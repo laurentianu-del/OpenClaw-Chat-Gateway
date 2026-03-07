@@ -91,6 +91,28 @@ app.use((req, res, next) => {
 });
 
 // Store active OpenClaw connections
+// Helper to rewrite outgoing messages: expand /uploads/ markdown links to absolute paths
+function rewriteOutgoingMessage(message: string): string {
+  const config = configManager.getConfig();
+  if (!config.openclawWorkspace) return message;
+
+  let workspacePath = config.openclawWorkspace;
+  if (workspacePath.startsWith('~')) {
+    workspacePath = path.join(process.env.HOME || '', workspacePath.slice(1));
+  }
+  const absoluteUploadsDir = path.join(workspacePath, 'uploads');
+
+  // Regex to find markdown links like [name](/uploads/filename) or ![name](/uploads/filename)
+  // or naked /uploads/filename if not in markdown
+  return message.replace(/(\(?\/uploads\/)([^\s)]+)(\)?)/g, (match, prefix, filename, suffix) => {
+    const absolutePath = path.join(absoluteUploadsDir, filename);
+    // If it was in parens (markdown), we might want to keep the parens or replace the whole thing
+    // Actually, OpenClaw expects file paths, so replacing (/uploads/...) with (absolute_path) is good
+    // But sometimes it might just be the raw string.
+    return `${prefix.startsWith('(') ? '(' : ''}${absolutePath}${suffix.endsWith(')') ? ')' : ''}`;
+  });
+}
+
 const connections = new Map<string, OpenClawClient>();
 
 // Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
@@ -349,7 +371,11 @@ app.post('/api/chat', async (req, res) => {
 
     db.saveMessage({ session_key: sessionId, role: 'user', content: String(message) });
     const client = await getConnection(sessionId);
-    const rawResponse = await client.sendChatMessage({ sessionKey: sessionId, message: finalMessage });
+    
+    // Rewrite outgoing message to expand relative upload paths to absolute ones for OpenClaw
+    const outgoingMessage = rewriteOutgoingMessage(finalMessage);
+    
+    const rawResponse = await client.sendChatMessage({ sessionKey: sessionId, message: outgoingMessage });
     // Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
     const response = rewriteOpenClawMediaPaths(rawResponse);
     db.saveMessage({ session_key: sessionId, role: 'assistant', content: String(response) });
