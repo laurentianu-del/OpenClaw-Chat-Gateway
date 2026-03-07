@@ -1,0 +1,16 @@
+[Unit]
+Description=ClawUI Frontend Service (Release)
+After=network.target clawui-backend.service
+
+[Service]
+Type=simple
+Environment=FRONTEND_PORT=3115
+Environment=BACKEND_PORT=3110
+Environment=CLAWUI_DATA_DIR=.clawui_release
+WorkingDirectory=/home/ange/Dev/Antigravity/clawui/frontend
+ExecStart=/usr/bin/npx vite preview --port 3115 --host
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

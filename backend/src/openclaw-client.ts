@@ -1,0 +1,196 @@
+import WebSocket from 'ws';
+import { EventEmitter } from 'events';
+import crypto from 'crypto';
+
+interface OpenClawConfig {
+  gatewayUrl: string;
+  token?: string;
+  password?: string;
+}
+
+type Pending = {
+  resolve: (value: any) => void;
+  reject: (err: Error) => void;
+  timer: NodeJS.Timeout;
+};
+
+export class OpenClawClient extends EventEmitter {
+  private ws: WebSocket | null = null;
+  private config: OpenClawConfig;
+  private connected = false;
+  private pending = new Map<string, Pending>();
+  private connectPromise: Promise<void> | null = null;
+
+  constructor(config: OpenClawConfig) {
+    super();
+    this.config = config;
+  }
+
+  async connect(): Promise<void> {
+    if (this.connected) return;
+    if (this.connectPromise) return this.connectPromise;
+
+    this.connectPromise = new Promise((resolve, reject) => {
+      const wsUrl = this.config.gatewayUrl.replace(/^http/, 'ws');
+      this.ws = new WebSocket(wsUrl);
+
+      const fail = (err: Error) => {
+        this.connected = false;
+        this.connectPromise = null;
+        reject(err);
+      };
+
+      this.ws.on('open', () => {
+        // wait for connect.challenge event
+      });
+
+      this.ws.on('message', async (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+
+          // challenge from gateway
+          if (msg.type === 'event' && msg.event === 'connect.challenge') {
+            try {
+              await this.request('connect', {
+                minProtocol: 3,
+                maxProtocol: 3,
+                client: {
+                  id: 'gateway-client',
+                  version: 'clawui-backend',
+                  mode: 'backend',
+                  platform: process.platform,
+                },
+                caps: [],
+                auth: {
+                  token: this.config.token,
+                  password: this.config.password,
+                },
+                role: 'operator',
+                scopes: ['operator.admin'],
+              });
+
+              this.connected = true;
+              this.connectPromise = null;
+              this.emit('connected');
+              resolve();
+            } catch (err: any) {
+              fail(new Error(err?.message || 'Gateway connect failed'));
+            }
+            return;
+          }
+
+          // response frame
+          if (msg.type === 'res' && msg.id) {
+            const pending = this.pending.get(msg.id);
+            if (!pending) return;
+            this.pending.delete(msg.id);
+            clearTimeout(pending.timer);
+
+            if (msg.ok) pending.resolve(msg.payload);
+            else pending.reject(new Error(msg?.error?.message || 'Request failed'));
+            return;
+          }
+        } catch (err: any) {
+          this.emit('error', new Error(err?.message || 'Failed to parse message'));
+        }
+      });
+
+      this.ws.on('close', () => {
+        this.connected = false;
+        this.connectPromise = null;
+        this.emit('disconnected');
+      });
+
+      this.ws.on('error', (err) => {
+        this.emit('error', err as Error);
+        if (!this.connected) fail(err as Error);
+      });
+    });
+
+    return this.connectPromise;
+  }
+
+  private async request(method: string, params?: any, timeoutMs = 60000): Promise<any> {
+    if (!this.ws) throw new Error('WebSocket not initialized');
+
+    const id = crypto.randomUUID();
+    const frame = { type: 'req', id, method, params };
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`${method} timeout`));
+      }, timeoutMs);
+
+      this.pending.set(id, { resolve, reject, timer });
+      this.ws!.send(JSON.stringify(frame));
+    });
+  }
+
+  private extractLatestAssistantText(historyPayload: any): string {
+    const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m?.role !== 'assistant') continue;
+      const content = Array.isArray(m?.content) ? m.content : [];
+      const textParts = content
+        .filter((c: any) => c?.type === 'text' && typeof c?.text === 'string')
+        .map((c: any) => c.text);
+      if (textParts.length > 0) return textParts.join('\n');
+    }
+    return '';
+  }
+
+  async sendChatMessage(params: {
+    sessionKey: string;
+    message: string;
+    agentId?: string;
+  }): Promise<string> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    const started = await this.request('chat.send', {
+      sessionKey: params.sessionKey,
+      message: params.message,
+      idempotencyKey: crypto.randomUUID(),
+    }, 30000);
+
+    const runId = started?.runId;
+    if (!runId) throw new Error('chat.send did not return runId');
+
+    await this.request('agent.wait', { runId, timeoutMs: 90000 }, 95000);
+
+    const history = await this.request('chat.history', {
+      sessionKey: params.sessionKey,
+      limit: 20,
+    }, 30000);
+
+    const text = this.extractLatestAssistantText(history);
+    return text || 'No assistant text found in response.';
+  }
+
+  async testConnection(): Promise<boolean> {
+    if (!this.connected) {
+      await this.connect();
+    }
+    return this.connected;
+  }
+
+  disconnect(): void {
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(new Error('Client disconnected'));
+    }
+    this.pending.clear();
+
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
+    this.connectPromise = null;
+  }
+}
+
+export default OpenClawClient;
