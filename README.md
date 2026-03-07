@@ -29,12 +29,12 @@
   - Optional login password protection.
 - **🤖 System Integration**:
   - Built-in `systemd` user service support for auto-start.
-  - One-click deployment script with **customizable ports**.
+  - One-click deployment script with **customizable port**.
 
 ### 🛠️ Tech Stack
 
-- **Frontend**: Vite, React, Vanilla CSS (Premium UI), Lucide React, Framer Motion.
-- **Backend**: Node.js, Express, Better-SQLite3, Multer.
+- **Full Stack**: Node.js, Express, React, Vite, Framer Motion.
+- **Database**: Better-SQLite3.
 
 ### 📥 One-Click Installation
 
@@ -47,10 +47,10 @@ The easiest way to install OpenClaw Chat Gateway is using the one-click installe
 curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash
 ```
 
-*By default, the backend uses port **3110** and the frontend uses port **3115**. You can pass custom ports to the script:*
+*By default, the service uses port **3115**. You can pass a custom port to the script:*
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080 8081
+curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
 ```
 
 ---
@@ -78,12 +78,12 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
   - 可选的登录密码保护。
 - **🤖 系统集成**：
   - 原生支持 `systemd` 用户服务，实现开机自启。
-  - 提供一键部署脚本，**支持参数化自定义端口**。
+  - 提供一键部署脚本，**支持自定义端口**。
 
 ### 🛠️ 技术栈
 
-- **前端**：Vite, React, Vanilla CSS (Premium UI), Lucide React, Framer Motion.
-- **后端**：Node.js, Express, Better-SQLite3, Multer.
+- **全栈**：Node.js, Express, React, Vite, Framer Motion.
+- **数据库**：Better-SQLite3.
 
 ### 📥 一键安装
 
@@ -96,8 +96,8 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash
 ```
 
-*默认后端端口为 **3110**，前端端口为 **3115**。您可以通过参数自定义端口：*
+*默认服务端口为 **3115**。您可以通过参数自定义端口：*
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080 8081
+curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
 ```

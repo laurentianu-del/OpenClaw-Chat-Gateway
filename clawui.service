@@ -1,10 +1,10 @@
 [Unit]
-Description=ClawUI Backend Service (Release)
+Description=ClawUI Service
 After=network.target
 
 [Service]
 Type=simple
-Environment=PORT=3110
+Environment=PORT=3115
 Environment=NODE_ENV=production
 Environment=CLAWUI_DATA_DIR=.clawui_release
 WorkingDirectory=/home/ange/Dev/Antigravity/clawui/backend

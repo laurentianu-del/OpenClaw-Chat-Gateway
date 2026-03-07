@@ -47,10 +47,11 @@ fi
 # Run Deployment Script
 echo -e "\n${BLUE}Step 3: Initializing Deployment...${NC}"
 chmod +x deploy-release.sh
-./deploy-release.sh "$@"
+./deploy-release.sh "$1" # Pass single port argument if provided
 
 echo -e "\n${GREEN}================================================${NC}"
 echo -e "${GREEN}   Installation Complete! ${NC}"
 echo -e "${GREEN}================================================${NC}"
 echo -e "You can now access your OpenClaw Chat Gateway."
+echo -e "URL: http://localhost:${1:-3115}"
 echo -e "Installation folder: $INSTALL_DIR"

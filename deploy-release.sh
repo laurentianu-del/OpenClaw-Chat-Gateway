@@ -2,18 +2,15 @@
 set -e
 
 # Configuration
-# Dynamically determine project root from the script's directory
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_DIR="$HOME/.config/systemd/user"
 
-# Default Ports
-BACKEND_PORT=${1:-3110}
-FRONTEND_PORT=${2:-3115}
+# Default Port
+CLAWUI_PORT=${1:-3115}
 
-echo "Deploying OpenClaw Chat Gateway..."
+echo "Deploying OpenClaw Chat Gateway (Consolidated)..."
 echo "Project Path:  $PROJECT_ROOT"
-echo "Backend Port:  $BACKEND_PORT"
-echo "Frontend Port: $FRONTEND_PORT"
+echo "Service Port:  $CLAWUI_PORT"
 
 echo "Installing dependencies..."
 cd "$PROJECT_ROOT"
@@ -24,33 +21,27 @@ cd frontend && npm install && cd ..
 echo "Building projects..."
 npm run build
 
-echo "Setting up systemd services..."
+echo "Setting up systemd service..."
 mkdir -p "$SERVICE_DIR"
 
-# Copy and update service files
-cp "$PROJECT_ROOT/clawui-backend.service" "$SERVICE_DIR/"
-cp "$PROJECT_ROOT/clawui-frontend.service" "$SERVICE_DIR/"
+# Clean up old services if they exist
+systemctl --user stop clawui-backend.service clawui-frontend.service 2>/dev/null || true
+systemctl --user disable clawui-backend.service clawui-frontend.service 2>/dev/null || true
+rm -f "$SERVICE_DIR/clawui-backend.service" "$SERVICE_DIR/clawui-frontend.service"
 
-# Update WorkingDirectory in service files
-sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/backend|" "$SERVICE_DIR/clawui-backend.service"
-sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/frontend|" "$SERVICE_DIR/clawui-frontend.service"
+# Copy and update the consolidated service file
+cp "$PROJECT_ROOT/clawui.service" "$SERVICE_DIR/"
 
-# Update backend service port
-sed -i "s/Environment=PORT=.*/Environment=PORT=$BACKEND_PORT/" "$SERVICE_DIR/clawui-backend.service"
-
-# Update frontend service ports and preview command
-sed -i "s/Environment=FRONTEND_PORT=.*/Environment=FRONTEND_PORT=$FRONTEND_PORT/" "$SERVICE_DIR/clawui-frontend.service"
-sed -i "s/Environment=BACKEND_PORT=.*/Environment=BACKEND_PORT=$BACKEND_PORT/" "$SERVICE_DIR/clawui-frontend.service"
-sed -i "s/--port [0-9]*/--port $FRONTEND_PORT/" "$SERVICE_DIR/clawui-frontend.service"
+# Update WorkingDirectory and Port in the service file
+sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/backend|" "$SERVICE_DIR/clawui.service"
+sed -i "s/Environment=PORT=.*/Environment=PORT=$CLAWUI_PORT/" "$SERVICE_DIR/clawui.service"
 
 echo "Reloading systemd daemon..."
 systemctl --user daemon-reload
 
-echo "Enabling and starting services..."
-systemctl --user enable clawui-backend.service
-systemctl --user enable clawui-frontend.service
-systemctl --user restart clawui-backend.service
-systemctl --user restart clawui-frontend.service
+echo "Enabling and starting service..."
+systemctl --user enable clawui.service
+systemctl --user restart clawui.service
 
 # Ensure services stay running after logout
 echo "Enabling lingering for user $(whoami)..."
@@ -60,7 +51,6 @@ fi
 
 echo "------------------------------------------------"
 echo "Deployment complete!"
-echo "Release URL: http://localhost:$FRONTEND_PORT"
-echo "Backend URL: http://localhost:$BACKEND_PORT"
+echo "ClawUI URL: http://localhost:$CLAWUI_PORT"
 echo "------------------------------------------------"
-echo "Check status with: systemctl --user status clawui-backend clawui-frontend"
+echo "Check status with: systemctl --user status clawui"
