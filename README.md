@@ -14,12 +14,16 @@
 
 - **🚀 Direct OpenClaw Communication**: Full replacement for external chat tools (like Telegram). Connect directly to your OpenClaw instance for seamless interaction.
 - **🤖 Native Command Support**: Support for all native OpenClaw commands (e.g., `/status`, `/help`) directly in the chat interface.
+- **⚡ Custom Quick Commands**: Define and manage your own shortcut commands for frequently used tasks to maximize efficiency.
 - **📸 Comprehensive Chat Experience**:
   - Full **Markdown** support for rich text, code snippets, and structured data.
   - Multi-line input with automatic expansion for better writing.
   - Drag-and-drop support for **images, documents, and videos**.
   - Telegram-style image previews and global message search.
 - **📁 Advanced Session Management**: Create, rename, and **drag-and-order** character sessions in the sidebar.
+- **🛡️ Secure Access Control**:
+  - **Login Password Protection**: Optional password gate to secure your gateway access.
+  - **Reverse Proxy Whitelist**: Support for domain whitelisting to ensure secure deployment behind reverse proxies (Nginx/Traefik).
 - **⚙️ Enterprise-Ready Deployment**:
   - One-click installation with automatic dependency resolution.
   - Native `systemd` integration for auto-start and background management.
@@ -65,12 +69,16 @@ cd ~/OpenClaw-Chat-Gateway && chmod +x uninstall.sh && ./uninstall.sh
 
 - **🚀 直连 OpenClaw 通信**：完全取代 TG 等第三方聊天工具。直接与您的 OpenClaw 实例连接，实现无缝沟通。
 - **🤖 原生指令支持**：支持所有 OpenClaw 原生指令（如 `/status`、`/help`），直接在对话框输入即可。
+- **⚡ 自定义快捷指令**：自由定义和管理您的专属快捷指令，大幅提升日常操作效率。
 - **📸 完整聊天体验**：
   - 完美支持 **Markdown** 格式，包括代码高亮、表格及富文本。
   - 多行输入框，随内容自动调整高度，丝滑输入。
   - 支持 **图片、文档、视频** 的拖拽发送。
   - 类 Telegram 的图片预览系统及全局消息搜索。
 - **📁 高级会话管理**：创建并管理多个角色会话，侧边栏支持**拖拽排序**。
+- **🛡️ 安全访问控制**：
+  - **安全登录密码**：可选的密码验证机制，全面保护您的网关访问安全。
+  - **反向代理域名白名单**：支持域名白名单验证，适配 Nginx/Traefik 等反向代理环境的安全部署。
 - **⚙️ 生产级部署方案**：
   - 一键式安装脚本，自动处理所有依赖。
   - 原生 `systemd` 集成，开机自启，后台稳定运行。
@@ -100,7 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 
 ### 🗑️ 卸载
 
-如果您需要彻底删除本项目及其所有设置和数据，请运行：
+如果您需要彻底删除本项目及其所有设置 and 数据，请运行：
 
 ```bash
 cd ~/OpenClaw-Chat-Gateway && chmod +x uninstall.sh && ./uninstall.sh
