@@ -38,6 +38,9 @@
 
 ### 📥 One-Click Installation
 
+> [!IMPORTANT]
+> To ensure a complete and seamless experience, this program must be installed on the same **Linux host** as OpenClaw, and it must be a **native installation** (not deployed via Docker).
+
 The easiest way to install OpenClaw Chat Gateway is using the one-click installer:
 
 ```bash
@@ -83,6 +86,9 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 - **后端**：Node.js, Express, Better-SQLite3, Multer.
 
 ### 📥 一键安装
+
+> [!IMPORTANT]
+> 为了获得完整且无缝的体验，本项目须安装在安装了 OpenClaw 的 **Linux 主机**上，且必须是 **原生安装**（而非 Docker 模式部署）。
 
 最简单的安装方式是使用一键安装脚本：
 
