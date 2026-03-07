@@ -115,8 +115,14 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 
 ### 🗑️ 卸载
 
-如果您需要彻底删除本项目及其所有设置 and 数据，请运行：
+如果您需要彻底删除本项目及其所有设置与数据，请运行：
 
 ```bash
 cd ~/OpenClaw-Chat-Gateway && chmod +x uninstall.sh && ./uninstall.sh
 ```
+
+### 💬 社群与支持
+
+- **官方 TG 交流群**：[安格视界 (AngeWorld)](https://t.me/angeworld2024)
+- **安格超市**：[获取更多精品资源](https://blog.angeworld.cc/market/)
+
