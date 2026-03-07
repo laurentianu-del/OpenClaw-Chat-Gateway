@@ -245,6 +245,22 @@ app.post('/api/config/test', async (req, res) => {
   }
 });
 
+app.get('/api/config/detect-workspace', (req, res) => {
+  const homeDir = process.env.HOME || '';
+  const possiblePaths = [
+    path.join(homeDir, '.openclaw', 'workspace'),
+    '/root/.openclaw/workspace',
+  ];
+
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      return res.json({ success: true, path: p });
+    }
+  }
+
+  res.json({ success: false, message: 'Could not automatically detect workspace' });
+});
+
 app.post('/api/config/restart', async (_req, res) => {
   try {
     // Disconnect all active clients first

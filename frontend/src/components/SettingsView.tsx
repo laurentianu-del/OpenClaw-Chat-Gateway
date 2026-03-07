@@ -100,7 +100,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gatewayUrl: url, token, password }),
+        body: JSON.stringify({ gatewayUrl: url, token, password, openclawWorkspace }),
       });
       if (res.ok) {
         setGatewaySaved(true);
@@ -109,6 +109,24 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     } catch (err) {
       setGatewayError(true);
       setTimeout(() => setGatewayError(false), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleDetectWorkspace = async () => {
+    setIsLoading(true);
+    try {
+      const res = await fetch('/api/config/detect-workspace');
+      const data = await res.json();
+      if (data.success && data.path) {
+        setOpenclawWorkspace(data.path);
+      } else {
+        alert(data.message || '检测失败，请手动输入');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('检测请求发生网络错误');
     } finally {
       setIsLoading(false);
     }
@@ -219,7 +237,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aiName, loginEnabled, loginPassword, openclawWorkspace }),
+        body: JSON.stringify({ aiName, loginEnabled, loginPassword }),
       });
       if (res.ok) {
         setGeneralSaved(true);
@@ -377,6 +395,33 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       </button>
                     </div>
                   </div>
+
+                  {/* OpenClaw Workspace Path */}
+                  <div className="border-t border-gray-100 pt-5">
+                    <label className="block text-sm font-medium text-gray-900 mb-2">
+                       OpenClaw 工作区路径
+                    </label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={openclawWorkspace}
+                        onChange={(e) => setOpenclawWorkspace(e.target.value)}
+                        placeholder="/root/.openclaw/workspace"
+                        className="flex-1 px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleDetectWorkspace}
+                        disabled={isLoading}
+                        className="px-4 py-2.5 rounded-xl border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
+                      >
+                        自动检测
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-400 mt-1.5">
+                      配置此项后，上传的文件将存入该路径，以便 OpenClaw 识别。
+                    </p>
+                  </div>
                 </div>
 
                 {/* Domain Management Section */}
@@ -525,24 +570,6 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     ) : (
                       <p className="text-xs text-gray-400 mt-1.5">AI 在对话中显示的名称，限制10个汉字（20个英文字符）</p>
                     )}
-                  </div>
-
-                  {/* OpenClaw Workspace */}
-                  <div className="border-t border-gray-100 pt-6">
-                    <label className="block text-sm font-medium text-gray-900 mb-2">
-                      OpenClaw 工作区路径
-                    </label>
-                    <input
-                      type="text"
-                      value={openclawWorkspace}
-                      onChange={(e) => setOpenclawWorkspace(e.target.value)}
-                      placeholder="/root/.openclaw/workspace"
-                      className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
-                    />
-                    <p className="text-xs text-gray-400 mt-1.5 line-clamp-2">
-                      配置此项后，上传的文件将存入该路径，以便 OpenClaw 能够识别文件内容。<br/>
-                      原生安装默认为：<code className="bg-gray-100 px-1 rounded text-blue-600">/root/.openclaw/workspace</code>
-                    </p>
                   </div>
 
                   {/* Login Password Toggle */}
