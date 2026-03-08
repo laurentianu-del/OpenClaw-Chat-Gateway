@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, Children, isValidElement, cloneElement, ReactNode } from 'react';
-import { Menu, Plus, Quote, Copy, Check, FileText, FileImage, FileArchive, FileCode, File as FileIcon, Download, Music, Video, X, Search, ChevronUp, ChevronDown } from 'lucide-react';
+import { Menu, Plus, Quote, Copy, Check, FileText, FileImage, FileArchive, FileCode, File as FileIcon, Download, Music, Video, X, Search, ChevronUp, ChevronDown, Trash2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -81,8 +81,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       }
     });
 
-    setNavDots(dots);
-  }, [messages]);
+      setNavDots(dots);
+    }, [messages]);
+
+    useEffect(() => {
+      // Add a wrapper div to map close
+      return;
+    }, []);
 
   // Update active dot on scroll
   const handleNavScroll = useCallback(() => {
@@ -319,6 +324,21 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
   const handleQuote = (msg: Message) => {
     setQuotedMessage(msg);
     textareaRef.current?.focus();
+  };
+
+  const handleDeleteMessage = async (msgId: string) => {
+    if (!window.confirm('确定要删除这条消息吗？')) return;
+    try {
+      const res = await fetch(`/api/messages/${msgId}`, { method: 'DELETE' });
+      if (res.ok) {
+        setMessages(prev => prev.filter(m => m.id !== msgId));
+      } else {
+        alert('删除失败');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('网络错误');
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -790,14 +810,27 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 sm:px-8 sm:py-4 space-y-6 bg-white scroll-smooth pb-0">
         <div className="flex justify-center mb-8">
             <span className="px-4 py-1.5 bg-[#eff1f4] text-gray-500 text-[11px] rounded-full font-bold">
-                2026年3月6日
+                {messages.length > 0 ? messages[0].timestamp.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }) : '开始对话'}
             </span>
         </div>
 
-        {messages.map((msg) => {
+        {messages.map((msg, index) => {
           const isHighlighted = activeHighlightId === msg.id;
+          const prevMsg = index > 0 ? messages[index - 1] : null;
+          const showDateDivider = prevMsg && msg.timestamp.toDateString() !== prevMsg.timestamp.toDateString();
+          
           return (
-          <div key={msg.id} data-msg-id={msg.id} {...(msg.role === 'user' ? {'data-user-msg-id': msg.id} : {})} className={`flex w-full mb-6 transition-all duration-500 ${isHighlighted ? 'ring-4 ring-blue-500/20 bg-blue-50/30 -mx-4 px-4 py-2 rounded-2xl' : ''} ${msg.role === 'user' ? 'justify-end' : 'flex-col sm:flex-row justify-start items-start'}`}>
+          <div key={msg.id}>
+            {showDateDivider && (
+              <div className="flex items-center justify-center my-8 gap-4">
+                <div className="h-px bg-gray-200 flex-1"></div>
+                <span className="px-4 py-1.5 bg-[#eff1f4] text-gray-500 text-[11px] rounded-full font-bold">
+                  {msg.timestamp.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })}
+                </span>
+                <div className="h-px bg-gray-200 flex-1"></div>
+              </div>
+            )}
+            <div data-msg-id={msg.id} {...(msg.role === 'user' ? {'data-user-msg-id': msg.id} : {})} className={`flex w-full mb-6 transition-all duration-500 group/msg ${isHighlighted ? 'ring-4 ring-blue-500/20 bg-blue-50/30 -mx-4 px-4 py-2 rounded-2xl' : ''} ${msg.role === 'user' ? 'justify-end' : 'flex-col sm:flex-row justify-start items-start'}`}>
             {msg.role === 'assistant' && (
               <div className="flex items-center gap-2 mb-2 sm:mb-0 sm:mr-4 sm:mt-0.5 flex-shrink-0">
                 <img src="/ai-robot.jpg" alt="AI" className="w-8 h-8 rounded-full border border-gray-200 object-cover bg-gray-50 flex items-center justify-center overflow-hidden" />
@@ -1092,6 +1125,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                 >
                     {copiedId === msg.id ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                     {copiedId === msg.id ? '已复制' : '复制'}
+                </button>
+                <span className="text-gray-200 font-extralight">|</span>
+                <button 
+                  onClick={() => handleDeleteMessage(msg.id)} 
+                  className="hover:text-red-500 transition-colors flex items-center gap-1"
+                >
+                    <Trash2 className="w-3.5 h-3.5" /> 删除
                 </button>
               </div>
             </div>

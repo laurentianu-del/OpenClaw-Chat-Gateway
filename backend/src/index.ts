@@ -349,6 +349,16 @@ app.get('/api/history/:sessionId', (req, res) => {
   res.json({ success: true, messages: rows });
 });
 
+app.delete('/api/messages/:id', (req, res) => {
+  const { id } = req.params;
+  try {
+    db.deleteMessage(Number(id));
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.post('/api/chat', async (req, res) => {
   const { sessionId, message } = req.body;
 

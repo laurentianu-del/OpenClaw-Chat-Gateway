@@ -136,6 +136,10 @@ export class DB {
       .run(row.session_key, row.role, row.content);
   }
 
+  deleteMessage(id: number) {
+    return this.db.prepare('DELETE FROM chat_messages WHERE id = ?').run(id);
+  }
+
   getMessages(sessionKey: string, limit = 100): ChatRow[] {
     return this.db
       .prepare(
