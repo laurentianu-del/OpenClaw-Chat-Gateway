@@ -39,6 +39,8 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
   const [aiName, setAiName] = useState('OpenClaw');
   const [quotedMessage, setQuotedMessage] = useState<Message | null>(null);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
+  const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [messageToDelete, setMessageToDelete] = useState<string | null>(null);
 
   // --- Search States ---
   const [showMobileSearch, setShowMobileSearch] = useState(false);
@@ -81,13 +83,8 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       }
     });
 
-      setNavDots(dots);
-    }, [messages]);
-
-    useEffect(() => {
-      // Add a wrapper div to map close
-      return;
-    }, []);
+    setNavDots(dots);
+  }, [messages]);
 
   // Update active dot on scroll
   const handleNavScroll = useCallback(() => {
@@ -326,18 +323,23 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
     textareaRef.current?.focus();
   };
 
-  const handleDeleteMessage = async (msgId: string) => {
-    if (!window.confirm('确定要删除这条消息吗？')) return;
+  const handleDeleteMessage = (msgId: string) => {
+    setMessageToDelete(msgId);
+    setIsDeleteModalOpen(true);
+  };
+
+  const confirmDeleteMessage = async () => {
+    if (!messageToDelete) return;
     try {
-      const res = await fetch(`/api/messages/${msgId}`, { method: 'DELETE' });
+      const res = await fetch(`/api/messages/${messageToDelete}`, { method: 'DELETE' });
       if (res.ok) {
-        setMessages(prev => prev.filter(m => m.id !== msgId));
-      } else {
-        alert('删除失败');
+        setMessages(prev => prev.filter(m => m.id !== messageToDelete));
       }
     } catch (err) {
-      console.error(err);
-      alert('网络错误');
+      console.error('Delete failed:', err);
+    } finally {
+      setIsDeleteModalOpen(false);
+      setMessageToDelete(null);
     }
   };
 
@@ -1136,8 +1138,9 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
               </div>
             </div>
           </div>
-          );
-        })}
+        </div>
+        );
+      })}
         <div ref={messagesEndRef} />
       </div>
 
@@ -1371,6 +1374,40 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                 title="PDF Preview"
               />
             ) : null}
+          </div>
+        </div>
+      )}
+      {/* Custom Delete Confirmation Modal */}
+      {isDeleteModalOpen && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center p-4">
+          <div 
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity animate-in fade-in duration-200" 
+            onClick={() => setIsDeleteModalOpen(false)}
+          ></div>
+          <div className="bg-white rounded-[32px] border border-gray-200 w-full max-w-[340px] overflow-hidden relative z-10 animate-in fade-in zoom-in-95 duration-200 shadow-2xl">
+            <div className="p-8 text-center">
+              <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-3xl bg-red-50 mb-6 border border-red-100">
+                <Trash2 className="h-8 w-8 text-red-500" />
+              </div>
+              <h3 className="text-xl font-black text-gray-900 mb-2 tracking-tight">确认删除消息？</h3>
+              <p className="text-sm text-gray-500 leading-relaxed px-2">该操作将永久从对话历史中移除此条消息，且无法撤销。</p>
+            </div>
+            <div className="p-5 bg-gray-50/80 flex gap-3 border-t border-gray-100">
+              <button
+                type="button"
+                onClick={() => setIsDeleteModalOpen(false)}
+                className="flex-1 px-4 py-3 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 active:scale-95 rounded-2xl font-bold text-sm transition-all"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={confirmDeleteMessage}
+                className="flex-1 px-4 py-3 text-white bg-red-600 hover:bg-red-700 active:scale-95 rounded-2xl font-bold text-sm shadow-lg shadow-red-500/20 transition-all"
+              >
+                确认删除
+              </button>
+            </div>
           </div>
         </div>
       )}
