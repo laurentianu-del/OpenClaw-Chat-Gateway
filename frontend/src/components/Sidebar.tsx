@@ -32,10 +32,17 @@ export default function Sidebar({
 }: SidebarProps) {
   
   // Modal State
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
-  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
-  const [newSessionData, setNewSessionData] = useState({ name: '', description: '', prompt: '' });
+  const [newSessionData, setNewSessionData] = useState({ name: '', description: '', prompt: '', characterId: '' });
+  const [characters, setCharacters] = useState<any[]>([]);
+
+  // Fetch characters on mount
+  useState(() => {
+    fetch('/api/characters')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) setCharacters(data.characters);
+      });
+  });
   
   // Delete Modal State
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -65,7 +72,7 @@ export default function Sidebar({
         const data = await res.json();
         if (data.success) {
           setIsModalOpen(false);
-          setNewSessionData({ name: '', description: '', prompt: '' });
+          setNewSessionData({ name: '', description: '', prompt: '', characterId: '' });
           await reloadSessions();
           if (modalMode === 'create' && data.session?.id) {
             setActiveSessionId(data.session.id);
@@ -118,7 +125,8 @@ export default function Sidebar({
           setNewSessionData({ 
             name: fullSession.name || '', 
             description: fullSession.description || '', 
-            prompt: fullSession.prompt || '' 
+            prompt: fullSession.prompt || '',
+            characterId: fullSession.characterId || ''
           });
           setEditingSessionId(session.id);
           setModalMode('edit');
@@ -204,7 +212,7 @@ export default function Sidebar({
           onClick={() => {
             setModalMode('create');
             setEditingSessionId(null);
-            setNewSessionData({ name: `新角色 ${sessions.length + 1}`, description: '', prompt: '' });
+            setNewSessionData({ name: `新角色 ${sessions.length + 1}`, description: '', prompt: '', characterId: 'char_main' });
             setIsModalOpen(true);
           }}
           className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl border border-blue-200 text-blue-600 hover:border-blue-300 hover:bg-blue-50 transition-all bg-blue-50/50 font-bold text-sm active:scale-95"
@@ -229,8 +237,18 @@ export default function Sidebar({
                   onClick={() => { setActiveSessionId(s.id); setCurrentView('chat'); setIsMobileMenuOpen(false); }}
                   className={`w-full group text-left py-2.5 px-3 text-sm rounded-xl transition-all flex items-center gap-3 cursor-pointer ${activeSessionId === s.id ? 'bg-white border border-gray-300 text-blue-600 font-bold' : 'text-gray-600 hover:bg-gray-200 font-medium border border-transparent hover:border-gray-300'}`}
                 >
-                  <MessageSquare className={`w-4 h-4 flex-shrink-0 ${activeSessionId === s.id ? 'text-blue-500' : 'text-gray-400'}`} />
-                  <span className="truncate flex-1">{s.name || `角色 ${s.id}`}</span>
+                  {/* Character Avatar or Icon */}
+                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${activeSessionId === s.id ? 'bg-blue-50' : 'bg-gray-100 group-hover:bg-white'}`}>
+                    <MessageSquare className={`w-4 h-4 ${activeSessionId === s.id ? 'text-blue-500' : 'text-gray-400'}`} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="truncate">{s.name || `角色 ${s.id}`}</div>
+                    {(s as any).characterId && (
+                      <div className="text-[10px] text-gray-400 font-normal truncate">
+                        {characters.find(c => c.id === (s as any).characterId)?.name || '自定义'}
+                      </div>
+                    )}
+                  </div>
                   <div className="flex items-center gap-1 md:opacity-0 md:group-hover:opacity-100 transition-opacity">
                     <button onClick={(e) => handleStartEdit(e, s)} className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg">
                       <Edit2 className="w-3.5 h-3.5" />
@@ -289,6 +307,37 @@ export default function Sidebar({
                   className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all"
                   required
                 />
+              </div>
+
+              <div>
+                <label className="block text-sm font-semibold text-gray-700 mb-1.5">选择 Agent 身份</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {characters.map(char => (
+                    <button
+                      key={char.id}
+                      type="button"
+                      onClick={() => {
+                        setNewSessionData(prev => ({
+                          ...prev, 
+                          characterId: char.id,
+                          prompt: prev.prompt || char.systemPrompt // Default to char's prompt if empty
+                        }));
+                      }}
+                      className={`p-3 rounded-xl border text-sm text-left transition-all ${newSessionData.characterId === char.id ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300'}`}
+                    >
+                      <div className="font-bold">{char.name}</div>
+                      <div className="text-[10px] opacity-70 truncate">{char.description}</div>
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => setNewSessionData(prev => ({...prev, characterId: ''}))}
+                    className={`p-3 rounded-xl border text-sm text-left transition-all ${!newSessionData.characterId ? 'border-blue-500 bg-blue-50 text-blue-700' : 'border-gray-200 bg-gray-50 text-gray-600 hover:border-gray-300'}`}
+                  >
+                    <div className="font-bold">自定义</div>
+                    <div className="text-[10px] opacity-70 truncate">手动设置 Prompt</div>
+                  </button>
+                </div>
               </div>
               
               <div>

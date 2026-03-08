@@ -150,9 +150,16 @@ export class OpenClawClient extends EventEmitter {
       await this.connect();
     }
 
+    // Use standard OpenClaw session key format: agent:{agentId}:chat:{uniqueId}
+    const agentId = params.agentId || 'main';
+    const finalSessionKey = params.sessionKey.startsWith('agent:') 
+      ? params.sessionKey 
+      : `agent:${agentId}:chat:${params.sessionKey}`;
+
     const started = await this.request('chat.send', {
-      sessionKey: params.sessionKey,
+      sessionKey: finalSessionKey,
       message: params.message,
+      agentId: agentId,
       idempotencyKey: crypto.randomUUID(),
     }, 30000);
 
@@ -162,7 +169,7 @@ export class OpenClawClient extends EventEmitter {
     await this.request('agent.wait', { runId, timeoutMs: 90000 }, 95000);
 
     const history = await this.request('chat.history', {
-      sessionKey: params.sessionKey,
+      sessionKey: finalSessionKey,
       limit: 20,
     }, 30000);
 

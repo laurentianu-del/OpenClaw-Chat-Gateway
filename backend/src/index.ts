@@ -306,20 +306,36 @@ app.post('/api/config/restart', async (_req, res) => {
   }
 });
 
+app.get('/api/characters', (_req, res) => {
+  res.json({ success: true, characters: db.getCharacters() });
+});
+
+app.post('/api/characters', (req, res) => {
+  const char = req.body;
+  if (!char.id) char.id = 'char_' + Date.now();
+  db.saveCharacter(char);
+  res.json({ success: true, character: char });
+});
+
+app.delete('/api/characters/:id', (req, res) => {
+  db.deleteCharacter(req.params.id);
+  res.json({ success: true });
+});
+
 app.get('/api/sessions', (_req, res) => {
   const sessions = sessionManager.getAllSessions();
   res.json(sessions);
 });
 
 app.post('/api/sessions', (req, res) => {
-  const { name, description, prompt } = req.body;
-  const newSession = sessionManager.createSession({ name, description, prompt });
+  const { name, description, prompt, characterId } = req.body;
+  const newSession = sessionManager.createSession({ name, description, prompt, characterId });
   res.json({ success: true, session: newSession });
 });
 
 app.put('/api/sessions/:id', (req, res) => {
-  const { name, description, prompt } = req.body;
-  const updated = sessionManager.updateSession(req.params.id, { name, description, prompt });
+  const { name, description, prompt, characterId } = req.body;
+  const updated = sessionManager.updateSession(req.params.id, { name, description, prompt, characterId });
   if (updated) {
     res.json({ success: true, session: updated });
   } else {
@@ -386,7 +402,12 @@ app.post('/api/chat', async (req, res) => {
     // Rewrite outgoing message to expand relative upload paths to absolute ones for OpenClaw
     const outgoingMessage = rewriteOutgoingMessage(finalMessage);
     
-    const rawResponse = await client.sendChatMessage({ sessionKey: sessionId, message: outgoingMessage });
+    const agentId = sessionInfo?.agentId || 'main';
+    const rawResponse = await client.sendChatMessage({ 
+      sessionKey: sessionId, 
+      message: outgoingMessage,
+      agentId: agentId
+    });
     // Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
     const response = rewriteOpenClawMediaPaths(rawResponse);
     db.saveMessage({ session_key: sessionId, role: 'assistant', content: String(response) });

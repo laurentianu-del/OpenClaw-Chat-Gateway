@@ -6,6 +6,7 @@ interface CreateSessionOptions {
   description?: string;
   prompt?: string;
   agentId?: string;
+  characterId?: string;
   id?: string;
 }
 
@@ -44,12 +45,25 @@ export class SessionManager extends EventEmitter {
     const maxPos = allSessions.length > 0 ? Math.max(...allSessions.map(s => s.position || 0)) : -1;
     const position = maxPos + 1;
 
+    // Auto-resolve agentId and prompt from character if characterId is provided
+    let finalAgentId = options.agentId || 'main';
+    let finalPrompt = options.prompt;
+
+    if (options.characterId) {
+      const character = this.db.getCharacters().find(c => c.id === options.characterId);
+      if (character) {
+        finalAgentId = character.agentId;
+        if (!finalPrompt) finalPrompt = character.systemPrompt;
+      }
+    }
+
     const session: SessionRow = {
       id,
       name,
       description: options.description,
-      prompt: options.prompt,
-      agentId: options.agentId || 'main',
+      prompt: finalPrompt,
+      agentId: finalAgentId,
+      characterId: options.characterId,
       position,
       created_at: now,
       updated_at: now,

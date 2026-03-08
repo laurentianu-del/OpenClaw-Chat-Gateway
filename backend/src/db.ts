@@ -16,9 +16,20 @@ export type SessionRow = {
   description?: string;
   prompt?: string;
   agentId: string;
+  characterId?: string;
   position: number;
   created_at: number;
   updated_at: number;
+};
+
+export type CharacterRow = {
+  id: string;
+  name: string;
+  description?: string;
+  agentId: string;
+  avatar?: string;
+  systemPrompt?: string;
+  created_at?: number;
 };
 
 export class DB {
@@ -71,10 +82,28 @@ export class DB {
         description TEXT,
         prompt TEXT,
         agentId TEXT NOT NULL,
+        characterId TEXT,
         position INTEGER DEFAULT 0,
         created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS characters (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        agentId TEXT NOT NULL,
+        avatar TEXT,
+        systemPrompt TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      -- Insert default agents/characters
+      INSERT OR IGNORE INTO characters (id, name, description, agentId, systemPrompt) 
+      VALUES ('char_main', '通用助手', 'OpenClaw 默认全能助手', 'main', 'You are a helpful AI assistant.');
+      
+      INSERT OR IGNORE INTO characters (id, name, description, agentId, systemPrompt) 
+      VALUES ('char_coder', '代码专家', '精通多种编程语言的架构师', 'coder', 'You are an expert software engineer and architect.');
 
       -- Insert default commands if they don't exist
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/models', '列出模型供应商可进一步变更模型');
@@ -82,7 +111,10 @@ export class DB {
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/clear', '清空当前会话');
     `);
 
-    // Migrate existing sessions table (add description and prompt columns if missing)
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN characterId TEXT");
+    } catch (e: any) {}
+
     try {
       this.db.exec("ALTER TABLE sessions ADD COLUMN description TEXT");
     } catch (e: any) {
@@ -166,11 +198,26 @@ export class DB {
       .all(limit);
   }
 
+  // --- Characters ---
+  getCharacters(): CharacterRow[] {
+    return this.db.prepare('SELECT * FROM characters ORDER BY created_at ASC').all() as CharacterRow[];
+  }
+
+  saveCharacter(char: CharacterRow) {
+    this.db
+      .prepare('INSERT INTO characters (id, name, description, agentId, avatar, systemPrompt) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, agentId=excluded.agentId, avatar=excluded.avatar, systemPrompt=excluded.systemPrompt')
+      .run(char.id, char.name, char.description || null, char.agentId, char.avatar || null, char.systemPrompt || null);
+  }
+
+  deleteCharacter(id: string) {
+    this.db.prepare('DELETE FROM characters WHERE id = ?').run(id);
+  }
+
   // --- Sessions ---
   saveSession(session: SessionRow) {
     this.db
-      .prepare('INSERT INTO sessions (id, name, description, prompt, agentId, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, prompt=excluded.prompt, position=excluded.position, updated_at=excluded.updated_at')
-      .run(session.id, session.name, session.description || null, session.prompt || null, session.agentId, session.position, session.created_at, session.updated_at);
+      .prepare('INSERT INTO sessions (id, name, description, prompt, agentId, characterId, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, prompt=excluded.prompt, agentId=excluded.agentId, characterId=excluded.characterId, position=excluded.position, updated_at=excluded.updated_at')
+      .run(session.id, session.name, session.description || null, session.prompt || null, session.agentId, session.characterId || null, session.position, session.created_at, session.updated_at);
   }
 
   getSession(id: string): SessionRow | undefined {
