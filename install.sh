@@ -12,31 +12,31 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}================================================${NC}"
-echo -e "${BLUE}   OpenClaw Chat Gateway - One-Click Installer  ${NC}"
+echo -e "${BLUE}    OpenClaw Chat Gateway - 一键安装脚本       ${NC}"
 echo -e "${BLUE}================================================${NC}"
 
 # Check for Prerequisites
-echo -e "\n${BLUE}Step 1: Checking Prerequisites...${NC}"
+echo -e "\n${BLUE}步骤 1: 检查运行环境...${NC}"
 
 if ! command -v git &> /dev/null; then
-    echo -e "${RED}Error: git is not installed. Please install git first.${NC}"
+    echo -e "${RED}错误: 未安装 git。请先安装 git。${NC}"
     exit 1
 fi
 
 if ! command -v node &> /dev/null; then
-    echo -e "${RED}Error: Node.js is not installed. Please install Node.js (v18+) first.${NC}"
+    echo -e "${RED}错误: 未安装 Node.js。请先安装 Node.js (v18+)。${NC}"
     exit 1
 fi
 
 if ! command -v npm &> /dev/null; then
-    echo -e "${RED}Error: npm is not installed. Please install npm first.${NC}"
+    echo -e "${RED}错误: 未安装 npm。请先安装 npm。${NC}"
     exit 1
 fi
 
 # Clone Repository
-echo -e "\n${BLUE}Step 2: Cloning Repository...${NC}"
+echo -e "\n${BLUE}步骤 2: 获取项目源码...${NC}"
 if [ -d "$INSTALL_DIR" ]; then
-    echo -e "${BLUE}Directory $INSTALL_DIR already exists. Updating...${NC}"
+    echo -e "${BLUE}目录 $INSTALL_DIR 已存在，正在更新...${NC}"
     cd "$INSTALL_DIR"
     git pull
 else
@@ -45,7 +45,7 @@ else
 fi
 
 # Run Deployment Script
-echo -e "\n${BLUE}Step 3: Initializing Deployment...${NC}"
+echo -e "\n${BLUE}步骤 3: 初始化部署...${NC}"
 chmod +x deploy-release.sh
 ./deploy-release.sh "$1" # Pass single port argument if provided
 
@@ -53,27 +53,14 @@ chmod +x deploy-release.sh
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 
-# LibreOffice Check
-echo -e "\n${BLUE}Step 4: Checking for LibreOffice (Recommended)...${NC}"
-if ! command -v libreoffice &> /dev/null; then
-    echo -e "安装 libreoffice 有更好的文档预览体验。"
-    read -p "检查到主机未安装 libreoffice，是否现在安装？(Y/n): " install_lo
-    install_lo=${install_lo:-Y}
-    
-    if [[ "$install_lo" =~ ^[Yy]$ ]]; then
-        echo -e "${BLUE}正在安装 LibreOffice...${NC}"
-        sudo apt update && sudo apt install libreoffice -y
-    else
-        echo -e "${BLUE}您可以下次自行安装，安装指令为: ${NC}sudo apt update && sudo apt install libreoffice -y"
-    fi
-else
-    echo -e "${GREEN}LibreOffice 已安装，文档预览体验已就绪。${NC}"
-fi
-
 echo -e "\n${GREEN}================================================${NC}"
-echo -e "${GREEN}   Installation Complete! ${NC}"
+echo -e "${GREEN}   安装完成！ ${NC}"
 echo -e "${GREEN}================================================${NC}"
-echo -e "You can now access your OpenClaw Chat Gateway."
-echo -e "Local Access:   http://localhost:${1:-3115}"
-echo -e "Network Access: http://$LOCAL_IP:${1:-3115}"
-echo -e "Installation folder: $INSTALL_DIR"
+echo -e "您现在可以访问 OpenClaw Chat Gateway："
+echo -e "本地访问:   http://localhost:${1:-3115}"
+echo -e "网络访问:   http://$LOCAL_IP:${1:-3115}"
+echo -e "安装目录:   $INSTALL_DIR"
+echo -e "------------------------------------------------"
+echo -e "${BLUE}提示: 安装 LibreOffice 可以获得更好的文档预览体验。${NC}"
+echo -e "安装指令: ${GREEN}sudo apt update && sudo apt install libreoffice -y${NC}"
+echo -e "------------------------------------------------"
