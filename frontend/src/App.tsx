@@ -5,7 +5,7 @@ import SettingsView from './components/SettingsView';
 import LoginScreen from './components/LoginScreen';
 
 export type ViewType = 'chat' | 'settings';
-export type SettingsTab = 'gateway' | 'general' | 'commands' | 'about';
+export type SettingsTab = 'gateway' | 'general' | 'models' | 'commands' | 'about';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewType>('chat');

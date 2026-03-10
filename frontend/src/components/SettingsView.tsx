@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag } from 'lucide-react';
 import { SettingsTab } from '../App';
 
@@ -50,10 +50,21 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [editingId, setEditingId] = useState<number | null>(null);
 
   // --- Shared Delete Modal State ---
-  type DeleteTarget = { type: 'host'; value: string } | { type: 'command'; id: number };
+  type DeleteTarget = { type: 'host'; value: string } | { type: 'command'; id: number } | { type: 'model'; id: string };
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [deleteModalMessage, setDeleteModalMessage] = useState('');
+
+  // --- Model Management State ---
+  const [models, setModels] = useState<{ id: string; alias?: string; primary: boolean }[]>([]);
+  const [newModelEndpoint, setNewModelEndpoint] = useState('');
+  const [newModelName, setNewModelName] = useState('');
+  const [newModelAlias, setNewModelAlias] = useState('');
+  const [modelError, setModelError] = useState('');
+  const [modelSuccessTimestamp, setModelSuccessTimestamp] = useState(0);
+  const [editingModelId, setEditingModelId] = useState<string | null>(null);
+  const [editingAlias, setEditingAlias] = useState('');
+  const editAliasInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setTestResult(null);
@@ -75,7 +86,20 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       .catch(console.error);
 
     fetchCommands();
+    fetchModels();
   }, []);
+
+  const fetchModels = async () => {
+    try {
+      const res = await fetch('/api/models');
+      const data = await res.json();
+      if (data.success) {
+        setModels(data.models || []);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   const fetchCommands = async () => {
     try {
@@ -314,6 +338,20 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       } else if (deleteTarget.type === 'command') {
         const res = await fetch(`/api/commands/${deleteTarget.id}`, { method: 'DELETE' });
         if (res.ok) fetchCommands();
+      } else if (deleteTarget.type === 'model') {
+        const res = await fetch('/api/models/manage', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: deleteTarget.id }),
+        });
+        if (res.ok) {
+          fetchModels();
+          setModelSuccessTimestamp(Date.now());
+        } else {
+          const data = await res.json().catch(() => ({}));
+          setModelError(data.error || '删除模型失败');
+          setTimeout(() => setModelError(''), 3000);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -329,7 +367,119 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     setNewDescription(cmd.description);
   };
 
-  const headerTitle = settingsTab === 'gateway' ? '设置 - 网关' : settingsTab === 'general' ? '设置 - 通用' : settingsTab === 'commands' ? '设置 - 快捷指令' : '关于系统';
+  const handleAddModel = async () => {
+    if (!newModelEndpoint.trim() || !newModelName.trim()) {
+      setModelError('端点和模型名称不能为空');
+      setTimeout(() => setModelError(''), 3000);
+      return;
+    }
+    setIsLoading(true);
+    try {
+      const res = await fetch('/api/models/manage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          endpoint: newModelEndpoint.trim(),
+          modelName: newModelName.trim(),
+          alias: newModelAlias.trim() || undefined
+        }),
+      });
+      if (res.ok) {
+        setNewModelEndpoint('');
+        setNewModelName('');
+        setNewModelAlias('');
+        fetchModels();
+        setModelSuccessTimestamp(Date.now());
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setModelError(data.error || '添加模型失败');
+        setTimeout(() => setModelError(''), 3000);
+      }
+    } catch (err) {
+      console.error(err);
+      setModelError('添加模型发生网络错误');
+      setTimeout(() => setModelError(''), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleDeleteModel = (id: string, isPrimary: boolean) => {
+    setDeleteTarget({ type: 'model', id });
+    setDeleteModalMessage(
+      `确定要删除模型 "${id}" 吗？\n${isPrimary ? '注意：这是当前的默认模型！\n' : ''}如果该模型已被智能体使用，它们将自动恢复为默认模型。`
+    );
+    setIsDeleteModalOpen(true);
+  };
+
+  const handleSetDefaultModel = async (id: string) => {
+    setIsLoading(true);
+    try {
+      const res = await fetch('/api/models/manage/default', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      if (res.ok) {
+        fetchModels();
+        setModelSuccessTimestamp(Date.now());
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setModelError(data.error || '设置默认模型失败');
+        setTimeout(() => setModelError(''), 3000);
+      }
+    } catch (err) {
+      console.error(err);
+      setModelError('设置默认模型发生网络错误');
+      setTimeout(() => setModelError(''), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const startEditModel = (model: { id: string; alias?: string }) => {
+    setEditingModelId(model.id);
+    setEditingAlias(model.alias || '');
+    setTimeout(() => editAliasInputRef.current?.focus(), 50);
+  };
+
+  const cancelEditModel = () => {
+    setEditingModelId(null);
+    setEditingAlias('');
+  };
+
+  const handleSaveModelAlias = async () => {
+    if (!editingModelId) return;
+    setIsLoading(true);
+    try {
+      const res = await fetch('/api/models/manage', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: editingModelId, alias: editingAlias }),
+      });
+      if (res.ok) {
+        setEditingModelId(null);
+        setEditingAlias('');
+        fetchModels();
+        setModelSuccessTimestamp(Date.now());
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setModelError(data.error || '修改别名失败');
+        setTimeout(() => setModelError(''), 3000);
+      }
+    } catch (err) {
+      console.error(err);
+      setModelError('修改别名发生网络错误');
+      setTimeout(() => setModelError(''), 3000);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Get distinct endpoints from current models
+  const knownEndpoints = Array.from(new Set(models.map(m => m.id.split('/')[0]).filter(Boolean)));
+
+  const headerTitle = settingsTab === 'gateway' ? '设置 - 网关' : settingsTab === 'general' ? '设置 - 通用' : settingsTab === 'commands' ? '设置 - 快捷指令' : settingsTab === 'models' ? '设置 - 模型管理' : '关于系统';
 
   return (
     <div className="flex flex-col h-full bg-gray-50/50">
@@ -741,7 +891,184 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
             </div>
           )}
 
-          {/* About Tab */}
+          {/* Model Management Tab */}
+          {settingsTab === 'models' && (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-4">添加模型</h3>
+                
+                {modelError && (
+                  <div className="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
+                    <X className="w-4 h-4 shrink-0" />
+                    {modelError}
+                  </div>
+                )}
+                {modelSuccessTimestamp > 0 && Date.now() - modelSuccessTimestamp < 3000 && (
+                  <div className="mb-4 p-3 bg-green-50 text-green-600 text-sm rounded-xl border border-green-100 flex items-center gap-2 animate-in fade-in duration-300">
+                    <Check className="w-4 h-4 shrink-0" />
+                    操作成功，网关配置已更新
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-gray-500">提供商端点 (Endpoint)</label>
+                    <input
+                      list="known-endpoints"
+                      type="text"
+                      value={newModelEndpoint}
+                      onChange={(e) => setNewModelEndpoint(e.target.value)}
+                      placeholder="例如: openai"
+                      className="w-full px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 text-sm"
+                    />
+                    <datalist id="known-endpoints">
+                      {knownEndpoints.map(ep => (
+                        <option key={ep} value={ep} />
+                      ))}
+                    </datalist>
+                  </div>
+                  
+                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-gray-500">模型标识 (Model ID)</label>
+                    <input
+                      type="text"
+                      value={newModelName}
+                      onChange={(e) => setNewModelName(e.target.value)}
+                      placeholder="例如: gpt-5.4"
+                      className="w-full px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 text-sm"
+                    />
+                  </div>
+
+                  <div className="space-y-1 relative">
+                    <label className="text-xs font-medium text-gray-500">显示别名 (可选)</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={newModelAlias}
+                        onChange={(e) => setNewModelAlias(e.target.value)}
+                        placeholder="例如: GPT 5.4"
+                        className="flex-1 px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 text-sm"
+                      />
+                      <button
+                        onClick={handleAddModel}
+                        disabled={isLoading || !newModelEndpoint.trim() || !newModelName.trim()}
+                        className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors flex items-center justify-center"
+                        title="添加模型"
+                      >
+                        {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-4">现有模型列表</h3>
+                <div className="bg-white border text-sm border-gray-200 rounded-xl overflow-hidden shadow-sm">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-gray-50 border-b border-gray-200">
+                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap">模型 ID</th>
+                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap">别名</th>
+                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap w-24">状态</th>
+                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-right w-24">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100">
+                      {models.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="px-4 py-8 text-center text-gray-400">
+                            暂无模型配置
+                          </td>
+                        </tr>
+                      ) : (
+                        models.map((model) => (
+                          <tr key={model.id} className={`hover:bg-gray-50/50 transition-colors ${editingModelId === model.id ? 'bg-blue-50/30' : 'group'}`}>
+                            <td className="px-4 py-3 font-mono text-xs text-gray-700">{model.id}</td>
+                            <td className="px-4 py-3 text-gray-600">
+                              {editingModelId === model.id ? (
+                                <input
+                                  ref={editAliasInputRef}
+                                  type="text"
+                                  value={editingAlias}
+                                  onChange={(e) => setEditingAlias(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleSaveModelAlias();
+                                    if (e.key === 'Escape') cancelEditModel();
+                                  }}
+                                  placeholder="输入别名（可留空）"
+                                  className="w-full px-2 py-1 text-sm border border-blue-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                                />
+                              ) : (
+                                model.alias || <span className="text-gray-300">-</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3">
+                              {model.primary ? (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">
+                                  默认
+                                </span>
+                              ) : null}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              {editingModelId === model.id ? (
+                                <div className="flex items-center justify-end gap-1">
+                                  <button
+                                    onClick={handleSaveModelAlias}
+                                    disabled={isLoading}
+                                    className="p-1.5 text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
+                                    title="保存"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={cancelEditModel}
+                                    className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                                    title="取消"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <button
+                                    onClick={() => startEditModel(model)}
+                                    className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                                    title="修改别名"
+                                  >
+                                    <Edit2 className="w-4 h-4" />
+                                  </button>
+                                  {!model.primary && (
+                                    <button
+                                      onClick={() => handleSetDefaultModel(model.id)}
+                                      className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                      title="设为默认"
+                                    >
+                                      <Check className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => handleDeleteModel(model.id, model.primary)}
+                                    className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                    title="删除"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              )}
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* About System Tab */}
+
           {settingsTab === 'about' && (
             <div className="flex flex-col items-center justify-center min-h-[60vh]">
               <div className="bg-white rounded-3xl border border-gray-200 p-10 w-full max-w-lg text-center flex flex-col items-center">

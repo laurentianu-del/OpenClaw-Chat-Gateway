@@ -348,6 +348,73 @@ app.get('/api/models', (_req, res) => {
   res.json({ success: true, models });
 });
 
+app.post('/api/models/manage', async (req, res) => {
+  try {
+    const { endpoint, modelName, alias } = req.body;
+    if (!endpoint || !modelName) {
+      return res.status(400).json({ success: false, error: 'endpoint and modelName required' });
+    }
+    const success = await agentProvisioner.addModelConfig(endpoint, modelName, alias);
+    if (success) {
+      // Restart the gateway to apply
+      execPromise('openclaw gateway restart').catch(console.error);
+      return res.json({ success: true });
+    }
+    return res.status(400).json({ success: false, error: 'Model may already exist or config invalid' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/models/manage', async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+    
+    const success = await agentProvisioner.deleteModelConfig(id);
+    if (success) {
+      // Restart the gateway to apply
+      execPromise('openclaw gateway restart').catch(console.error);
+      return res.json({ success: true });
+    }
+    return res.status(404).json({ success: false, error: 'Model not found' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/models/manage/default', async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+
+    const success = await agentProvisioner.setDefaultModel(id);
+    if (success) {
+      // Restart the gateway to apply
+      execPromise('openclaw gateway restart').catch(console.error);
+      return res.json({ success: true });
+    }
+    return res.status(404).json({ success: false, error: 'Model not found' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/models/manage', async (req, res) => {
+  try {
+    const { id, alias } = req.body;
+    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+
+    const success = await agentProvisioner.updateModelConfig(id, alias);
+    if (success) {
+      return res.json({ success: true });
+    }
+    return res.status(404).json({ success: false, error: 'Model not found' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/characters', (_req, res) => {
   const characters = db.getCharacters().map(char => {
     const diskSoul = agentProvisioner.readSoul(char.agentId);

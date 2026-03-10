@@ -245,6 +245,115 @@ export class AgentProvisioner {
   }
 
   /**
+   * Add a new model to openclaw.json
+   */
+  async addModelConfig(endpoint: string, modelName: string, alias?: string): Promise<boolean> {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return false;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents) config.agents = {};
+    if (!config.agents.defaults) config.agents.defaults = {};
+    if (!config.agents.defaults.models) config.agents.defaults.models = {};
+
+    const modelId = `${endpoint}/${modelName}`;
+    if (config.agents.defaults.models[modelId]) {
+      // Model already exists
+      return false;
+    }
+
+    config.agents.defaults.models[modelId] = alias ? { alias } : {};
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return true;
+  }
+
+  /**
+   * Delete a model from openclaw.json and fallback agents using it to default
+   */
+  async deleteModelConfig(modelId: string): Promise<boolean> {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return false;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents?.defaults?.models?.[modelId]) {
+      return false; // Model doesn't exist
+    }
+
+    // 1. Remove the model definition
+    delete config.agents.defaults.models[modelId];
+
+    // 2. Handle primary model fallback
+    if (config.agents.defaults.model?.primary === modelId) {
+      // Choose the first available model as the new primary, or delete it
+      const remainingModels = Object.keys(config.agents.defaults.models);
+      if (remainingModels.length > 0) {
+        config.agents.defaults.model.primary = remainingModels[0];
+      } else {
+        delete config.agents.defaults.model.primary;
+      }
+    }
+
+    // 3. Fallback agents that were using this model (deleting their 'model' falls back to default)
+    if (Array.isArray(config.agents.list)) {
+      config.agents.list.forEach((agent: any) => {
+        if (agent.model === modelId) {
+          delete agent.model;
+        }
+      });
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return true;
+  }
+
+  /**
+   * Set a model as the default (primary) model in openclaw.json
+   */
+  async setDefaultModel(modelId: string): Promise<boolean> {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return false;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents) config.agents = {};
+    if (!config.agents.defaults) config.agents.defaults = {};
+    if (!config.agents.defaults.model) config.agents.defaults.model = {};
+
+    // Validate if the model actually exists
+    if (!config.agents.defaults.models?.[modelId]) {
+      return false;
+    }
+
+    config.agents.defaults.model.primary = modelId;
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return true;
+  }
+
+  /**
+   * Update a model's alias in openclaw.json
+   */
+  async updateModelConfig(modelId: string, alias?: string): Promise<boolean> {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return false;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents?.defaults?.models?.[modelId]) {
+      return false; // Model doesn't exist
+    }
+
+    // Update (or clear) alias
+    if (alias && alias.trim()) {
+      config.agents.defaults.models[modelId] = { ...config.agents.defaults.models[modelId], alias: alias.trim() };
+    } else {
+      // Clear alias
+      const { alias: _removed, ...rest } = config.agents.defaults.models[modelId];
+      config.agents.defaults.models[modelId] = rest;
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return true;
+  }
+
+  /**
    * Update the model for an existing agent in openclaw.json
    * For 'main' agent: updates agents.defaults.model.primary
    * For other agents: updates agents.list[].model

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Plus, Settings, ArrowLeft, X, Network, Terminal, Edit2, Trash2, Info } from 'lucide-react';
+import { Plus, Settings, ArrowLeft, X, Network, Terminal, Edit2, Trash2, Info, Cpu } from 'lucide-react';
 import { Reorder } from 'motion/react';
 import { ViewType, SettingsTab } from '../App';
 
@@ -349,6 +349,14 @@ export default function Sidebar({
             <Settings className="w-5 h-5" />
             通用设置
           </button>
+          <button 
+            onClick={() => navigateTo('settings', 'models', false)}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-semibold border ${settingsTab === 'models' ? 'text-blue-600 bg-blue-50 border-blue-300' : 'text-gray-600 hover:bg-gray-200 border-transparent'}`}
+          >
+            <Cpu className="w-5 h-5" />
+            模型管理
+          </button>
+          
           <button 
             onClick={() => navigateTo('settings', 'commands', false)}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-semibold border ${settingsTab === 'commands' ? 'text-blue-600 bg-blue-50 border-blue-300' : 'text-gray-600 hover:bg-gray-200 border-transparent'}`}
