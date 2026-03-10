@@ -406,7 +406,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         type="text"
                         value={openclawWorkspace}
                         onChange={(e) => setOpenclawWorkspace(e.target.value)}
-                        placeholder="/root/.openclaw/workspace"
+                        placeholder="/root/.openclaw/workspace-main"
                         className="flex-1 px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
                       />
                       <button

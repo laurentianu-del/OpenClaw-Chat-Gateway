@@ -68,6 +68,12 @@ const configManager = new ConfigManager();
 const sessionManager = new SessionManager(db);
 const agentProvisioner = new AgentProvisioner();
 
+// Ensure main agent workspace is registered in openclaw.json at startup
+const mainRegistered = agentProvisioner.ensureMainAgent();
+if (mainRegistered) {
+  console.log('[Startup] Main agent workspace registered in openclaw.json');
+}
+
 // LibreOffice detection
 let hasLibreOffice = false;
 const previewCacheDir = path.join(process.env.HOME || '.', '.clawui_preview_cache');
@@ -306,16 +312,10 @@ app.post('/api/config/test', async (req, res) => {
 });
 
 app.get('/api/config/detect-workspace', (req, res) => {
-  const homeDir = process.env.HOME || '';
-  const possiblePaths = [
-    path.join(homeDir, '.openclaw', 'workspace'),
-    '/root/.openclaw/workspace',
-  ];
+  const mainWorkspace = agentProvisioner.getWorkspacePath('main');
 
-  for (const p of possiblePaths) {
-    if (fs.existsSync(p)) {
-      return res.json({ success: true, path: p });
-    }
+  if (fs.existsSync(mainWorkspace)) {
+    return res.json({ success: true, path: mainWorkspace });
   }
 
   res.json({ success: false, message: 'Could not automatically detect workspace' });

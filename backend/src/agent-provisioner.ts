@@ -48,13 +48,42 @@ export class AgentProvisioner {
   }
 
   /**
-   * Get the workspace path for a given agentId
+   * Get the workspace path for a given agentId.
+   * Rule: agent "abc" uses "workspace-abc". No special cases.
    */
   getWorkspacePath(agentId: string): string {
-    if (agentId === 'main') {
-      return path.join(this.openclawDir, 'workspace-main');
-    }
     return path.join(this.openclawDir, `workspace-${agentId}`);
+  }
+
+  /**
+   * Ensure the 'main' agent has its workspace path registered in openclaw.json.
+   * Called at application startup so that the OpenClaw engine also picks up
+   * the correct workspace-main/ path instead of the default workspace/.
+   */
+  ensureMainAgent(): boolean {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return false;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents) config.agents = {};
+    if (!config.agents.list) config.agents.list = [];
+
+    const workspaceDir = this.getWorkspacePath('main');
+    const existing = config.agents.list.find((a: any) => a.id === 'main');
+
+    if (existing) {
+      if (existing.workspace === workspaceDir) return false; // already correct
+      existing.workspace = workspaceDir;
+    } else {
+      config.agents.list.push({ id: 'main', workspace: workspaceDir });
+    }
+
+    // Ensure the workspace directory exists
+    fs.mkdirSync(workspaceDir, { recursive: true });
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    console.log(`[AgentProvisioner] Registered main agent workspace: ${workspaceDir}`);
+    return true;
   }
 
   /**
@@ -72,10 +101,6 @@ export class AgentProvisioner {
         return false;
       }
 
-      // Skip provisioning for default 'main' agent
-      if (opts.agentId === 'main') {
-        return false;
-      }
 
       const workspaceDir = this.getWorkspacePath(opts.agentId);
       const agentDir = path.join(this.openclawDir, 'agents', opts.agentId, 'agent');
