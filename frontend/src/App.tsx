@@ -153,7 +153,7 @@ export default function App() {
 
   return (
     <div
-      className="flex fixed inset-0 h-[100dvh] w-full overflow-visible bg-gray-50 text-gray-900 font-sans antialiased"
+      className="flex fixed inset-0 h-[100dvh] w-full overflow-hidden bg-gray-50 text-gray-900 font-sans antialiased"
       style={{ opacity: appReady ? 1 : 0 }}
     >
       <Sidebar 
@@ -168,7 +168,7 @@ export default function App() {
         reorderSessions={reorderSessions}
         navigateTo={navigateTo}
       />
-      <main className="flex-1 flex flex-col min-w-0 bg-white overflow-visible md:relative md:z-[60]">
+      <main className="flex-1 flex flex-col min-w-0 bg-white overflow-hidden md:relative md:z-[60]">
         {currentView === 'chat' ? (
           <ChatView 
             isConnected={isConnected} 

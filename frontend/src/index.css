@@ -8,14 +8,9 @@ html,
 body,
 #root {
   height: 100%;
-  /* Use dvh (dynamic viewport height) so mobile browser chrome is excluded */
-  height: 100dvh;
   margin: 0;
   padding: 0;
   overflow: hidden;
-  /* iOS safe area support */
-  padding-bottom: env(safe-area-inset-bottom);
-  box-sizing: border-box;
 }
 
 /* Custom scrollbar */
