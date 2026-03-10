@@ -13,7 +13,6 @@ export type ChatRow = {
 export type SessionRow = {
   id: string;
   name: string;
-  description?: string;
   prompt?: string;
   agentId: string;
   characterId?: string;
@@ -25,10 +24,10 @@ export type SessionRow = {
 export type CharacterRow = {
   id: string;
   name: string;
-  description?: string;
   agentId: string;
   avatar?: string;
   systemPrompt?: string;
+  model?: string;
   created_at?: number;
 };
 
@@ -99,11 +98,11 @@ export class DB {
       );
 
       -- Insert default agents/characters
-      INSERT OR IGNORE INTO characters (id, name, description, agentId, systemPrompt) 
-      VALUES ('char_main', '通用助手', 'OpenClaw 默认全能助手', 'main', 'You are a helpful AI assistant.');
+      INSERT OR IGNORE INTO characters (id, name, agentId, systemPrompt) 
+      VALUES ('char_main', '通用助手', 'main', 'You are a helpful AI assistant.');
       
-      INSERT OR IGNORE INTO characters (id, name, description, agentId, systemPrompt) 
-      VALUES ('char_coder', '代码专家', '精通多种编程语言的架构师', 'coder', 'You are an expert software engineer and architect.');
+      INSERT OR IGNORE INTO characters (id, name, agentId, systemPrompt) 
+      VALUES ('char_coder', '代码专家', 'coder', 'You are an expert software engineer and architect.');
 
       -- Insert default commands if they don't exist
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/models', '列出模型供应商可进一步变更模型');
@@ -127,6 +126,10 @@ export class DB {
 
     try {
       this.db.exec("ALTER TABLE sessions ADD COLUMN position INTEGER DEFAULT 0");
+    } catch (e: any) {}
+
+    try {
+      this.db.exec("ALTER TABLE characters ADD COLUMN model TEXT");
     } catch (e: any) {}
   }
 
@@ -175,7 +178,7 @@ export class DB {
   getMessages(sessionKey: string, limit = 100): ChatRow[] {
     return this.db
       .prepare(
-        'SELECT id, session_key, role, content, created_at FROM chat_messages WHERE session_key = ? ORDER BY id DESC LIMIT ?'
+        "SELECT id, session_key, role, content, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at FROM chat_messages WHERE session_key = ? ORDER BY id DESC LIMIT ?"
       )
       .all(sessionKey, limit) as ChatRow[];
   }
@@ -198,6 +201,12 @@ export class DB {
       .all(limit);
   }
 
+  getFileByStoredName(filename: string) {
+    return this.db
+      .prepare('SELECT * FROM files WHERE stored_path LIKE ?')
+      .get(`%/${filename}`) as any;
+  }
+
   // --- Characters ---
   getCharacters(): CharacterRow[] {
     return this.db.prepare('SELECT * FROM characters ORDER BY created_at ASC').all() as CharacterRow[];
@@ -205,8 +214,8 @@ export class DB {
 
   saveCharacter(char: CharacterRow) {
     this.db
-      .prepare('INSERT INTO characters (id, name, description, agentId, avatar, systemPrompt) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, agentId=excluded.agentId, avatar=excluded.avatar, systemPrompt=excluded.systemPrompt')
-      .run(char.id, char.name, char.description || null, char.agentId, char.avatar || null, char.systemPrompt || null);
+      .prepare('INSERT INTO characters (id, name, agentId, avatar, systemPrompt, model) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, agentId=excluded.agentId, avatar=excluded.avatar, systemPrompt=excluded.systemPrompt, model=excluded.model')
+      .run(char.id, char.name, char.agentId, char.avatar || null, char.systemPrompt || null, char.model || null);
   }
 
   deleteCharacter(id: string) {
@@ -216,8 +225,8 @@ export class DB {
   // --- Sessions ---
   saveSession(session: SessionRow) {
     this.db
-      .prepare('INSERT INTO sessions (id, name, description, prompt, agentId, characterId, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, prompt=excluded.prompt, agentId=excluded.agentId, characterId=excluded.characterId, position=excluded.position, updated_at=excluded.updated_at')
-      .run(session.id, session.name, session.description || null, session.prompt || null, session.agentId, session.characterId || null, session.position, session.created_at, session.updated_at);
+      .prepare('INSERT INTO sessions (id, name, prompt, agentId, characterId, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, prompt=excluded.prompt, agentId=excluded.agentId, characterId=excluded.characterId, position=excluded.position, updated_at=excluded.updated_at')
+      .run(session.id, session.name, session.prompt || null, session.agentId, session.characterId || null, session.position, session.created_at, session.updated_at);
   }
 
   getSession(id: string): SessionRow | undefined {

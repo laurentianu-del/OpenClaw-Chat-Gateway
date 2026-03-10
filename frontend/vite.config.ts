@@ -24,7 +24,7 @@ export default defineConfig({
         target: `http://localhost:${process.env.BACKEND_PORT || 3100}`,
         changeOrigin: true,
       },
-      '/openclaw-media': {
+      '/openclaw': {
         target: `http://localhost:${process.env.BACKEND_PORT || 3100}`,
         changeOrigin: true,
       },

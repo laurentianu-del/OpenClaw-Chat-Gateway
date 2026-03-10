@@ -90,6 +90,24 @@ export class OpenClawClient extends EventEmitter {
             else pending.reject(new Error(msg?.error?.message || 'Request failed'));
             return;
           }
+
+          // Chat streaming events from gateway
+          if (msg.type === 'event' && msg.event === 'chat') {
+            const payload = msg.payload || msg.data;
+            if (!payload) return;
+
+            const state = payload.state; // 'delta' | 'final'
+            const sessionKey = payload.sessionKey;
+            const text = payload.message?.content?.[0]?.text || '';
+            const runId = payload.runId;
+
+            if (state === 'delta') {
+              this.emit('chat.delta', { sessionKey, runId, text });
+            } else if (state === 'final') {
+              this.emit('chat.final', { sessionKey, runId, text, message: payload.message });
+            }
+            return;
+          }
         } catch (err: any) {
           this.emit('error', new Error(err?.message || 'Failed to parse message'));
         }
@@ -141,6 +159,35 @@ export class OpenClawClient extends EventEmitter {
     return '';
   }
 
+  // Non-blocking: sends message and returns immediately. 
+  // Listen on 'chat.delta' and 'chat.final' events for the response.
+  async sendChatMessageStreaming(params: {
+    sessionKey: string;
+    message: string;
+    agentId?: string;
+  }): Promise<{ runId: string; sessionKey: string }> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    const agentId = params.agentId || 'main';
+    const finalSessionKey = params.sessionKey.startsWith('agent:') 
+      ? params.sessionKey 
+      : `agent:${agentId}:chat:${params.sessionKey}`;
+
+    const started = await this.request('chat.send', {
+      sessionKey: finalSessionKey,
+      message: params.message,
+      idempotencyKey: crypto.randomUUID(),
+    }, 30000);
+
+    const runId = started?.runId;
+    if (!runId) throw new Error('chat.send did not return runId');
+
+    return { runId, sessionKey: finalSessionKey };
+  }
+
+  // Blocking: sends message and waits for full response (legacy)
   async sendChatMessage(params: {
     sessionKey: string;
     message: string;
@@ -150,7 +197,6 @@ export class OpenClawClient extends EventEmitter {
       await this.connect();
     }
 
-    // Use standard OpenClaw session key format: agent:{agentId}:chat:{uniqueId}
     const agentId = params.agentId || 'main';
     const finalSessionKey = params.sessionKey.startsWith('agent:') 
       ? params.sessionKey 
@@ -159,7 +205,6 @@ export class OpenClawClient extends EventEmitter {
     const started = await this.request('chat.send', {
       sessionKey: finalSessionKey,
       message: params.message,
-      agentId: agentId,
       idempotencyKey: crypto.randomUUID(),
     }, 30000);
 

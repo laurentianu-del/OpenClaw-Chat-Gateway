@@ -1,4 +1,5 @@
 import express from 'express';
+import axios from 'axios';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
@@ -9,6 +10,7 @@ import OpenClawClient from './openclaw-client';
 import SessionManager from './session-manager';
 import ConfigManager from './config-manager';
 import DB from './db';
+import AgentProvisioner from './agent-provisioner';
 import { exec } from 'child_process';
 import util from 'util';
 import net from 'net';
@@ -32,22 +34,17 @@ const openclawMediaDir = path.join(process.env.HOME || '.', '.openclaw', 'media'
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     const config = configManager.getConfig();
-    let finalUploadDir = uploadDir;
-
-    if (config.openclawWorkspace) {
-      // Expand ~ if present
-      let workspacePath = config.openclawWorkspace;
-      if (workspacePath.startsWith('~')) {
-        workspacePath = path.join(process.env.HOME || '', workspacePath.slice(1));
-      }
-      
-      const sharedUploadDir = path.join(workspacePath, 'uploads');
-      try {
-        fs.mkdirSync(sharedUploadDir, { recursive: true });
-        finalUploadDir = sharedUploadDir;
-      } catch (err) {
-        console.error(`[Upload] Failed to use shared workspace: ${err instanceof Error ? err.message : String(err)}`);
-      }
+    const sessionId = _req.body?.sessionId || '';
+    const sessionInfo = sessionManager.getSession(sessionId);
+    const agentId = sessionInfo?.agentId || 'main';
+    const workspacePath = agentProvisioner.getWorkspacePath(agentId);
+    
+    const finalUploadDir = path.join(workspacePath, 'uploads');
+    console.log(`[Upload] Session: ${sessionId}, Agent: ${agentId}, Path: ${finalUploadDir}`);
+    try {
+      fs.mkdirSync(finalUploadDir, { recursive: true });
+    } catch (err) {
+      console.error(`[Upload] Failed to use workspace for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
     }
     
     cb(null, finalUploadDir);
@@ -69,6 +66,23 @@ const upload = multer({
 const db = new DB();
 const configManager = new ConfigManager();
 const sessionManager = new SessionManager(db);
+const agentProvisioner = new AgentProvisioner();
+
+// LibreOffice detection
+let hasLibreOffice = false;
+const previewCacheDir = path.join(process.env.HOME || '.', '.clawui_preview_cache');
+fs.mkdirSync(previewCacheDir, { recursive: true });
+
+(async () => {
+  try {
+    await execPromise('which libreoffice');
+    hasLibreOffice = true;
+    console.log('[Preview] ✅ LibreOffice detected - high-fidelity preview enabled');
+  } catch {
+    hasLibreOffice = false;
+    console.log('[Preview] ⚠️  LibreOffice not found - using client-side preview fallback');
+  }
+})();
 
 // Host checking middleware for reverse proxies
 app.use((req, res, next) => {
@@ -92,38 +106,45 @@ app.use((req, res, next) => {
 
 // Store active OpenClaw connections
 // Helper to rewrite outgoing messages: expand /uploads/ markdown links to absolute paths
-function rewriteOutgoingMessage(message: string): string {
-  const config = configManager.getConfig();
-  if (!config.openclawWorkspace) return message;
-
-  let workspacePath = config.openclawWorkspace;
-  if (workspacePath.startsWith('~')) {
-    workspacePath = path.join(process.env.HOME || '', workspacePath.slice(1));
-  }
+function rewriteOutgoingMessage(message: string, agentId: string): string {
+  const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
 
   // Regex to find markdown links like [name](/uploads/filename) or ![name](/uploads/filename)
   // or naked /uploads/filename if not in markdown
   return message.replace(/(\(?\/uploads\/)([^\s)]+)(\)?)/g, (match, prefix, filename, suffix) => {
     const absolutePath = path.join(absoluteUploadsDir, filename);
-    // If it was in parens (markdown), we might want to keep the parens or replace the whole thing
-    // Actually, OpenClaw expects file paths, so replacing (/uploads/...) with (absolute_path) is good
-    // But sometimes it might just be the raw string.
     return `${prefix.startsWith('(') ? '(' : ''}${absolutePath}${suffix.endsWith(')') ? ')' : ''}`;
   });
 }
 
 const connections = new Map<string, OpenClawClient>();
 
-// Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
+// Rewrite absolute local file paths in AI responses to HTTP-accessible download URLs
 function rewriteOpenClawMediaPaths(text: string): string {
-  // Match absolute paths like /home/user/.openclaw/media/browser/xxx.jpg
-  const homeDir = process.env.HOME || '';
-  const mediaPrefix = path.join(homeDir, '.openclaw', 'media');
-  // Escape for regex
-  const escaped = mediaPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const regex = new RegExp(escaped + '(/[^\\s)\\]"]+)', 'g');
-  return text.replace(regex, '/openclaw-media$1');
+  // Match absolute Unix paths, stopping at whitespace, Markdown punct, or Chinese brackets/parens
+  // \uff08\uff09 = （） \u3010\u3011 = 【】 \u300a\u300b = 《》
+  const regex = /(\/(?:[^\s\)\]\u0022\u0027\u0060|<>\uff08\uff09\u3010\u3011\u300a\u300b\u300c\u300d]+))/g;
+  
+  return text.replace(regex, (match, _p1, offset) => {
+    // Must have at least 2 path segments (e.g. /home/something) to avoid matching things like /api
+    if (match.split('/').length < 3) return match;
+    // Must have a file extension to be considered a downloadable file
+    const ext = path.extname(match);
+    if (!ext) return match;
+    // Skip URLs: check both the match content and surrounding context
+    if (match.includes('://')) return match;
+    // Skip if this is part of a URL (preceded by ":" from a scheme like https: or http:)
+    if (offset > 0 && text[offset - 1] === ':') return match;
+    
+    try {
+      const encodedPath = Buffer.from(match).toString('base64');
+      const filename = path.basename(match);
+      return `\n\n[${filename}](/api/files/download?path=${encodeURIComponent(encodedPath)})\n\n`;
+    } catch {
+      return match;
+    }
+  });
 }
 
 // Helper to get or create connection
@@ -162,6 +183,22 @@ app.get('/health', (_req, res) => {
 });
 
 // API Routes
+app.get('/api/system/check-update', async (_req, res) => {
+  try {
+    const response = await axios.get('https://api.github.com/repos/liandu2024/OpenClaw-Chat-Gateway/releases/latest', {
+      timeout: 10000,
+      headers: {
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'OpenClaw-Chat-Gateway-ClawUI'
+      }
+    });
+    res.json(response.data);
+  } catch (error) {
+    console.error('[UpdateCheck] Failed to fetch latest release:', error instanceof Error ? error.message : String(error));
+    res.status(500).json({ error: 'Failed to fetch update info from GitHub' });
+  }
+});
+
 app.get('/api/config', (_req, res) => {
   const config = configManager.getConfig();
   res.json({
@@ -306,50 +343,240 @@ app.post('/api/config/restart', async (_req, res) => {
   }
 });
 
-app.get('/api/characters', (_req, res) => {
-  res.json({ success: true, characters: db.getCharacters() });
+app.get('/api/models', (_req, res) => {
+  const models = agentProvisioner.readAvailableModels();
+  res.json({ success: true, models });
 });
 
-app.post('/api/characters', (req, res) => {
+app.get('/api/characters', (_req, res) => {
+  const characters = db.getCharacters().map(char => {
+    const diskSoul = agentProvisioner.readSoul(char.agentId);
+    if (diskSoul !== null) {
+      char.systemPrompt = diskSoul;
+    }
+    // Always read the actual model from openclaw.json (source of truth)
+    const actualModel = agentProvisioner.readAgentModel(char.agentId);
+    if (actualModel) {
+      char.model = actualModel;
+    }
+    return char;
+  });
+  res.json({ success: true, characters });
+});
+
+app.post('/api/characters', async (req, res) => {
   const char = req.body;
   if (!char.id) char.id = 'char_' + Date.now();
+
+  // Validate agentId
+  if (!char.agentId) {
+    return res.status(400).json({ success: false, error: '智能体 ID 不能为空' });
+  }
+  if (/\s/.test(char.agentId)) {
+    return res.status(400).json({ success: false, error: '智能体 ID 不允许包含空格' });
+  }
+  
+  // Check for duplicate agentId (excluding the current character being edited)
+  const existingChars = db.getCharacters();
+  const isDuplicate = existingChars.some(c => c.agentId === char.agentId && c.id !== char.id);
+  if (isDuplicate) {
+    return res.status(400).json({ success: false, error: `智能体 ID "${char.agentId}" 已存在，请使用其他 ID` });
+  }
+
+  // Provision full isolated environment in OpenClaw (workspace, SOUL.md, USER.md, etc.)
+  const configChanged = await agentProvisioner.provision({
+    agentId: char.agentId,
+    soulContent: char.systemPrompt,
+    model: char.model,
+  });
+  
+  // Also update SOUL.md if this is an existing character being re-saved
+  if (!configChanged) {
+    await agentProvisioner.updateSoul(char.agentId, char.systemPrompt);
+    // Update model in config if changed
+    const modelChanged = await agentProvisioner.updateModel(char.agentId, char.model);
+    if (modelChanged) {
+      try { await execPromise('openclaw gateway restart'); } catch (e) {
+        console.error('Failed to restart gateway:', e);
+      }
+    }
+  }
+  
   db.saveCharacter(char);
+
+  if (configChanged) {
+      console.log('OpenClaw config changed for new agent, restarting gateway...');
+      try {
+          await execPromise('openclaw gateway restart');
+      } catch (e) {
+          console.error('Failed to restart gateway automatically:', e);
+      }
+  }
+
   res.json({ success: true, character: char });
 });
 
-app.delete('/api/characters/:id', (req, res) => {
-  db.deleteCharacter(req.params.id);
+app.delete('/api/characters/:id', async (req, res) => {
+  try {
+    const character = db.getCharacters().find(c => c.id === req.params.id);
+    if (!character) {
+      return res.status(404).json({ success: false, error: 'Character not found' });
+    }
+
+    db.deleteCharacter(req.params.id);
+
+    // Deprovision agent: remove from OpenClaw config + delete workspace & state dirs
+    if (character.agentId && character.agentId !== 'main') {
+      const configChanged = await agentProvisioner.deprovision(character.agentId);
+      if (configChanged) {
+        console.log(`Agent "${character.agentId}" fully removed, restarting gateway...`);
+        try {
+          await execPromise('openclaw gateway restart');
+        } catch (e) {
+          console.error('Failed to restart gateway automatically:', e);
+        }
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error('Error deleting character:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// USER.md read/write API for per-character user profile
+app.get('/api/characters/:agentId/user-md', (req, res) => {
+  const content = agentProvisioner.readUserMd(req.params.agentId);
+  res.json({ success: true, content });
+});
+
+app.put('/api/characters/:agentId/user-md', (req, res) => {
+  const { content } = req.body;
+  if (typeof content !== 'string') {
+    return res.status(400).json({ success: false, error: 'Missing content' });
+  }
+  agentProvisioner.writeUserMd(req.params.agentId, content);
   res.json({ success: true });
 });
 
 app.get('/api/sessions', (_req, res) => {
   const sessions = sessionManager.getAllSessions();
-  res.json(sessions);
+  const sessionsWithModel = sessions.map(session => {
+    return {
+      ...session,
+      model: agentProvisioner.readAgentModel(session.agentId) || ''
+    };
+  });
+  res.json(sessionsWithModel);
 });
 
-app.post('/api/sessions', (req, res) => {
-  const { name, description, prompt, characterId } = req.body;
-  const newSession = sessionManager.createSession({ name, description, prompt, characterId });
-  res.json({ success: true, session: newSession });
+app.post('/api/sessions', async (req, res) => {
+  const { id, name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model } = req.body;
+  const prompt = soulContent;
+  
+  if (id && sessionManager.getSession(id)) {
+    return res.status(400).json({ success: false, error: 'Agent ID already exists' });
+  }
+
+  // Provide basic default for first session if it doesn't exist
+  const newSession = sessionManager.createSession({ id, name, prompt });
+  const agentId = newSession.id;
+
+  // Provision agent workspace
+  await agentProvisioner.provision({ 
+    agentId, 
+    soulContent: prompt,
+    userContent,
+    agentsContent,
+    toolsContent,
+    heartbeatContent,
+    identityContent,
+    model 
+  });
+  
+  // Update session record with the auto-generated agentId
+  sessionManager.updateSession(newSession.id, { agentId });
+  const finalSession = sessionManager.getSession(newSession.id);
+
+  res.json({ success: true, session: finalSession });
 });
 
-app.put('/api/sessions/:id', (req, res) => {
-  const { name, description, prompt, characterId } = req.body;
-  const updated = sessionManager.updateSession(req.params.id, { name, description, prompt, characterId });
-  if (updated) {
-    res.json({ success: true, session: updated });
+app.put('/api/sessions/:id', async (req, res) => {
+  const { name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model } = req.body;
+  const prompt = soulContent;
+  const session = sessionManager.getSession(req.params.id);
+  
+  if (!session) {
+    return res.status(404).json({ success: false, error: 'Session not found' });
+  }
+
+  const updated = sessionManager.updateSession(req.params.id, { name, prompt });
+  
+  if (session.agentId) {
+    await agentProvisioner.updateSoul(session.agentId, prompt || '');
+    if (userContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'USER.md', userContent);
+    if (agentsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'AGENTS.md', agentsContent);
+    if (toolsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'TOOLS.md', toolsContent);
+    if (heartbeatContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'HEARTBEAT.md', heartbeatContent);
+    if (identityContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'IDENTITY.md', identityContent);
+    
+    // Model update might require gateway restart
+    const modelChanged = await agentProvisioner.updateModel(session.agentId, model);
+    if (modelChanged) {
+      try { await execPromise('openclaw gateway restart'); } catch(e) {}
+    }
+  }
+
+  res.json({ success: true, session: updated });
+});
+
+app.delete('/api/sessions/:id', async (req, res) => {
+  const session = sessionManager.getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ success: false, error: 'Session not found' });
+  }
+
+  if (session.id === 'main' || session.agentId === 'main') {
+    return res.status(400).json({ success: false, error: 'Cannot delete the main agent session' });
+  }
+
+  const agentId = session.agentId;
+  const success = sessionManager.deleteSession(req.params.id);
+  
+  if (success) {
+    if (agentId && agentId !== 'main') {
+      const configChanged = await agentProvisioner.deprovision(agentId);
+      if (configChanged) {
+        try { await execPromise('openclaw gateway restart'); } catch(e) {}
+      }
+    }
+    res.json({ success: true });
   } else {
     res.status(404).json({ success: false, error: 'Session not found' });
   }
 });
 
-app.delete('/api/sessions/:id', (req, res) => {
-  const success = sessionManager.deleteSession(req.params.id);
-  if (success) {
-    res.json({ success: true });
-  } else {
-    res.status(404).json({ success: false, error: 'Session not found or default session' });
+// Endpoint to fetch all configuring MD files for a given session's agent
+app.get('/api/sessions/:id/configs', (req, res) => {
+  const session = sessionManager.getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ success: false, error: 'Session not found' });
   }
+  
+  const agentId = session.agentId;
+  res.json({
+    success: true,
+    configs: {
+      soulContent: agentProvisioner.readSoul(agentId) || '',
+      userContent: agentProvisioner.readAgentFile(agentId, 'USER.md', ''),
+      agentsContent: agentProvisioner.readAgentFile(agentId, 'AGENTS.md', ''),
+      toolsContent: agentProvisioner.readAgentFile(agentId, 'TOOLS.md', ''),
+      heartbeatContent: agentProvisioner.readAgentFile(agentId, 'HEARTBEAT.md', ''),
+      identityContent: agentProvisioner.readAgentFile(agentId, 'IDENTITY.md', ''),
+      model: agentProvisioner.readAgentModel(agentId)
+    }
+  });
 });
 
 app.post('/api/sessions/reorder', (req, res) => {
@@ -387,33 +614,91 @@ app.post('/api/chat', async (req, res) => {
     const sessionInfo = sessionManager.getSession(sessionId);
     let finalMessage = String(message);
 
-    // If session has a system prompt, check if this is the first message
     if (sessionInfo && sessionInfo.prompt) {
       const history = db.getMessages(sessionId, 1);
       if (history.length === 0) {
-        // Prepend the prompt if it's the very first message
         finalMessage = `[System Instructions: ${sessionInfo.prompt}]\n\nUser: ${finalMessage}`;
       }
     }
 
     db.saveMessage({ session_key: sessionId, role: 'user', content: String(message) });
     const client = await getConnection(sessionId);
-    
-    // Rewrite outgoing message to expand relative upload paths to absolute ones for OpenClaw
-    const outgoingMessage = rewriteOutgoingMessage(finalMessage);
-    
     const agentId = sessionInfo?.agentId || 'main';
-    const rawResponse = await client.sendChatMessage({ 
-      sessionKey: sessionId, 
+    const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
+
+    // Set up SSE streaming
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    let lastText = '';
+    let streamEnded = false;
+
+    const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
+      if (streamEnded) return;
+      lastText = data.text;
+      const rewritten = rewriteOpenClawMediaPaths(data.text);
+      res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
+    };
+
+    const onFinal = (data: { sessionKey: string; runId: string; text: string }) => {
+      if (streamEnded) return;
+      streamEnded = true;
+      const finalText = data.text || lastText;
+      const rewritten = rewriteOpenClawMediaPaths(finalText);
+
+      // Save final response to DB
+      db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten });
+
+      res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
+      res.end();
+
+      // Cleanup listeners
+      client.off('chat.delta', onDelta);
+      client.off('chat.final', onFinal);
+    };
+
+    // Listen for streaming events
+    client.on('chat.delta', onDelta);
+    client.on('chat.final', onFinal);
+
+    // Send the message (non-blocking)
+    const { runId } = await client.sendChatMessageStreaming({
+      sessionKey: sessionId,
       message: outgoingMessage,
       agentId: agentId
     });
-    // Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
-    const response = rewriteOpenClawMediaPaths(rawResponse);
-    db.saveMessage({ session_key: sessionId, role: 'assistant', content: String(response) });
-    res.json({ success: true, response });
+
+    // Safety timeout: if no final event after 120s, end the stream
+    const safetyTimeout = setTimeout(() => {
+      if (!streamEnded) {
+        streamEnded = true;
+        const rewritten = rewriteOpenClawMediaPaths(lastText || 'Response timed out.');
+        db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten });
+        res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
+        res.end();
+        client.off('chat.delta', onDelta);
+        client.off('chat.final', onFinal);
+      }
+    }, 120000);
+
+    // Clean up on client disconnect
+    req.on('close', () => {
+      streamEnded = true;
+      clearTimeout(safetyTimeout);
+      client.off('chat.delta', onDelta);
+      client.off('chat.final', onFinal);
+    });
+
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    } else {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
@@ -507,10 +792,135 @@ app.delete('/api/commands/:id', (req, res) => {
   }
 });
 
-app.use('/uploads', express.static(uploadDir));
+app.get('/uploads/:filename', (req, res) => {
+  const filename = req.params.filename;
+  
+  // 1. Try to find in database (to support agent workspaces)
+  const fileInfo = db.getFileByStoredName(filename);
+  if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
+    return res.sendFile(fileInfo.stored_path);
+  }
 
-// Serve OpenClaw media files (screenshots, inbound, etc.)
-app.use('/openclaw-media', express.static(openclawMediaDir));
+  // 2. Fallback to global upload dir
+  const globalPath = path.join(uploadDir, filename);
+  if (fs.existsSync(globalPath)) {
+    return res.sendFile(globalPath);
+  }
+
+  res.status(404).send('File not found');
+});
+
+
+// Serve OpenClaw files (workspaces, media, etc.)
+app.use('/openclaw', express.static(path.join(process.env.HOME || '', '.openclaw')));
+
+// Securely serve arbitrary local files via base64 encoded paths
+app.get('/api/files/download', (req, res) => {
+  const b64Path = req.query.path as string;
+  if (!b64Path) {
+    return res.status(400).send('Missing path parameter');
+  }
+
+  try {
+    const absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
+    
+    // Basic security check: ensure it's an absolute path
+    if (!path.isAbsolute(absolutePath)) {
+      return res.status(403).send('Only absolute paths are allowed');
+    }
+
+    if (!fs.existsSync(absolutePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    const filename = path.basename(absolutePath);
+    // Set proper Content-Disposition with UTF-8 filename for correct downloads
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    res.sendFile(absolutePath);
+  } catch (error: any) {
+    console.error(`[Download Error] ${error.message}`);
+    res.status(500).send('Failed to serve file');
+  }
+});
+
+// File preview capabilities
+app.get('/api/files/capabilities', (_req, res) => {
+  res.json({ libreoffice: hasLibreOffice });
+});
+
+app.get('/api/files/preview', async (req, res) => {
+  try {
+    if (!hasLibreOffice) {
+      return res.status(501).json({ error: 'LibreOffice not available', fallback: true });
+    }
+
+    let absolutePath = '';
+    const b64Path = req.query.path as string;
+    const filenameParam = req.query.filename as string;
+
+    if (b64Path) {
+      absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
+      if (!path.isAbsolute(absolutePath)) {
+        return res.status(403).send('Only absolute paths are allowed');
+      }
+    } else if (filenameParam) {
+      // Resolve uploaded file path
+      const decodedFilename = decodeURIComponent(filenameParam);
+      const fileInfo = db.getFileByStoredName(decodedFilename);
+      if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
+        absolutePath = fileInfo.stored_path;
+      } else {
+        const globalPath = path.join(uploadDir, decodedFilename);
+        if (fs.existsSync(globalPath)) {
+          absolutePath = globalPath;
+        }
+      }
+    }
+
+    if (!absolutePath || !fs.existsSync(absolutePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    // Create a hash-based cache key
+    const crypto = require('crypto');
+    const stat = fs.statSync(absolutePath);
+    const cacheKey = crypto.createHash('md5').update(`${absolutePath}:${stat.mtimeMs}`).digest('hex');
+    const cachedPdf = path.join(previewCacheDir, `${cacheKey}.pdf`);
+
+    // Serve from cache if available
+    if (fs.existsSync(cachedPdf)) {
+      res.setHeader('Content-Type', 'application/pdf');
+      return res.sendFile(cachedPdf);
+    }
+
+    // Convert using LibreOffice
+    const tmpDir = path.join(previewCacheDir, cacheKey);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    await execPromise(
+      `libreoffice --headless --convert-to pdf --outdir "${tmpDir}" "${absolutePath}"`,
+      { timeout: 30000 }
+    );
+
+    // Find the output PDF
+    const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.pdf'));
+    if (files.length === 0) {
+      throw new Error('LibreOffice conversion produced no PDF output');
+    }
+
+    const outputPdf = path.join(tmpDir, files[0]);
+    // Move to cache location
+    fs.renameSync(outputPdf, cachedPdf);
+    // Clean up tmp dir
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.sendFile(cachedPdf);
+  } catch (error: any) {
+    console.error(`[Preview Error] ${error.message}`);
+    res.status(500).json({ error: 'Preview conversion failed', message: error.message });
+  }
+});
 
 // Serve static files from frontend
 app.use(express.static(path.join(__dirname, '../../frontend/dist')));

@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect, useCallback, Children, isValidElement, cloneElement, ReactNode } from 'react';
-import { Menu, Plus, Quote, Copy, Check, FileText, FileImage, FileArchive, FileCode, File as FileIcon, Download, Music, Video, X, Search, ChevronUp, ChevronDown, Trash2 } from 'lucide-react';
+import { Menu, Plus, Quote, Copy, Check, Download, X, Search, ChevronUp, ChevronDown, Trash2 } from 'lucide-react';
+import { getFileIconInfo } from '../utils/fileUtils';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import FilePreviewModal from './FilePreviewModal';
 
 interface Message {
   id: string;
@@ -17,7 +19,7 @@ interface ChatViewProps {
   isConnected: boolean;
   activeSessionId: string;
   onMenuClick: () => void;
-  sessions: {id: string, name: string}[];
+  sessions: {id: string, name: string, characterId?: string, model?: string}[];
 }
 
 export default function ChatView({ isConnected, activeSessionId, onMenuClick, sessions }: ChatViewProps) {
@@ -34,13 +36,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<{file: File, preview: string}[]>([]);
   const [isDragging, setIsDragging] = useState(false);
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [previewType, setPreviewType] = useState<'image' | 'pdf' | null>(null);
+  const [previewFile, setPreviewFile] = useState<{url: string, filename: string} | null>(null);
   const [aiName, setAiName] = useState('OpenClaw');
   const [quotedMessage, setQuotedMessage] = useState<Message | null>(null);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [messageToDelete, setMessageToDelete] = useState<string | null>(null);
+  const [characters, setCharacters] = useState<any[]>([]);
 
   // --- Search States ---
   const [showMobileSearch, setShowMobileSearch] = useState(false);
@@ -186,6 +188,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
 
   // --- Effects ---
   useEffect(() => {
+    isInitialLoad.current = true; // Reset scroll behavior for new session
     loadHistory();
   }, [activeSessionId]);
 
@@ -197,6 +200,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       .catch(() => {});
     
     fetchCommands();
+    
+    // Fetch characters for AI header details
+    fetch('/api/characters')
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) setCharacters(data.characters);
+      });
   }, []);
 
   const fetchCommands = async () => {
@@ -212,16 +222,24 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
   const isInitialLoad = useRef(true);
 
   useEffect(() => {
+    // Don't scroll (or flip the flag) when messages is empty — 
+    // that's the initial state before loadHistory() completes.
+    if (messages.length === 0) return;
+
     const scrollToBottom = () => {
       if (messagesEndRef.current) {
-        messagesEndRef.current.scrollIntoView({ behavior: isInitialLoad.current ? 'instant' : 'smooth' });
+        // Use 'instant' for initial load/session switch, 'smooth' for new messages
+        messagesEndRef.current.scrollIntoView({ 
+          behavior: isInitialLoad.current ? 'instant' : 'smooth',
+          block: 'end'
+        });
       }
       if (isInitialLoad.current) {
         isInitialLoad.current = false;
       }
     };
     // Small delay to ensure DOM is rendered
-    const timer = setTimeout(scrollToBottom, 100);
+    const timer = setTimeout(scrollToBottom, 50);
     return () => clearTimeout(timer);
   }, [messages]);
 
@@ -265,7 +283,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
     try {
       const configRes = await fetch('/api/config');
       const configData = await configRes.json();
-      if (configData?.defaultAgent) {
+      if (configData?.defaultAgent && configData.defaultAgent !== 'main') {
         setCurrentModel(configData.defaultAgent);
       }
 
@@ -399,8 +417,8 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       let uploadedContent = '';
       if (currentFiles.length > 0) {
         const fd = new FormData();
-        currentFiles.forEach(f => fd.append('files', f.file));
         fd.append('sessionId', activeSessionId);
+        currentFiles.forEach(f => fd.append('files', f.file));
         const upRes = await fetch('/api/files/upload', { method: 'POST', body: fd });
         const upData = await upRes.json();
         if (upData?.success && upData.files) {
@@ -436,7 +454,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
         timestamp: new Date(),
       };
 
-      setMessages(prev => [...prev, userMessage]);
+      const assistantId = (Date.now() + 1).toString();
+      setMessages(prev => [...prev, userMessage, {
+        id: assistantId,
+        role: 'assistant' as const,
+        content: '',
+        timestamp: new Date(),
+      }]);
 
       const response = await fetch('/api/chat', {
         method: 'POST',
@@ -446,25 +470,55 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       });
 
       if (!response.ok) throw new Error('API Error');
+      if (!response.body) throw new Error('No response body');
 
-      const data = await response.json();
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: data.response || 'No response',
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, assistantMessage]);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === 'delta' || evt.type === 'final') {
+              setMessages(prev => prev.map(m => 
+                m.id === assistantId ? { ...m, content: evt.text } : m
+              ));
+            }
+            if (evt.type === 'error') {
+              setMessages(prev => prev.map(m => 
+                m.id === assistantId ? { ...m, content: `❌ Error: ${evt.error}` } : m
+              ));
+            }
+          } catch {}
+        }
+      }
     } catch (error: any) {
       if (error.name === 'AbortError') {
-        // User cancelled – don't show an error bubble, just stop
+        // User cancelled
       } else {
-        setMessages(prev => [...prev, {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
-          content: `❌ Error: ${error.message}`,
-          timestamp: new Date(),
-        }]);
+        setMessages(prev => {
+          // Update the placeholder if it exists, otherwise add error
+          const hasPlaceholder = prev.some(m => m.role === 'assistant' && m.content === '');
+          if (hasPlaceholder) {
+            return prev.map(m => m.role === 'assistant' && m.content === '' 
+              ? { ...m, content: `❌ Error: ${error.message}` } : m);
+          }
+          return [...prev, {
+            id: (Date.now() + 1).toString(),
+            role: 'assistant',
+            content: `❌ Error: ${error.message}`,
+            timestamp: new Date(),
+          }];
+        });
       }
     } finally {
       abortControllerRef.current = null;
@@ -509,6 +563,14 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
     }
   };
 
+  const handlePaste = (e: React.ClipboardEvent) => {
+    if (e.clipboardData && e.clipboardData.files.length > 0) {
+      e.preventDefault();
+      const files = Array.from(e.clipboardData.files);
+      handleFileChange(files);
+    }
+  };
+
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -531,7 +593,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       content: command,
       timestamp: new Date(),
     };
-    setMessages(prev => [...prev, userMessage]);
+    const assistantId = (Date.now() + 1).toString();
+    setMessages(prev => [...prev, userMessage, {
+      id: assistantId,
+      role: 'assistant' as const,
+      content: '',
+      timestamp: new Date(),
+    }]);
 
     try {
       const response = await fetch('/api/chat', {
@@ -540,21 +608,36 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
         body: JSON.stringify({ sessionId: activeSessionId, message: command }),
       });
       if (!response.ok) throw new Error('API Error');
-      const data = await response.json();
-      const assistantMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: data.response || 'No response',
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, assistantMessage]);
+      if (!response.body) throw new Error('No response body');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const evt = JSON.parse(line.slice(6));
+            if (evt.type === 'delta' || evt.type === 'final') {
+              setMessages(prev => prev.map(m => 
+                m.id === assistantId ? { ...m, content: evt.text } : m
+              ));
+            }
+          } catch {}
+        }
+      }
     } catch (error: any) {
-      setMessages(prev => [...prev, {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: `\u274c Error: ${error.message}`,
-        timestamp: new Date(),
-      }]);
+      setMessages(prev => prev.map(m => 
+        m.id === assistantId ? { ...m, content: `❌ Error: ${error.message}` } : m
+      ));
     } finally {
       setIsLoading(false);
     }
@@ -694,7 +777,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
 
   return (
     <div 
-      className="flex flex-col h-full bg-white relative overflow-hidden"
+      className="flex flex-col h-full bg-white relative"
       onDragEnter={handleDrag}
       onDragOver={handleDrag}
       onDragLeave={handleDrag}
@@ -725,8 +808,8 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
               <Menu className="w-6 h-6" />
             </button>
             <div className="flex items-center space-x-2 sm:space-x-3">
-              <h1 className="text-[17px] sm:text-lg font-bold text-gray-900 leading-tight truncate max-w-[130px] sm:max-w-[400px]">
-                <span className="hidden md:inline">{aiName} | </span>{activeSessionName}
+              <h1 className="text-[17px] sm:text-lg font-bold text-gray-900 leading-tight truncate">
+                {aiName}
               </h1>
               <div className={`flex items-center gap-1 sm:gap-1.5 text-xs sm:text-sm ${isConnected ? 'text-green-600' : 'text-red-500'}`}>
                 <span className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} ${isLoading && isConnected ? 'animate-pulse' : ''}`}></span>
@@ -807,9 +890,42 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
         </div>
       </header>
 
-      {/* Message List + Nav Bar */}
-      <div className="flex-1 flex relative overflow-hidden">
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 sm:px-8 sm:py-4 space-y-6 bg-white scroll-smooth pb-0">
+      {/* Message List Area */}
+      <div className="flex-1 flex relative min-h-0">
+        {/* Navigation dots overlaying the Sidebar border */}
+        {navDots.length > 0 && (
+          <div className="hidden md:block absolute left-0 top-0 bottom-0 w-0 z-[60]">
+            <div className="absolute inset-0 flex flex-col pt-4 pb-4">
+              {navDots.map((dot) => (
+                <div
+                  key={dot.id}
+                  className="absolute left-0 -translate-x-1/2 z-10"
+                  style={{ top: `${Math.max(2, Math.min(98, dot.top))}%` }}
+                  onMouseEnter={() => setHoveredDot(dot.id)}
+                  onMouseLeave={() => setHoveredDot(null)}
+                >
+                  <button
+                    onClick={() => scrollToUserMsg(dot.id)}
+                    className={`rounded-full transition-all duration-200 hover:scale-150 relative ${
+                      activeNavDot === dot.id
+                        ? 'w-3 h-3 bg-blue-500'
+                        : 'w-2.5 h-2.5 bg-gray-400 hover:bg-blue-400'
+                    }`}
+                  />
+                  {/* Tooltip */}
+                  {hoveredDot === dot.id && (
+                    <div className="absolute left-full ml-3 top-1/2 -translate-y-1/2 w-max max-w-[240px] px-3 py-2 bg-gray-800 text-white text-[12px] rounded-lg whitespace-pre-wrap break-words leading-relaxed pointer-events-none animate-in fade-in duration-150 z-50">
+                      <div className="line-clamp-3">{dot.content}</div>
+                      <div className="absolute top-1/2 -translate-y-1/2 left-[-4px] w-0 h-0 border-t-4 border-b-4 border-r-4 border-t-transparent border-b-transparent border-r-gray-800" />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden p-4 sm:px-8 sm:py-4 space-y-6 bg-white scroll-smooth pb-0 relative">
         <div className="flex justify-center mb-8">
             <span className="px-4 py-1.5 bg-[#eff1f4] text-gray-500 text-[11px] rounded-full font-bold">
                 {messages.length > 0 ? messages[0].timestamp.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' }) : '开始对话'}
@@ -832,13 +948,31 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                 <div className="h-px bg-gray-200 flex-1"></div>
               </div>
             )}
-            <div data-msg-id={msg.id} {...(msg.role === 'user' ? {'data-user-msg-id': msg.id} : {})} className={`flex w-full mb-6 transition-all duration-500 group/msg ${isHighlighted ? 'ring-4 ring-blue-500/20 bg-blue-50/30 -mx-4 px-4 py-2 rounded-2xl' : ''} ${msg.role === 'user' ? 'justify-end' : 'flex-col sm:flex-row justify-start items-start'}`}>
-            {msg.role === 'assistant' && (
-              <div className="flex items-center gap-2 mb-2 sm:mb-0 sm:mr-4 sm:mt-0.5 flex-shrink-0">
-                <img src="/ai-robot.jpg" alt="AI" className="w-8 h-8 rounded-full border border-gray-200 object-cover bg-gray-50 flex items-center justify-center overflow-hidden" />
-              </div>
-            )}
+            <div data-msg-id={msg.id} {...(msg.role === 'user' ? {'data-user-msg-id': msg.id} : {})} className={`flex w-full mb-6 transition-all duration-500 group/msg ${isHighlighted ? 'ring-4 ring-blue-500/20 bg-blue-50/30 -mx-4 px-4 py-2 rounded-2xl' : ''} ${msg.role === 'user' ? 'justify-end' : 'flex-col justify-start items-start'}`}>
             <div className={`flex flex-col min-w-0 ${msg.role === 'user' ? 'items-end max-w-[85%]' : 'items-start flex-1 w-full'}`}>
+              {msg.role === 'assistant' && (
+                <div className="flex items-center gap-3 mb-4 flex-wrap w-full">
+                  <img src="/ai-robot.jpg" alt="AI" className="w-8 h-8 rounded-full border border-gray-200 object-cover bg-gray-50 flex-shrink-0" />
+                  <div className="flex items-center gap-2 flex-wrap min-w-0">
+                    <span className="text-[17px] font-bold text-gray-900 leading-none">{activeSessionName}</span>
+                    {(() => {
+                      const session = sessions.find(s => s.id === activeSessionId);
+                      const character = characters.find(c => c.id === session?.characterId);
+                      
+                      const modelDisplayName = session?.model || character?.model || currentModel || 'OpenClaw';
+                      
+                      return (
+                        <>
+                          {/* character name alias removed per user request */}
+                          <div className="px-2.5 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-blue-600 text-[12px] tracking-tight">
+                            {modelDisplayName}
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
               <div className={`group relative text-[16px] leading-[1.6] transition-all duration-300 ${
                 msg.role === 'user' 
                   ? `text-[#1f2937] border px-5 py-3 rounded-[20px] rounded-tr-[4px] ${isHighlighted ? 'bg-blue-100 border-blue-400' : 'bg-[#edf2f7] border-gray-300'}`
@@ -864,9 +998,9 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                               <div className="absolute right-2 top-2 z-20">
                                 <button
                                   onClick={() => handleCopy(codeText, `code-${msg.id}`)}
-                                  className="p-1.5 rounded-md bg-white border border-gray-300 text-gray-500 hover:text-blue-500 hover:bg-white transition-all opacity-0 group-hover/code:opacity-100 flex items-center gap-1 text-[10px] font-bold uppercase"
+                                  className="p-1 px-2.5 rounded-xl bg-white border border-gray-200 text-gray-600 hover:text-blue-600 hover:border-blue-200 hover:bg-blue-50 transition-all opacity-0 group-hover/code:opacity-100 flex items-center gap-1.5 text-[13px] font-sans font-medium"
                                 >
-                                  {copiedId === `code-${msg.id}` ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                                  {copiedId === `code-${msg.id}` ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                                   <span>{copiedId === `code-${msg.id}` ? '已复制' : '复制'}</span>
                                 </button>
                               </div>
@@ -938,8 +1072,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                               className="inline-block relative overflow-hidden rounded-xl border border-gray-200/60 max-w-[200px] m-1 transition-transform hover:scale-[1.02] cursor-pointer bg-white"
                               onClick={() => {
                                 if (src) {
-                                  setPreviewUrl(src);
-                                  setPreviewType('image');
+                                  setPreviewFile({ url: src, filename: alt || 'image.png' });
                                 }
                               }}
                             >
@@ -949,7 +1082,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                         },
                         // Render generic files nicely
                         a({ href, children, ...props }) {
-                          const isUpload = href?.startsWith('/uploads/');
+                          const isUpload = href?.startsWith('/uploads/') || href?.startsWith('/openclaw/') || href?.startsWith('/api/files/download');
                           if (!isUpload) {
                             return (
                               <span className="relative inline group/link">
@@ -988,65 +1121,22 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                             );
                           }
                           
-                          // Determine icon/type from extension
-                          const ext = href?.split('.').pop()?.toLowerCase();
-                          let Icon = FileIcon;
-                          let typeText = '文件';
-                          let bgColor = 'bg-blue-500';
-                          
-                          if (['pdf', 'doc', 'docx', 'txt', 'rtf'].includes(ext || '')) {
-                            Icon = FileText;
-                            typeText = ext === 'pdf' ? 'PDF' : '文档';
-                            bgColor = 'bg-rose-500';
-                          } else if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext || '')) {
-                            Icon = FileArchive;
-                            typeText = '压缩包';
-                            bgColor = 'bg-amber-500';
-                          } else if (['js', 'ts', 'py', 'json', 'html', 'css'].includes(ext || '')) {
-                            Icon = FileCode;
-                            typeText = '代码';
-                            bgColor = 'bg-slate-700';
-                          } else if (['mp3', 'flac', 'wav'].includes(ext || '')) {
-                            Icon = Music;
-                            typeText = '音频';
-                            bgColor = 'bg-purple-500';
-                          } else if (['mp4', 'mkv', 'avi', 'mov'].includes(ext || '')) {
-                            Icon = Video;
-                            typeText = '视频';
-                            bgColor = 'bg-indigo-500';
-                          } else if (['xls', 'xlsx', 'csv'].includes(ext || '')) {
-                            Icon = FileText;
-                            typeText = '表格';
-                            bgColor = 'bg-emerald-500';
-                          } else if (['ppt', 'pptx'].includes(ext || '')) {
-                            Icon = FileText;
-                            typeText = '演示文稿';
-                            bgColor = 'bg-orange-500';
-                          } else if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext || '')) {
-                            Icon = FileImage;
-                            typeText = '图片';
-                            bgColor = 'bg-sky-500';
-                          }
 
-                          const isImage = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp'].includes(ext || '');
-                          const isPdf = ext === 'pdf';
-                          const canPreview = isImage || isPdf;
+                          // Extract display filename from children for download attribute
+                          const displayName = typeof children === 'string' ? children 
+                            : Array.isArray(children) ? children.join('') 
+                            : href?.split('/').pop() || 'file';
 
-                          const handleClick = (e: React.MouseEvent) => {
-                            if (canPreview && href) {
-                              e.preventDefault();
-                              setPreviewUrl(href);
-                              setPreviewType(isImage ? 'image' : 'pdf');
-                            }
-                          };
+                          // Determine icon/type from extension using helper
+                          const { Icon, typeText, bgColor } = getFileIconInfo(displayName);
 
                           return (
-                            <a 
-                              href={href} 
-                              download={!canPreview}
-                              target="_blank"
-                              onClick={handleClick}
-                              className={`inline-flex items-center gap-3 p-3 w-[260px] rounded-2xl bg-white border border-gray-300 transition-all group no-underline flex-shrink-0 ${canPreview ? 'cursor-pointer' : ''}`}
+                            <div
+                              className="inline-flex items-center gap-3 p-3 w-[260px] rounded-2xl bg-white border border-gray-300 transition-all group no-underline flex-shrink-0 cursor-pointer hover:border-blue-300 hover:bg-blue-50/50"
+                              onClick={() => {
+                                if (!href) return;
+                                setPreviewFile({ url: href, filename: displayName });
+                              }}
                             >
                               <div className={`w-10 h-10 rounded-xl ${bgColor} flex items-center justify-center flex-shrink-0 text-white border border-black/10`}>
                                 <Icon className="w-5 h-5" />
@@ -1060,24 +1150,21 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                                 </div>
                               </div>
                               <div 
-                                className="w-8 h-8 rounded-full bg-gray-50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all flex-shrink-0 cursor-pointer z-10"
+                                className="w-8 h-8 rounded-full bg-gray-50 flex items-center justify-center md:opacity-0 md:group-hover:opacity-100 transition-all flex-shrink-0 cursor-pointer z-10 hover:bg-blue-50"
                                 onClick={(e) => {
-                                  if (canPreview) {
-                                    e.stopPropagation();
-                                    e.preventDefault();
-                                    // Trigger explicit download
-                                    const link = document.createElement('a');
-                                    link.href = href || '';
-                                    link.download = '';
-                                    document.body.appendChild(link);
-                                    link.click();
-                                    document.body.removeChild(link);
-                                  }
+                                  e.stopPropagation();
+                                  // Always trigger download
+                                  const link = document.createElement('a');
+                                  link.href = href || '';
+                                  link.download = displayName;
+                                  document.body.appendChild(link);
+                                  link.click();
+                                  document.body.removeChild(link);
                                 }}
                               >
                                 <Download className="w-4 h-4 text-gray-400 group-hover:text-blue-500" />
                               </div>
-                            </a>
+                            </div>
                           );
                         },
                         // Try to convert sequences of pure attachments into a flex grid
@@ -1115,25 +1202,25 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                 </div>
               </div>
               
-              <div className={`mt-2 flex items-center space-x-2 text-[12px] text-gray-400 font-medium ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                <span>{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                <button onClick={() => handleQuote(msg)} className="hover:text-gray-600 transition-colors flex items-center gap-1">
-                    <Quote className="w-3.5 h-3.5" /> 引用
+              <div className={`mt-2 flex items-center space-x-3 text-[14px] text-gray-500 font-sans font-normal ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                <span className="text-[12px] opacity-70 font-sans">{msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                <button onClick={() => handleQuote(msg)} className="hover:text-blue-600 transition-colors flex items-center gap-1.5">
+                    <Quote className="w-4 h-4" /> 引用
                 </button>
                 <span className="text-gray-200 font-extralight">|</span>
                 <button 
                   onClick={() => handleCopy(msg.content, msg.id)} 
-                  className={`hover:text-gray-600 transition-colors flex items-center gap-1 ${copiedId === msg.id ? 'text-blue-500' : ''}`}
+                  className={`hover:text-blue-600 transition-colors flex items-center gap-1 ${copiedId === msg.id ? 'text-blue-600' : ''}`}
                 >
-                    {copiedId === msg.id ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    {copiedId === msg.id ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                     {copiedId === msg.id ? '已复制' : '复制'}
                 </button>
                 <span className="text-gray-200 font-extralight">|</span>
                 <button 
                   onClick={() => handleDeleteMessage(msg.id)} 
-                  className="hover:text-red-500 transition-colors flex items-center gap-1"
+                  className="hover:text-red-500 transition-colors flex items-center gap-1.5"
                 >
-                    <Trash2 className="w-3.5 h-3.5" /> 删除
+                    <Trash2 className="w-4 h-4" /> 删除
                 </button>
               </div>
             </div>
@@ -1144,41 +1231,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Right Navigation Bar */}
-      {navDots.length > 0 && (
-        <div className="hidden md:block w-8 flex-shrink-0 relative bg-white border-l border-gray-200 ml-1">
-          <div className="absolute inset-0 flex flex-col">
-            {/* Track line */}
-            <div className="absolute left-1/2 top-[2%] bottom-[2%] w-[1px] bg-gray-200 -translate-x-1/2" />
-            {/* Dots */}
-            {navDots.map((dot) => (
-              <div
-                key={dot.id}
-                className="absolute left-1/2 -translate-x-1/2 -translate-y-1/2 z-10"
-                style={{ top: `${Math.max(2, Math.min(98, dot.top))}%` }}
-                onMouseEnter={() => setHoveredDot(dot.id)}
-                onMouseLeave={() => setHoveredDot(null)}
-              >
-                <button
-                  onClick={() => scrollToUserMsg(dot.id)}
-                  className={`rounded-full transition-all duration-200 hover:scale-150 ${
-                    activeNavDot === dot.id
-                      ? 'w-3 h-3 bg-blue-500'
-                      : 'w-2.5 h-2.5 bg-gray-400 hover:bg-blue-400'
-                  }`}
-                />
-                {/* Tooltip */}
-                {hoveredDot === dot.id && (
-                  <div className="absolute right-full mr-3 top-1/2 -translate-y-1/2 w-max max-w-[240px] px-3 py-2 bg-gray-800 text-white text-[12px] rounded-lg whitespace-pre-wrap break-words leading-relaxed pointer-events-none animate-in fade-in duration-150 z-50">
-                    <div className="line-clamp-3">{dot.content}</div>
-                    <div className="absolute top-1/2 -translate-y-1/2 right-[-4px] w-0 h-0 border-t-4 border-b-4 border-l-4 border-t-transparent border-b-transparent border-l-gray-800" />
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+
       </div>
 
       {/* Input Area - Gemini Style */}
@@ -1188,19 +1241,24 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
           {pendingFiles.length > 0 && (
             <div className="flex flex-wrap gap-3 pb-2 animate-in slide-in-from-bottom-2 duration-300">
               {pendingFiles.map((pf, idx) => (
-                <div key={idx} className={`relative group ${pf.preview ? 'w-24 h-24' : 'w-max min-w-[120px] max-w-[200px] h-14 pl-2 pr-3 flex items-center gap-2'} rounded-xl overflow-hidden bg-white border border-gray-300 flex-shrink-0 transition-transform hover:scale-[1.02] active:scale-95`}>
-                  {pf.preview ? (
+                <div key={idx} className={`relative group ${pf.preview ? 'w-24 h-24' : 'w-max min-w-[120px] max-w-[200px] h-14 pl-2 pr-3 flex items-center gap-2'} rounded-xl overflow-hidden bg-white border border-gray-300 flex-shrink-0 transition-all hover:scale-[1.02] active:scale-95 hover:bg-blue-50/50 hover:border-blue-200`}>
+                   {pf.preview ? (
                     <img src={pf.preview} className="w-full h-full object-cover" alt="preview" />
                   ) : (
-                    <>
-                      <div className="w-10 h-10 rounded-lg bg-blue-50 flex items-center justify-center flex-shrink-0">
-                        <FileIcon className="w-5 h-5 text-blue-500" />
-                      </div>
-                      <div className="flex flex-col min-w-0 pr-4">
-                        <span className="text-[12px] font-semibold text-gray-700 truncate w-full">{pf.file.name}</span>
-                        <span className="text-[10px] text-gray-400 capitalize">{pf.file.name.split('.').pop()}</span>
-                      </div>
-                    </>
+                    (() => {
+                      const { Icon, typeText, bgColor } = getFileIconInfo(pf.file.name);
+                      return (
+                        <>
+                          <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center flex-shrink-0 text-white`}>
+                            <Icon className="w-5 h-5 text-white" />
+                          </div>
+                          <div className="flex flex-col min-w-0 pr-4">
+                            <span className="text-[12px] font-semibold text-gray-700 truncate w-full">{pf.file.name}</span>
+                            <span className="text-[10px] text-gray-400 capitalize">{typeText}</span>
+                          </div>
+                        </>
+                      );
+                    })()
                   )}
                   <button 
                     onClick={() => removePendingFile(idx)}
@@ -1272,10 +1330,11 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
               rows={1}
               value={input}
               onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Enter 发送消息，Shift + Enter 换行"
               disabled={isLoading}
-              className="w-full min-h-[44px] max-h-[200px] py-3 px-5 bg-transparent focus:outline-none text-[16px] font-medium placeholder:text-gray-400 resize-none overflow-y-auto leading-relaxed border-none scrollbar-hide"
+              className="w-full min-h-[44px] max-h-[200px] py-3 pl-5 pr-8 bg-transparent focus:outline-none text-[16px] font-medium placeholder:text-gray-400 resize-none overflow-y-auto leading-relaxed border-none scrollbar-hide"
             />
             
             {/* Bottom toolbar */}
@@ -1344,38 +1403,13 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
         </div>
       </div>
 
-      {/* Preview Modal */}
-      {previewUrl && previewType && (
-        <div 
-          className="fixed inset-0 z-[200] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 sm:p-8 animate-in fade-in duration-200"
-          onClick={() => setPreviewUrl(null)}
-        >
-          <button 
-            className="absolute top-6 right-6 p-2 bg-white/10 hover:bg-white/20 text-white rounded-full transition-all"
-            onClick={() => setPreviewUrl(null)}
-          >
-            <X className="w-6 h-6" />
-          </button>
-          
-          <div 
-            className="w-full h-full max-w-6xl max-h-full flex flex-col items-center justify-center"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {previewType === 'image' ? (
-              <img 
-                src={previewUrl} 
-                alt="preview" 
-                className="max-w-full max-h-[90vh] object-contain rounded-lg border border-gray-200"
-              />
-            ) : previewType === 'pdf' ? (
-              <iframe 
-                src={`${previewUrl}#toolbar=0`} 
-                className="w-full h-[90vh] bg-white rounded-xl border border-gray-200"
-                title="PDF Preview"
-              />
-            ) : null}
-          </div>
-        </div>
+      {/* Unified File Preview Modal */}
+      {previewFile && (
+        <FilePreviewModal
+          url={previewFile.url}
+          filename={previewFile.filename}
+          onClose={() => setPreviewFile(null)}
+        />
       )}
       {/* Custom Delete Confirmation Modal */}
       {isDeleteModalOpen && (
@@ -1384,7 +1418,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
             className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity animate-in fade-in duration-200" 
             onClick={() => setIsDeleteModalOpen(false)}
           ></div>
-          <div className="bg-white rounded-[32px] border border-gray-200 w-full max-w-[340px] overflow-hidden relative z-10 animate-in fade-in zoom-in-95 duration-200 shadow-2xl">
+          <div className="bg-white rounded-[32px] border border-gray-200 w-full max-w-[340px] overflow-hidden relative z-10 animate-in fade-in zoom-in-95 duration-200">
             <div className="p-8 text-center">
               <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-3xl bg-red-50 mb-6 border border-red-100">
                 <Trash2 className="h-8 w-8 text-red-500" />
@@ -1403,7 +1437,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
               <button
                 type="button"
                 onClick={confirmDeleteMessage}
-                className="flex-1 px-4 py-3 text-white bg-red-600 hover:bg-red-700 active:scale-95 rounded-2xl font-bold text-sm shadow-lg shadow-red-500/20 transition-all"
+                className="flex-1 px-4 py-3 text-white bg-red-600 hover:bg-red-700 active:scale-95 rounded-2xl font-bold text-sm transition-all"
               >
                 确认删除
               </button>

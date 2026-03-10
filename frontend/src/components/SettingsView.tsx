@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu } from 'lucide-react';
+import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag } from 'lucide-react';
 import { SettingsTab } from '../App';
 
 interface SettingsViewProps {
@@ -329,7 +329,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     setNewDescription(cmd.description);
   };
 
-  const headerTitle = settingsTab === 'gateway' ? '设置 - 网关' : settingsTab === 'general' ? '设置 - 通用' : '设置 - 快捷指令';
+  const headerTitle = settingsTab === 'gateway' ? '设置 - 网关' : settingsTab === 'general' ? '设置 - 通用' : settingsTab === 'commands' ? '设置 - 快捷指令' : '关于系统';
 
   return (
     <div className="flex flex-col h-full bg-gray-50/50">
@@ -737,6 +737,79 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </table>
                   </div>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* About Tab */}
+          {settingsTab === 'about' && (
+            <div className="flex flex-col items-center justify-center min-h-[60vh]">
+              <div className="bg-white rounded-3xl border border-gray-200 p-10 w-full max-w-lg text-center flex flex-col items-center">
+                
+                {/* Logo Section */}
+                <div className="mb-6 w-max text-center flex flex-col items-center">
+                  <div className="text-[2.5rem] font-black text-[#1a1c1e] tracking-tight leading-tight mb-0.5">OpenClaw</div>
+                  <div className="text-[1.1rem] font-bold text-[#94a3b8] tracking-[0.35em] uppercase leading-tight">CHAT GATEWAY</div>
+                </div>
+
+                {/* Version Info */}
+                <div className="space-y-4 mb-8">
+                  <div className="text-2xl font-medium text-gray-800">Ver: 1.00</div>
+                  <div>
+                    <a href="#" className="text-[#3b82f6] hover:text-blue-700 font-medium text-lg transition-colors underline-offset-4 hover:underline">
+                      检查新版本
+                    </a>
+                  </div>
+                </div>
+
+                {/* Author Info */}
+                <div className="text-xl font-medium text-gray-700 mb-10">
+                  安格视界 / AnGeWorld
+                </div>
+
+                {/* Links Row */}
+                <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-4 mb-6">
+                  <a 
+                    href="https://github.com/liandu2024/OpenClaw-Chat-Gateway" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="flex items-center gap-2 text-[#3b82f6] hover:text-blue-700 transition-colors group text-[13px] sm:text-[15px] font-medium"
+                  >
+                    <Github className="w-5 h-5 text-gray-900 group-hover:-translate-y-0.5 transition-transform" />
+                    <span>Github</span>
+                  </a>
+                  <a 
+                    href="https://t.me/angeworld2024" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="flex items-center gap-2 text-[#3b82f6] hover:text-blue-700 transition-colors group text-[13px] sm:text-[15px] font-medium"
+                  >
+                    <Send className="w-5 h-5 text-[#3b82f6] group-hover:-translate-y-0.5 transition-transform" />
+                    <span>安格视界TG群</span>
+                  </a>
+                  <a 
+                    href="https://blog.angeworld.cc/market" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="flex items-center gap-2 text-[#3b82f6] hover:text-blue-700 transition-colors group text-[13px] sm:text-[15px] font-medium"
+                  >
+                    <ShoppingBag className="w-5 h-5 text-[#ef4444] group-hover:-translate-y-0.5 transition-transform" />
+                    <span>安格超市</span>
+                  </a>
+                </div>
+
+                {/* API Button Row */}
+                <div className="w-full flex justify-center mb-8 px-2">
+                  <a 
+                    href="https://ai.opendoor.cn" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="flex items-center justify-center px-6 py-2.5 rounded-xl sm:rounded-full bg-[#fefce8] border border-blue-300 text-[#3b82f6] hover:bg-yellow-100 hover:border-blue-400 transition-all font-bold text-[11px] min-[380px]:text-[12px] sm:text-[14px] max-w-full text-center shadow-sm"
+                  >
+                    芝麻开门 AI 接口 : https://ai.opendoor.cn
+                  </a>
+                </div>
+
               </div>
             </div>
           )}

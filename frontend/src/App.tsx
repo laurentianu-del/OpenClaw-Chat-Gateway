@@ -5,22 +5,75 @@ import SettingsView from './components/SettingsView';
 import LoginScreen from './components/LoginScreen';
 
 export type ViewType = 'chat' | 'settings';
-export type SettingsTab = 'gateway' | 'general' | 'commands';
+export type SettingsTab = 'gateway' | 'general' | 'commands' | 'about';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewType>('chat');
   const [isConnected, setIsConnected] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('gateway');
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null); // null = checking
-  const [activeSessionId, setActiveSessionId] = useState<string>('5741707482');
+  const [activeSessionId, setActiveSessionId] = useState<string>(() => {
+    return localStorage.getItem('clawui_active_session') || '';
+  });
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  const [sessions, setSessions] = useState<{id: string, name: string}[]>([]);
+  const [sessions, setSessions] = useState<{id: string, name: string, characterId?: string, model?: string}[]>([]);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+
+  // --- History API Integration for Back Gesture ---
+  useEffect(() => {
+    // Initialize base state
+    window.history.replaceState({ view: currentView, tab: settingsTab, menu: isMobileMenuOpen }, '');
+
+    const handlePopState = (event: PopStateEvent) => {
+      if (event.state && event.state.view) {
+        // If menu was open and we're going back to a closed menu state, close it
+        if (isMobileMenuOpen && !event.state.menu) {
+          setIsMobileMenuOpen(false);
+          return;
+        }
+        
+        setCurrentView(event.state.view);
+        if (event.state.tab) setSettingsTab(event.state.tab);
+        if (event.state.menu !== undefined) setIsMobileMenuOpen(event.state.menu);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [isMobileMenuOpen, currentView, settingsTab]);
+
+  // Wrapper for view/tab changes that should push to history
+  const navigateTo = (view: ViewType, tab?: SettingsTab, openMenu?: boolean) => {
+    const nextTab = tab || settingsTab;
+    const nextOpen = openMenu !== undefined ? openMenu : isMobileMenuOpen;
+    if (view !== currentView || nextTab !== settingsTab || nextOpen !== isMobileMenuOpen) {
+      window.history.pushState({ view, tab: nextTab, menu: nextOpen }, '');
+      setCurrentView(view);
+      if (tab) setSettingsTab(tab);
+      setIsMobileMenuOpen(nextOpen);
+    }
+  };
+
+  // Sync activeSessionId to localStorage
+  useEffect(() => {
+    if (activeSessionId) {
+      localStorage.setItem('clawui_active_session', activeSessionId);
+    }
+  }, [activeSessionId]);
 
   const reloadSessions = async () => {
     try {
       const res = await fetch('/api/sessions');
       const data = await res.json();
       setSessions(data);
+      setSessionsLoaded(true);
+      // Auto-select first session if currently active is not in the list or empty
+      if (data.length > 0) {
+        setActiveSessionId(prev => {
+          const exists = data.find((s: any) => s.id === prev);
+          return exists ? prev : data[0].id;
+        });
+      }
     } catch (err) {
       console.error('Failed to reload sessions:', err);
     }
@@ -89,48 +142,45 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Loading state while checking auth
-  if (isAuthenticated === null) {
-    return (
-      <div className="flex fixed inset-0 h-[100dvh] w-full items-center justify-center bg-gray-50">
-        <div className="text-gray-400 text-sm font-medium animate-pulse">加载中...</div>
-      </div>
-    );
-  }
-
-  // Show login screen if not authenticated
-  if (!isAuthenticated) {
+  // Show login screen if not authenticated (and auth check is done)
+  if (isAuthenticated === false) {
     return <LoginScreen onLoginSuccess={() => setIsAuthenticated(true)} />;
   }
 
+  // Always render the real UI, but hide it until data is ready.
+  // This prevents progressive paint / "expanding" artifacts.
+  const appReady = isAuthenticated === true && sessionsLoaded;
+
   return (
-    <div className="flex fixed inset-0 h-[100dvh] w-full overflow-hidden bg-gray-50 text-gray-900 font-sans antialiased">
+    <div
+      className="flex fixed inset-0 h-[100dvh] w-full overflow-visible bg-gray-50 text-gray-900 font-sans antialiased"
+      style={{ opacity: appReady ? 1 : 0 }}
+    >
       <Sidebar 
         currentView={currentView} 
-        setCurrentView={setCurrentView} 
         settingsTab={settingsTab} 
-        setSettingsTab={setSettingsTab} 
         activeSessionId={activeSessionId}
         setActiveSessionId={setActiveSessionId}
         isMobileMenuOpen={isMobileMenuOpen}
-        setIsMobileMenuOpen={setIsMobileMenuOpen}
         sessions={sessions}
+        sessionsLoaded={sessionsLoaded}
         reloadSessions={reloadSessions}
         reorderSessions={reorderSessions}
+        navigateTo={navigateTo}
       />
-      <main className="flex-1 flex flex-col min-w-0 bg-white">
+      <main className="flex-1 flex flex-col min-w-0 bg-white overflow-visible md:relative md:z-[60]">
         {currentView === 'chat' ? (
           <ChatView 
             isConnected={isConnected} 
             activeSessionId={activeSessionId} 
-            onMenuClick={() => setIsMobileMenuOpen(true)}
+            onMenuClick={() => navigateTo(currentView, settingsTab, true)}
             sessions={sessions}
           />
         ) : (
           <SettingsView 
             isConnected={isConnected} 
             settingsTab={settingsTab} 
-            onMenuClick={() => setIsMobileMenuOpen(true)}
+            onMenuClick={() => navigateTo(currentView, settingsTab, true)}
           />
         )}
       </main>

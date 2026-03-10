@@ -15,7 +15,7 @@ body,
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 10px;
+  width: 8px;
 }
 
 ::-webkit-scrollbar-track {
@@ -23,16 +23,12 @@ body,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #d1d5db;
+  background: #cbd5e1; /* slate-300 */
   border-radius: 10px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #9ca3af;
-  border: 2px solid transparent;
-  background-clip: padding-box;
+  background: #94a3b8; /* slate-400 */
 }
 
 /* Global interaction styles */
