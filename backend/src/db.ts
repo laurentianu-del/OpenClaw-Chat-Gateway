@@ -7,6 +7,9 @@ export type ChatRow = {
   session_key: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  model_used?: string;
+  agent_id?: string;
+  agent_name?: string;
   created_at?: string;
 };
 
@@ -131,6 +134,11 @@ export class DB {
     try {
       this.db.exec("ALTER TABLE characters ADD COLUMN model TEXT");
     } catch (e: any) {}
+
+    // Per-message snapshot columns
+    try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN model_used TEXT"); } catch (e: any) {}
+    try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN agent_id TEXT"); } catch (e: any) {}
+    try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN agent_name TEXT"); } catch (e: any) {}
   }
 
   // --- Quick Commands ---
@@ -167,8 +175,8 @@ export class DB {
 
   saveMessage(row: ChatRow) {
     this.db
-      .prepare('INSERT INTO chat_messages (session_key, role, content) VALUES (?, ?, ?)')
-      .run(row.session_key, row.role, row.content);
+      .prepare('INSERT INTO chat_messages (session_key, role, content, model_used, agent_id, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(row.session_key, row.role, row.content, row.model_used || null, row.agent_id || null, row.agent_name || null);
   }
 
   deleteMessage(id: number) {
@@ -178,7 +186,7 @@ export class DB {
   getMessages(sessionKey: string, limit = 100): ChatRow[] {
     return this.db
       .prepare(
-        "SELECT id, session_key, role, content, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at FROM chat_messages WHERE session_key = ? ORDER BY id DESC LIMIT ?"
+        "SELECT id, session_key, role, content, model_used, agent_id, agent_name, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at FROM chat_messages WHERE session_key = ? ORDER BY id DESC LIMIT ?"
       )
       .all(sessionKey, limit) as ChatRow[];
   }

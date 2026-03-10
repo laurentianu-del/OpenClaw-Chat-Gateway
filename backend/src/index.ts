@@ -707,6 +707,14 @@ app.post('/api/chat', async (req, res) => {
     db.saveMessage({ session_key: sessionId, role: 'user', content: String(message) });
     const client = await getConnection(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
+
+    // Resolve agent name and model for per-message snapshot
+    const allCharacters = db.getCharacters();
+    const character = allCharacters.find(c => c.agentId === agentId);
+    const agentName = character?.name || agentId;
+    const modelUsed = agentProvisioner.readAgentModel(agentId) ||
+      agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+
     const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
 
     // Set up SSE streaming
@@ -733,7 +741,7 @@ app.post('/api/chat', async (req, res) => {
       const rewritten = rewriteOpenClawMediaPaths(finalText);
 
       // Save final response to DB
-      db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten });
+      db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
 
       res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
       res.end();
@@ -759,7 +767,7 @@ app.post('/api/chat', async (req, res) => {
       if (!streamEnded) {
         streamEnded = true;
         const rewritten = rewriteOpenClawMediaPaths(lastText || 'Response timed out.');
-        db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten });
+        db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
         res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
         res.end();
         client.off('chat.delta', onDelta);

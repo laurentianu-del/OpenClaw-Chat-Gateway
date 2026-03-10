@@ -13,6 +13,9 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  model?: string;
+  agentId?: string;
+  agentName?: string;
 }
 
 interface ChatViewProps {
@@ -295,6 +298,9 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
           role: m.role === 'assistant' ? 'assistant' : 'user',
           content: String(m.content || ''),
           timestamp: new Date(m.created_at || Date.now()),
+          model: m.model_used || undefined,
+          agentId: m.agent_id || undefined,
+          agentName: m.agent_name || undefined,
         }));
         setMessages(rows);
       }
@@ -954,16 +960,17 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
                 <div className="flex items-center gap-3 mb-4 flex-wrap w-full">
                   <img src="/ai-robot.jpg" alt="AI" className="w-8 h-8 rounded-full border border-gray-200 object-cover bg-gray-50 flex-shrink-0" />
                   <div className="flex items-center gap-2 flex-wrap min-w-0">
-                    <span className="text-[17px] font-bold text-gray-900 leading-none">{activeSessionName}</span>
                     {(() => {
                       const session = sessions.find(s => s.id === activeSessionId);
                       const character = characters.find(c => c.id === session?.characterId);
                       
-                      const modelDisplayName = session?.model || character?.model || currentModel || 'OpenClaw';
+                      // Per-message snapshot takes priority; fall back to current session for legacy messages
+                      const modelDisplayName = msg.model || session?.model || character?.model || currentModel || 'OpenClaw';
+                      const displayName = msg.agentName || activeSessionName;
                       
                       return (
                         <>
-                          {/* character name alias removed per user request */}
+                          <span className="text-[17px] font-bold text-gray-900 leading-none">{displayName}</span>
                           <div className="px-2.5 py-0.5 rounded-full bg-blue-50 border border-blue-200 text-blue-600 text-[12px] tracking-tight">
                             {modelDisplayName}
                           </div>
