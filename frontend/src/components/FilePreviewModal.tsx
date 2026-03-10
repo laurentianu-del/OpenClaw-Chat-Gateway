@@ -61,97 +61,110 @@ function extractPathParam(url: string): string | null {
 }
 
 // Zoomable Wrapper for mobile pinch-to-zoom
+// Uses native DOM touch listeners with {passive: false} because React synthetic
+// events are passive on mobile, making preventDefault() a no-op → causes simultaneous scroll+zoom
 function ZoomableWrapper({ children, center = false }: { children: React.ReactNode, center?: boolean }) {
   const [scale, setScale] = useState(1);
   const [translate, setTranslate] = useState({ x: 0, y: 0 });
-  const [origin, setOrigin] = useState({ x: 50, y: 50 }); // percentage origin for transform
+  const [origin, setOrigin] = useState({ x: 50, y: 50 });
   const containerRef = useRef<HTMLDivElement>(null);
-  const startDist = useRef<number>(0);
-  const startScale = useRef<number>(1);
+  const stateRef = useRef({ scale: 1, translate: { x: 0, y: 0 }, origin: { x: 50, y: 50 } });
+  const startDist = useRef(0);
+  const startScale = useRef(1);
   const lastTouch = useRef<{ x: number, y: number } | null>(null);
-  const lastTap = useRef<number>(0);
-  const originSet = useRef(false);
+  const lastTap = useRef(0);
+  const isPinching = useRef(false);
 
-  const handleTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length === 2) {
-      const dist = Math.hypot(
-        e.touches[0].pageX - e.touches[1].pageX,
-        e.touches[0].pageY - e.touches[1].pageY
-      );
-      startDist.current = dist;
-      startScale.current = scale;
-      originSet.current = false;
+  // Keep stateRef in sync
+  useEffect(() => { stateRef.current = { scale, translate, origin }; }, [scale, translate, origin]);
 
-      // Calculate pinch midpoint relative to container for transform-origin
-      const container = containerRef.current;
-      if (container) {
-        const rect = container.getBoundingClientRect();
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault(); // Block native pinch-zoom immediately
+        isPinching.current = true;
+        const dist = Math.hypot(
+          e.touches[0].pageX - e.touches[1].pageX,
+          e.touches[0].pageY - e.touches[1].pageY
+        );
+        startDist.current = dist;
+        startScale.current = stateRef.current.scale;
+
+        // Compute pinch midpoint for transform-origin
+        const rect = el.getBoundingClientRect();
         const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
         const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-        // Convert to percentage of the scrollable content (including scroll offset)
-        const scrollTop = container.scrollTop;
-        const scrollLeft = container.scrollLeft;
-        const originX = ((midX - rect.left + scrollLeft) / container.scrollWidth) * 100;
-        const originY = ((midY - rect.top + scrollTop) / container.scrollHeight) * 100;
-        setOrigin({ x: Math.max(0, Math.min(100, originX)), y: Math.max(0, Math.min(100, originY)) });
-        originSet.current = true;
-      }
-    } else if (e.touches.length === 1) {
-      const now = Date.now();
-      if (now - lastTap.current < 300) {
-        const newScale = scale === 1 ? 2 : 1;
-        setScale(newScale);
-        setTranslate({ x: 0, y: 0 });
-        if (newScale === 1) setOrigin({ x: 50, y: 50 });
-        // Set origin to tap position for double-tap zoom
-        if (newScale > 1 && containerRef.current) {
-          const rect = containerRef.current.getBoundingClientRect();
-          const scrollTop = containerRef.current.scrollTop;
-          const originX = ((e.touches[0].clientX - rect.left) / rect.width) * 100;
-          const originY = ((e.touches[0].clientY - rect.top + scrollTop) / containerRef.current.scrollHeight) * 100;
-          setOrigin({ x: originX, y: originY });
+        const scrollTop = el.scrollTop;
+        const oX = ((midX - rect.left) / rect.width) * 100;
+        const oY = ((midY - rect.top + scrollTop) / el.scrollHeight) * 100;
+        setOrigin({ x: Math.max(0, Math.min(100, oX)), y: Math.max(0, Math.min(100, oY)) });
+      } else if (e.touches.length === 1) {
+        const now = Date.now();
+        if (now - lastTap.current < 300) {
+          // Double tap
+          const cur = stateRef.current.scale;
+          const newScale = cur === 1 ? 2 : 1;
+          setScale(newScale);
+          setTranslate({ x: 0, y: 0 });
+          if (newScale > 1) {
+            const rect = el.getBoundingClientRect();
+            const oX = ((e.touches[0].clientX - rect.left) / rect.width) * 100;
+            const oY = ((e.touches[0].clientY - rect.top + el.scrollTop) / el.scrollHeight) * 100;
+            setOrigin({ x: oX, y: oY });
+          } else {
+            setOrigin({ x: 50, y: 50 });
+          }
         }
+        lastTap.current = now;
+        lastTouch.current = { x: e.touches[0].pageX, y: e.touches[0].pageY };
       }
-      lastTap.current = now;
-      lastTouch.current = { x: e.touches[0].pageX, y: e.touches[0].pageY };
-    }
-  };
+    };
 
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (e.touches.length === 2 && startDist.current > 0) {
-      // Pinch to zoom - prevent default to stop browser from zooming/scrolling
-      if (e.cancelable) e.preventDefault();
-      const dist = Math.hypot(
-        e.touches[0].pageX - e.touches[1].pageX,
-        e.touches[0].pageY - e.touches[1].pageY
-      );
-      const newScale = Math.min(Math.max(startScale.current * (dist / startDist.current), 1), 4);
-      setScale(newScale);
-      if (newScale === 1) {
-        setTranslate({ x: 0, y: 0 });
-        setOrigin({ x: 50, y: 50 });
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2 && isPinching.current) {
+        e.preventDefault(); // MUST prevent to stop native scroll during pinch
+        const dist = Math.hypot(
+          e.touches[0].pageX - e.touches[1].pageX,
+          e.touches[0].pageY - e.touches[1].pageY
+        );
+        const newScale = Math.min(Math.max(startScale.current * (dist / startDist.current), 1), 4);
+        setScale(newScale);
+        if (newScale === 1) {
+          setTranslate({ x: 0, y: 0 });
+          setOrigin({ x: 50, y: 50 });
+        }
+      } else if (e.touches.length === 1 && stateRef.current.scale > 1 && lastTouch.current) {
+        e.preventDefault(); // Block scroll when panning zoomed content
+        const touch = e.touches[0];
+        const dx = touch.pageX - lastTouch.current.x;
+        const dy = touch.pageY - lastTouch.current.y;
+        const s = stateRef.current.scale;
+        setTranslate(prev => ({ x: prev.x + dx / s, y: prev.y + dy / s }));
+        lastTouch.current = { x: touch.pageX, y: touch.pageY };
       }
-    } else if (e.touches.length === 1 && scale > 1 && lastTouch.current) {
-      // Single finger panning - prevent default to stop native scrolling when zoomed
-      if (e.cancelable) e.preventDefault();
-      const touch = e.touches[0];
-      const dx = touch.pageX - lastTouch.current.x;
-      const dy = touch.pageY - lastTouch.current.y;
-      
-      setTranslate(prev => ({
-        x: prev.x + dx / scale,
-        y: prev.y + dy / scale
-      }));
-      
-      lastTouch.current = { x: touch.pageX, y: touch.pageY };
-    }
-    // If scale === 1 and touches === 1, we don't preventDefault, allowing native scrolling
-  };
+      // scale === 1 single finger → don't prevent, allow native scroll
+    };
 
-  const handleTouchEnd = () => {
-    startDist.current = 0;
-    lastTouch.current = null;
-  };
+    const onTouchEnd = () => {
+      isPinching.current = false;
+      startDist.current = 0;
+      lastTouch.current = null;
+    };
+
+    // passive: false is CRITICAL — allows preventDefault() on mobile
+    el.addEventListener('touchstart', onTouchStart, { passive: false });
+    el.addEventListener('touchmove', onTouchMove, { passive: false });
+    el.addEventListener('touchend', onTouchEnd);
+
+    return () => {
+      el.removeEventListener('touchstart', onTouchStart);
+      el.removeEventListener('touchmove', onTouchMove);
+      el.removeEventListener('touchend', onTouchEnd);
+    };
+  }, []); // Only attach once; reads live state via stateRef
 
   const isZoomed = scale > 1;
 
@@ -160,20 +173,18 @@ function ZoomableWrapper({ children, center = false }: { children: React.ReactNo
       ref={containerRef}
       className={`w-full h-full flex flex-col items-center ${center ? 'justify-center' : 'justify-start'} ${isZoomed ? 'overflow-hidden' : 'overflow-y-auto overflow-x-hidden'}`}
       style={{ 
-        touchAction: isZoomed ? 'none' : 'pan-y',
+        touchAction: 'manipulation', // prevents double-tap browser zoom but allows scroll
         WebkitFontSmoothing: 'antialiased',
         MozOsxFontSmoothing: 'grayscale',
         textRendering: 'optimizeLegibility'
       }}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      onTouchEnd={handleTouchEnd}
     >
       <div 
-        className={`transition-transform duration-100 ease-out flex-shrink-0 flex flex-col items-center ${isZoomed ? 'will-change-transform' : ''}`}
+        className={`flex-shrink-0 flex flex-col items-center ${isZoomed ? 'will-change-transform' : ''}`}
         style={{ 
           transform: isZoomed ? `scale(${scale}) translate(${Math.round(translate.x)}px, ${Math.round(translate.y)}px)` : 'none', 
           transformOrigin: `${origin.x}% ${origin.y}%`,
+          transition: isPinching.current ? 'none' : 'transform 0.15s ease-out',
           width: '100%',
           minHeight: center ? 'auto' : '100%' 
         }}
