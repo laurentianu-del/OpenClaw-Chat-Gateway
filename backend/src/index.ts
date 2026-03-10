@@ -1014,11 +1014,30 @@ app.get('/api/files/preview', async (req, res) => {
   }
 });
 
-// Serve static files from frontend
-app.use(express.static(path.join(__dirname, '../../frontend/dist')));
+// Serve hashed static assets with long-lived cache (JS/CSS filenames include content hash)
+app.use('/assets', express.static(path.join(__dirname, '../../frontend/dist/assets'), {
+  maxAge: '1y',
+  immutable: true,
+}));
 
-// Fallback for SPA
+// Serve other static files (images, favicon, manifest, etc.) with short cache
+app.use(express.static(path.join(__dirname, '../../frontend/dist'), {
+  maxAge: '1h',
+  setHeaders: (res, filePath) => {
+    // index.html must NEVER be cached by proxies — always revalidate
+    if (filePath.endsWith('index.html')) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  },
+}));
+
+// Fallback for SPA — also no-cache
 app.get('*', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
 });
 
