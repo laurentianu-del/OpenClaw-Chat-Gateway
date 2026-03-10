@@ -415,6 +415,22 @@ app.put('/api/models/manage', async (req, res) => {
   }
 });
 
+app.delete('/api/endpoints/manage', async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    if (!endpoint) return res.status(400).json({ success: false, error: 'endpoint required' });
+
+    const count = await agentProvisioner.deleteEndpointConfig(endpoint);
+    if (count > 0) {
+      execPromise('openclaw gateway restart').catch(console.error);
+      return res.json({ success: true, deleted: count });
+    }
+    return res.status(404).json({ success: false, error: 'Endpoint not found or no models under it' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get('/api/characters', (_req, res) => {
   const characters = db.getCharacters().map(char => {
     const diskSoul = agentProvisioner.readSoul(char.agentId);

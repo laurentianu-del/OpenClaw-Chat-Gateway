@@ -354,6 +354,48 @@ export class AgentProvisioner {
   }
 
   /**
+   * Delete all models under a given endpoint in openclaw.json
+   */
+  async deleteEndpointConfig(endpoint: string): Promise<number> {
+    const configPath = path.join(this.openclawDir, 'openclaw.json');
+    if (!fs.existsSync(configPath)) return 0;
+
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    if (!config.agents?.defaults?.models) return 0;
+
+    const prefix = `${endpoint}/`;
+    const toDelete = Object.keys(config.agents.defaults.models).filter(id => id.startsWith(prefix));
+    if (toDelete.length === 0) return 0;
+
+    for (const modelId of toDelete) {
+      delete config.agents.defaults.models[modelId];
+    }
+
+    // Handle primary model fallback
+    const primary = config.agents?.defaults?.model?.primary;
+    if (primary && toDelete.includes(primary)) {
+      const remaining = Object.keys(config.agents.defaults.models);
+      if (remaining.length > 0) {
+        config.agents.defaults.model.primary = remaining[0];
+      } else {
+        delete config.agents.defaults.model.primary;
+      }
+    }
+
+    // Fallback agents using any deleted model
+    if (Array.isArray(config.agents.list)) {
+      config.agents.list.forEach((agent: any) => {
+        if (toDelete.includes(agent.model)) {
+          delete agent.model;
+        }
+      });
+    }
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    return toDelete.length;
+  }
+
+  /**
    * Update the model for an existing agent in openclaw.json
    * For 'main' agent: updates agents.defaults.model.primary
    * For other agents: updates agents.list[].model

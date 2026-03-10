@@ -50,7 +50,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [editingId, setEditingId] = useState<number | null>(null);
 
   // --- Shared Delete Modal State ---
-  type DeleteTarget = { type: 'host'; value: string } | { type: 'command'; id: number } | { type: 'model'; id: string };
+  type DeleteTarget = { type: 'host'; value: string } | { type: 'command'; id: number } | { type: 'model'; id: string } | { type: 'endpoint'; name: string };
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [deleteModalMessage, setDeleteModalMessage] = useState('');
@@ -352,6 +352,20 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           setModelError(data.error || '删除模型失败');
           setTimeout(() => setModelError(''), 3000);
         }
+      } else if (deleteTarget.type === 'endpoint') {
+        const res = await fetch('/api/endpoints/manage', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: deleteTarget.name }),
+        });
+        if (res.ok) {
+          fetchModels();
+          setModelSuccessTimestamp(Date.now());
+        } else {
+          const data = await res.json().catch(() => ({}));
+          setModelError(data.error || '删除端点失败');
+          setTimeout(() => setModelError(''), 3000);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -441,6 +455,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     setEditingModelId(model.id);
     setEditingAlias(model.alias || '');
     setTimeout(() => editAliasInputRef.current?.focus(), 50);
+  };
+
+  const handleDeleteEndpoint = (endpoint: string, count: number) => {
+    setDeleteTarget({ type: 'endpoint', name: endpoint });
+    setDeleteModalMessage(`确定要删除端点 "${endpoint}" 吗？\n这将删除该端点下的全部 ${count} 个模型。\n如果其中包含默认模型或被智能体使用的模型，将自动恢复为系统默认。`);
+    setIsDeleteModalOpen(true);
   };
 
   const cancelEditModel = () => {
@@ -964,8 +984,48 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               </div>
 
               <div>
+                <h3 className="text-lg font-semibold text-gray-900 mb-1">端点管理</h3>
+                <p className="text-sm text-gray-500 mb-4">可对整个端点下的所有模型进行批量删除。</p>
+                <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+                  {knownEndpoints.length === 0 ? (
+                    <div className="px-6 py-6 text-center text-gray-400 text-sm">暂无端点</div>
+                  ) : (
+                    <table className="w-full text-left border-collapse">
+                      <thead>
+                        <tr className="bg-gray-50 border-b border-gray-200">
+                          <th className="px-6 py-3 font-medium text-gray-500 text-sm">端点</th>
+                          <th className="px-6 py-3 font-medium text-gray-500 text-sm">模型数量</th>
+                          <th className="px-6 py-3 text-right w-24"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {knownEndpoints.map(ep => {
+                          const epCount = models.filter(m => m.id.startsWith(`${ep}/`)).length;
+                          return (
+                            <tr key={ep} className="hover:bg-gray-50/50 transition-colors group">
+                              <td className="px-6 py-4 font-medium text-gray-800 text-base">{ep}</td>
+                              <td className="px-6 py-4 text-gray-500 text-base">{epCount} 个模型</td>
+                              <td className="px-6 py-4 text-right">
+                                <button
+                                  onClick={() => handleDeleteEndpoint(ep, epCount)}
+                                  className="opacity-0 group-hover:opacity-100 p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                                  title="删除整个端点"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              <div>
                 <h3 className="text-lg font-semibold text-gray-900 mb-1">现有模型列表</h3>
-                <p className="text-sm text-gray-500 mb-4">悬停列可进行编辑别名、设为默认或删除操作。</p>
+                <p className="text-sm text-gray-500 mb-4">按模型 ID 升序排列，悬停列可进行编辑别名、设为默认或删除操作。</p>
                 <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
                   <table className="w-full text-left border-collapse">
                     <thead>
@@ -984,7 +1044,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           </td>
                         </tr>
                       ) : (
-                        models.map((model) => (
+                        [...models].sort((a, b) => a.id.localeCompare(b.id)).map((model) => (
                           <tr key={model.id} className={`hover:bg-gray-50/50 transition-colors text-base ${editingModelId === model.id ? 'bg-blue-50/30' : 'group'}`}>
                             <td className="px-4 py-4 text-gray-700">{model.id}</td>
                             <td className="px-4 py-3 text-gray-600">
