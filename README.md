@@ -79,20 +79,64 @@ sudo apt update && sudo apt install libreoffice -y
 
 ## English
 
-**OpenClaw Chat Gateway** is a modern, enterprise-grade web client for the OpenClaw ecosystem. It provides professional "Agent Sandboxing" and a silky-smooth responsive UI, taking your OpenClaw productivity to the next level.
+**OpenClaw Chat Gateway** is a production-grade Web client designed specifically for the OpenClaw ecosystem. It provides a complete "Agent Sandboxing" management solution for advanced users, combined with a cutting-edge responsive interface to take your OpenClaw experience to a new dimension.
 
-### 🌟 Why Choose Chat Gateway?
+### 🌟 Core Highlights
 
-- **🗝️ Full UI Configuration**: Manage multiple agents effortlessly through a clean visual interface. **No more manual JSON/Markdown editing**.
-- **📉 Isolated Models & Token Savings**: Configure specific models for each agent. Combined with isolated workspaces, it **minimizes context overlap and significantly reduces token consumption**.
-- **📱 Mobile Excellence**: A mobile-first responsive design that feels and behaves like a **native iOS/Android app**.
-- **🖼️ High-Fidelity Previews**: Built-in support for Word, PPT, Excel, and PDF previews using LibreOffice rendering for professional accuracy.
+- **🤖 Multi-Agent, Full UI Configuration**: Supports rapid creation and management of multi-agents through a fully visualized UI interface. Say goodbye to **manually editing JSON and Markdown files**.
+- **📉 Isolated Model Configuration & Significant Token Savings**: Each agent can be independently configured with different models. Combined with completely isolated Workspaces and independent configuration files, it **precisely controls model routing and significantly reduces Token waste caused by background overlap**.
+- **📱 Ultimate Mobile Optimization**: Deeply adapted to mobile screens and interaction logic, with a smooth responsive design. The **user experience is almost indistinguishable from a native app**.
+
+### ✨ In-Depth Features
+- **🗝️ Complete Agent Isolation (Sandboxing)**: Independent workspaces and memory. Each character has its own `SOUL.md` and `USER.md`, completely eliminating conversation pollution.
+- **🖼️ Industrial-Grade Preview Experience**: Integrated with LibreOffice rendering capabilities, it perfectly supports online previews of complex documents such as Word, PPT, Excel, and PDF, preserving the original layout.
+- **🚀 Deep Native Integration**: Run low-level commands like `/status` and `/help` directly in the chat window for real-time system status feedback.
+
+<p align="center">
+  <img src="docs/screenshots/agent_config.png" width="45%" />
+</p>
 
 ### 🚀 Quick Start
+> [!IMPORTANT]
+> This project must be installed on a **Linux host** where OpenClaw is already installed, and it must be a **native installation** (not Docker).
+
+#### 📥 One-Click Installation
 ```bash
-# Default installation
+# Default port 3115
 curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash
 
-# Custom port
+# Custom port deployment (e.g., 8080)
 curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
 ```
+
+#### 🆙 Non-Destructive Upgrade / 🗑️ Complete Uninstallation
+```bash
+# Non-destructive upgrade
+curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh | bash
+
+# Complete uninstallation
+curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/uninstall.sh | bash
+```
+
+---
+
+### 📱 Mobile Preview
+Meticulously crafted mobile details, providing not just responsiveness, but immersion.
+
+<p align="center">
+  <img src="docs/screenshots/mobile_sidebar.jpg" width="45%" />
+  <img src="docs/screenshots/mobile_chat.jpg" width="45%" />
+</p>
+
+---
+
+### 💡 Tip: Enhanced Preview
+If you need to preview documents like Word, PPT, or Excel, please run the following command to install LibreOffice:
+```bash
+sudo apt update && sudo apt install libreoffice -y
+```
+
+### 💬 Community & Support
+- **Telegram Group**: [安格视界 (AngeWorld)](https://t.me/angeworld2024)
+- **Resource Site**: [安格超市 (Ange Market)](https://blog.angeworld.cc/market/)
+- **AI Interface**: [芝麻开门 AI 接口](https://ai.opendoor.cn)
