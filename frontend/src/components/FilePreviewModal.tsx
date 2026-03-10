@@ -84,10 +84,14 @@ function ZoomableWrapper({ children, center = false }: { children: React.ReactNo
           wrapperStyle={{ 
             width: '100%', 
             height: '100%', 
-            overflowY: isZoomed ? 'hidden' : 'auto', // Native scroll when unzoomed
-            overflowX: 'hidden' 
+            // Crucial fix: DO NOT toggle overflow dynamically. 
+            // It causes massive React re-renders and reflows during touch events,
+            // resulting in lag, Android tearing, and iOS Safari crashes.
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            touchAction: isZoomed ? 'none' : 'pan-y' // Tell browser to natively allow vertical scroll or block it
           }} 
-          contentStyle={{ width: '100%', minHeight: center ? 'auto' : '100%' }}
+          contentStyle={{ width: '100%', minHeight: center ? 'auto' : '100%', willChange: isZoomed ? 'transform' : 'auto' }}
         >
           {children}
         </TransformComponent>
