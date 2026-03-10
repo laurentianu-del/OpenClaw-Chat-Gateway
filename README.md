@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/screenshots/desktop_chat.png" width="100%" />
+  <img src="docs/screenshots/file_preview.png" width="45%" />
 </p>
 
 # OpenClaw Chat Gateway
@@ -27,7 +27,7 @@
 
 <p align="center">
   <img src="docs/screenshots/agent_config.png" width="45%" />
-  <img src="docs/screenshots/file_preview.png" width="45%" />
+
 </p>
 
 ### 🚀 快速开始
