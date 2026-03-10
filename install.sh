@@ -53,6 +53,23 @@ chmod +x deploy-release.sh
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 
+# LibreOffice Check
+echo -e "\n${BLUE}Step 4: Checking for LibreOffice (Recommended)...${NC}"
+if ! command -v libreoffice &> /dev/null; then
+    echo -e "安装 libreoffice 有更好的文档预览体验。"
+    read -p "检查到主机未安装 libreoffice，是否现在安装？(Y/n): " install_lo
+    install_lo=${install_lo:-Y}
+    
+    if [[ "$install_lo" =~ ^[Yy]$ ]]; then
+        echo -e "${BLUE}正在安装 LibreOffice...${NC}"
+        sudo apt update && sudo apt install libreoffice -y
+    else
+        echo -e "${BLUE}您可以下次自行安装，安装指令为: ${NC}sudo apt update && sudo apt install libreoffice -y"
+    fi
+else
+    echo -e "${GREEN}LibreOffice 已安装，文档预览体验已就绪。${NC}"
+fi
+
 echo -e "\n${GREEN}================================================${NC}"
 echo -e "${GREEN}   Installation Complete! ${NC}"
 echo -e "${GREEN}================================================${NC}"

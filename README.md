@@ -26,8 +26,9 @@
   - **Conversation Flow**: Intelligent date dividers for multi-day conversations.
 - **📁 Advanced Session Management**: Create, rename, and **drag-and-order** character sessions in the sidebar.
 - **🛡️ Secure Access Control**:
-  - **Login Password Protection**: Optional password gate to secure your gateway access.
+  - **Login Password Protection**: Optional password gate to secure your gateway access (Default password: \`123456\`).
   - **Reverse Proxy Whitelist**: Support for domain whitelisting to ensure secure deployment behind reverse proxies (Nginx/Traefik).
+- **📝 High-Fidelity Preview**: Install \`libreoffice\` on the host for the best document preview experience.
 - **⚙️ Enterprise-Ready Deployment**:
   - One-click installation with automatic dependency resolution.
   - Native `systemd` integration for auto-start and background management.
@@ -101,8 +102,9 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
   - **对话流优化**：自动插入跨天日期分割线，聊天脉络更清晰。
 - **📁 高级会话管理**：创建并管理多个角色会话，侧边栏支持**拖拽排序**。
 - **🛡️ 安全访问控制**：
-  - **安全登录密码**：可选的密码验证机制，全面保护您的网关访问安全。
+  - **安全登录密码**：可选的密码验证机制，全面保护您的网关访问安全（默认密码：\`123456\`）。
   - **反向代理域名白名单**：支持域名白名单验证，适配 Nginx/Traefik 等反向代理环境的安全部署。
+- **📝 高保真预览**：在本机安装 \`libreoffice\` 可获得最佳的文档预览体验。
 - **⚙️ 生产级部署方案**：
   - 一键式安装脚本，自动处理所有依赖。
   - 原生 `systemd` 集成，开机自启，后台稳定运行。
@@ -153,4 +155,14 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 
 - **官方 TG 交流群**：[安格视界 (AngeWorld)](https://t.me/angeworld2024)
 - **安格超市**：[获取更多精品资源](https://blog.angeworld.cc/market/)
+
+---
+
+### 💡 提示：安装 LibreOffice
+
+为了获得更完美的文档（Docx, PDF, PPT, Excel）预览体验，建议在安装了本程序的 Linux 主机上运行以下指令：
+
+```bash
+sudo apt update && sudo apt install libreoffice -y
+```
 
