@@ -571,6 +571,11 @@ export default function Sidebar({
                           const q = modelSearchQuery.toLowerCase();
                           return m.id.toLowerCase().includes(q) || (m.alias && m.alias.toLowerCase().includes(q));
                         })
+                        .sort((a, b) => {
+                          if (a.primary && !b.primary) return -1;
+                          if (!a.primary && b.primary) return 1;
+                          return a.id.localeCompare(b.id);
+                        })
                         .map(m => (
                           <button
                             key={m.id}
