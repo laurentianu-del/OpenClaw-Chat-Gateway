@@ -1890,7 +1890,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         return visibleDiscoveredModels.map(m => {
                           const isExisting = existingModelIds.has(`${newModelEndpoint.trim()}/${m}`);
                           const testData = individualTestStatus[m];
-                          const isSelected = selectedModels.includes(m);
+                          const isSelected = selectedModels.includes(m) || (selectedModels.length === 0 && newModelName === m);
 
                           return (
                             <div 
@@ -1902,10 +1902,21 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                             onClick={(e) => {
                               if (isExisting) return;
                               e.preventDefault();
-                              if (isSelected) setSelectedModels(prev => prev.filter(x => x !== m));
-                              else {
-                                setSelectedModels(prev => [...prev, m]);
-                                setNewModelName('');
+                              if (isSelected) {
+                                if (selectedModels.length === 0 && newModelName === m) {
+                                  setNewModelName('');
+                                } else {
+                                  setSelectedModels(prev => prev.filter(x => x !== m));
+                                }
+                              } else {
+                                if (selectedModels.length === 0 && newModelName && newModelName !== m) {
+                                  // Transform the single newModelName into the array along with the new selection
+                                  setSelectedModels([newModelName, m]);
+                                  setNewModelName('');
+                                } else {
+                                  setSelectedModels(prev => [...prev, m]);
+                                  setNewModelName('');
+                                }
                               }
                             }}
                           >
