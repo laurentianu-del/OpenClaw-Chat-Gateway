@@ -1260,7 +1260,7 @@ export default function ChatView({ isConnected, activeSessionId, onMenuClick, se
       </div>
 
       {/* Input Area - Gemini Style */}
-      <div className="px-4 sm:px-6 pb-2 pt-2 flex-shrink-0 bg-white">
+      <div className="px-4 sm:px-6 pb-6 sm:pb-8 pt-2 flex-shrink-0 bg-white">
         <div className="max-w-5xl mx-auto flex flex-col gap-3">
           {/* Previews (TG Style) */}
           {pendingFiles.length > 0 && (

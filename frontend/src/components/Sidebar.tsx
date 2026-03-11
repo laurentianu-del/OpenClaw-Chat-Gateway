@@ -334,7 +334,7 @@ export default function Sidebar({
         )}
         <aside className={`fixed inset-y-0 left-0 z-50 w-64 flex-shrink-0 flex-col border-r border-gray-300 bg-gray-100 h-full transition-transform duration-300 md:relative md:translate-x-0 md:flex ${isMobileMenuOpen ? 'translate-x-0 flex' : '-translate-x-full hidden'}`}>
           <SidebarHeader />
-        <nav className="flex-1 px-6 py-2 space-y-1">
+        <nav className="flex-1 px-4 py-2 space-y-1">
           <button 
             onClick={() => navigateTo('settings', 'gateway', false)}
             className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all font-semibold border ${settingsTab === 'gateway' ? 'text-blue-600 bg-blue-50 border-blue-300' : 'text-gray-600 hover:bg-gray-200 border-transparent'}`}
@@ -373,7 +373,7 @@ export default function Sidebar({
             关于
           </button>
         </nav>
-        <div className="p-6 border-t border-gray-100">
+        <div className="p-4 border-t border-gray-100">
           <button
             onClick={() => navigateTo('chat', settingsTab, false)}
             className="w-full flex items-center gap-3 px-4 py-3 text-gray-600 hover:bg-gray-200 hover:text-gray-900 rounded-xl transition-all font-medium"
@@ -399,7 +399,7 @@ export default function Sidebar({
       <aside className={`fixed inset-y-0 left-0 z-50 w-64 flex-shrink-0 flex-col border-r border-gray-300 bg-gray-100 h-full transition-transform duration-300 md:relative md:translate-x-0 md:flex ${isMobileMenuOpen ? 'translate-x-0 flex' : '-translate-x-full hidden'}`}>
         <SidebarHeader />
 
-      <div className="px-6 pb-4">
+      <div className="px-4 pb-4">
         <button 
           onClick={() => {
             setModalMode('create');
@@ -424,7 +424,7 @@ export default function Sidebar({
           新建智能体
         </button>
       </div>
-      <div className="flex-1 overflow-y-auto px-6 py-2 min-h-0">
+      <div className="flex-1 overflow-y-auto px-4 py-2 min-h-0">
         {!sessionsLoaded ? (
           <SessionSkeleton />
         ) : enableReorder ? (
@@ -441,7 +441,7 @@ export default function Sidebar({
               </Reorder.Item>
             ))
           ) : (
-            <div className="px-6 py-8 text-center bg-white/50 rounded-2xl border border-dashed border-gray-200 mt-2">
+            <div className="px-4 py-8 text-center bg-white/50 rounded-2xl border border-dashed border-gray-200 mt-2">
                <p className="text-sm text-gray-400 font-medium">暂无角色记录</p>
             </div>
           )}
