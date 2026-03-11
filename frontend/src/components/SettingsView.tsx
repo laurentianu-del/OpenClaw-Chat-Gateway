@@ -555,6 +555,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         setNewModelAlias('');
         setSelectedModels([]);
         setIsAddModelModalOpen(false);
+        fetchModels();
       }
     } catch (err) {
       console.error(err);
