@@ -63,6 +63,13 @@ export default function App() {
     localStorage.setItem('clawui_settings_tab', settingsTab);
   }, [currentView, settingsTab]);
 
+  // Sync activeSessionId to localStorage
+  useEffect(() => {
+    if (activeSessionId) {
+      localStorage.setItem('clawui_active_session', activeSessionId);
+    }
+  }, [activeSessionId]);
+
   // Wrapper for view/tab changes
   const navigateTo = (view: ViewType, tab?: SettingsTab, openMenu?: boolean) => {
     const nextTab = tab || settingsTab;
