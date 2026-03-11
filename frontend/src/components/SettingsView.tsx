@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag } from 'lucide-react';
+import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag, ChevronDown, ChevronUp } from 'lucide-react';
 import { SettingsTab } from '../App';
 
 interface SettingsViewProps {
@@ -80,6 +80,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [showOnlyConnected, setShowOnlyConnected] = useState(false);
   const [individualTestStatus, setIndividualTestStatus] = useState<Record<string, { status: 'testing'|'success'|'error', message?: string }>>({});
+  const [isModelsExpanded, setIsModelsExpanded] = useState(false);
   
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -1736,11 +1737,29 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               </div>
 
               <div className="flex-1 flex flex-col relative z-10" ref={dropdownRef}>
-                <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  模型 ID <span className="text-red-500">*</span>
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-sm font-medium text-gray-900">
+                    模型 ID <span className="text-red-500">*</span>
+                  </label>
+                  {selectedModels.length > 2 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setIsModelsExpanded(!isModelsExpanded);
+                      }}
+                      className="text-xs text-gray-500 hover:text-blue-600 flex items-center gap-1 transition-colors px-2 py-0.5 rounded hover:bg-gray-100"
+                    >
+                      {isModelsExpanded ? (
+                        <><ChevronUp className="w-3.5 h-3.5" /> 收起</>
+                      ) : (
+                        <><ChevronDown className="w-3.5 h-3.5" /> 展开全部 ({selectedModels.length})</>
+                      )}
+                    </button>
+                  )}
+                </div>
                 <div 
-                  className="relative cursor-pointer block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus-within:bg-white focus-within:outline-none focus-within:ring-2 focus-within:ring-blue-500/20 transition-all text-sm min-h-[46px] flex items-center gap-2 flex-wrap"
+                  className={`relative cursor-pointer block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus-within:bg-white focus-within:outline-none focus-within:ring-2 focus-within:ring-blue-500/20 transition-all text-sm flex items-center gap-2 flex-wrap min-h-[46px] ${isModelsExpanded ? 'max-h-[250px] overflow-y-auto items-start content-start' : 'max-h-[46px] overflow-hidden'}`}
                   onClick={() => {
                     setIsModelDropdownOpen(true);
                     if (discoveredModels.length === 0 && !isDiscovering) {
