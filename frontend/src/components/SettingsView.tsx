@@ -983,10 +983,10 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {settingsTab === 'models' && (
             <div className="space-y-6">
               {/* Sub-tabs for Model Management */}
-              <div className="flex bg-white rounded-xl border border-gray-200 p-1 mb-2">
+              <div className="flex bg-white rounded-xl border border-gray-200 p-1 mb-6">
                 <button
                   onClick={() => setActiveModelSubTab('endpoints')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-medium rounded-lg transition-all ${
+                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-bold rounded-lg transition-all ${
                     activeModelSubTab === 'endpoints'
                       ? 'bg-blue-50 text-blue-600 shadow-sm'
                       : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
@@ -996,13 +996,13 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                 </button>
                 <button
                   onClick={() => setActiveModelSubTab('models')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-medium rounded-lg transition-all ${
+                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-bold rounded-lg transition-all ${
                     activeModelSubTab === 'models'
                       ? 'bg-blue-50 text-blue-600 shadow-sm'
                       : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
                   }`}
                 >
-                  模型列表
+                  模型管理
                 </button>
               </div>
 
@@ -1114,7 +1114,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           // Convert api internal name to display name
                           const displayApi = epConfig.api === 'openai-completions' ? 'OpenAI' : 
                                              epConfig.api === 'anthropic-messages' ? 'Anthropic' :
-                                             epConfig.api === 'google-genai' ? 'Gemini' : epConfig.api;
+                                             epConfig.api === 'google-genai' ? 'Gemini' : 
+                                             epConfig.api === 'ollama' ? 'Ollama' : epConfig.api;
 
                           return (
                             <tr key={epName} className="hover:bg-gray-50/50 transition-colors group">
@@ -1414,6 +1415,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   <option value="google-genai">Google Gemini (GenAI)</option>
                   <option value="cohere-chat">Cohere Chat</option>
                   <option value="mistral-chat">Mistral Chat</option>
+                  <option value="ollama">Ollama</option>
                 </select>
                 <p className="text-xs text-gray-500 mt-1.5 ml-1">取决于提供商的底层 API 格式，通常为 OpenAI 兼容。</p>
               </div>
