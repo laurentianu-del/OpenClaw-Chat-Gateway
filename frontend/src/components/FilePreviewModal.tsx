@@ -103,7 +103,14 @@ function ZoomableWrapper({ children, center = false }: { children: React.ReactNo
             overflowX: 'hidden',
             touchAction: isZoomed ? 'none' : 'pan-y' // Tell browser to natively allow vertical scroll or block it
           }} 
-          contentStyle={{ width: '100%', minHeight: center ? 'auto' : '100%', willChange: isZoomed ? 'transform' : 'auto' }}
+          contentStyle={{ 
+            width: '100%', 
+            minHeight: '100%', 
+            display: center ? 'flex' : 'block',
+            alignItems: center ? 'center' : 'flex-start',
+            justifyContent: center ? 'center' : 'flex-start',
+            willChange: isZoomed ? 'transform' : 'auto' 
+          }}
         >
           {children}
         </TransformComponent>
