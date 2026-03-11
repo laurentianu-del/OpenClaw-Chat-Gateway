@@ -1092,7 +1092,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     新增端点
                   </button>
                 </div>
-                <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden mb-6 shadow-sm">
+                <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden mb-6">
                   {knownEndpoints.length === 0 ? (
                     <div className="px-6 py-10 text-center text-gray-400 text-sm">暂无端点</div>
                   ) : (
@@ -1101,11 +1101,10 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         <tr className="bg-white border-b border-gray-100">
                           <th className="px-6 py-4 font-medium text-gray-500 text-sm w-[40%]">端点名称</th>
                           <th className="px-6 py-4 font-medium text-gray-500 text-sm w-[20%]">接口类型</th>
-                          <th className="px-6 py-4 font-medium text-gray-500 text-sm text-center w-[20%]">模型<br/>数量</th>
+                          <th className="px-6 py-4 font-medium text-gray-500 text-sm text-center w-[20%]">模型</th>
                           <th className="px-6 py-4 font-bold text-gray-900 text-base text-center w-[20%]">操作</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-gray-100">
                         {knownEndpoints.map(epName => {
                           const epCount = models.filter(m => m.id.startsWith(`${epName}/`)).length;
                           const epConfig = endpoints.find(e => e.id === epName) || { id: epName, baseUrl: '', apiKey: '', api: 'openai-completions' };
@@ -1117,43 +1116,46 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                                              epConfig.api === 'ollama' ? 'Ollama' : epConfig.api;
 
                           return (
-                            <tr key={epName} className="hover:bg-gray-50/50 transition-colors group bg-white">
-                              <td className="px-6 py-5 align-top">
-                                <div className="font-medium text-gray-800 text-base mb-2">{epName}</div>
-                                <div className="text-gray-500 text-sm break-all max-w-sm">
+                            <tbody key={epName} className="group border-b border-gray-100 last:border-b-0 bg-white hover:bg-gray-50/50 transition-colors">
+                              <tr>
+                                <td className="px-6 pt-5 pb-1 align-bottom">
+                                  <div className="font-medium text-gray-800 text-lg">{epName}</div>
+                                </td>
+                                <td className="px-6 pt-5 pb-1 align-bottom">
+                                  <span className="px-2.5 py-1 rounded-md border border-gray-200 bg-gray-50 text-gray-500 text-xs font-medium">
+                                    {displayApi}
+                                  </span>
+                                </td>
+                                <td className="px-6 py-5 align-middle text-gray-500 text-sm text-center" rowSpan={2}>
+                                  {epCount} 个
+                                </td>
+                                <td className="px-6 py-5 align-middle text-center" rowSpan={2}>
+                                  <div className="flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100 transition-all">
+                                    <button
+                                      onClick={() => openEditEndpointModal(epConfig)}
+                                      className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
+                                      title="编辑端点"
+                                    >
+                                      <Edit2 className="w-4 h-4" />
+                                    </button>
+                                    <button
+                                      onClick={() => handleDeleteEndpoint(epName, epCount)}
+                                      className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                                      title="删除整个端点"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td colSpan={2} className="px-6 pb-5 pt-1 align-top text-gray-500 text-sm break-all max-w-[400px]">
                                   {epConfig.baseUrl || '-'}
-                                </div>
-                              </td>
-                              <td className="px-6 py-5 align-top pt-5">
-                                <span className="px-2 py-0.5 rounded-md bg-gray-100 text-gray-500 text-xs font-medium">
-                                  {displayApi}
-                                </span>
-                              </td>
-                              <td className="px-6 py-5 align-top text-gray-500 text-sm text-center pt-5 lg:pt-8">
-                                {epCount} 个
-                              </td>
-                              <td className="px-6 py-5 align-top text-center pt-5 lg:pt-8">
-                                <div className="flex items-center justify-center gap-2 opacity-0 group-hover:opacity-100 transition-all">
-                                  <button
-                                    onClick={() => openEditEndpointModal(epConfig)}
-                                    className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
-                                    title="编辑端点"
-                                  >
-                                    <Edit2 className="w-4 h-4" />
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteEndpoint(epName, epCount)}
-                                    className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
-                                    title="删除整个端点"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
+                                </td>
+                              </tr>
+                            </tbody>
                           );
                         })}
-                      </tbody>
                     </table>
                   )}
                 </div>
