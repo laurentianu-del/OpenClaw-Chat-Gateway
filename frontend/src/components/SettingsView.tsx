@@ -79,6 +79,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
   const [showOnlyConnected, setShowOnlyConnected] = useState(false);
   const [individualTestStatus, setIndividualTestStatus] = useState<Record<string, { status: 'testing'|'success'|'error', message?: string }>>({});
+  const [isTestingAll, setIsTestingAll] = useState(false);
   
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -201,10 +202,19 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const handleTestAllFiltered = async (e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
+    if (isTestingAll) return;
     const filtered = discoveredModels.filter(m => m.toLowerCase().includes(modelSearchQuery.toLowerCase()));
-    for (const m of filtered) {
-       if (existingModelIds.has(`${newModelEndpoint.trim()}/${m}`)) continue;
-       handleTestSingleModel(m); // Do it in parallel rather than blocking sequentially
+    
+    setIsTestingAll(true);
+    try {
+      const promises = [];
+      for (const m of filtered) {
+         if (existingModelIds.has(`${newModelEndpoint.trim()}/${m}`)) continue;
+         promises.push(handleTestSingleModel(m));
+      }
+      await Promise.allSettled(promises);
+    } finally {
+      setIsTestingAll(false);
     }
   };
 
