@@ -357,7 +357,9 @@ app.post('/api/models/manage', async (req, res) => {
     const success = await agentProvisioner.addModelConfig(endpoint, modelName, alias);
     if (success) {
       // Restart the gateway to apply
-      execPromise('openclaw gateway restart').catch(console.error);
+      setTimeout(() => {
+        execPromise('openclaw gateway restart').catch(console.error);
+      }, 1000);
       return res.json({ success: true });
     }
     return res.status(400).json({ success: false, error: 'Model may already exist or config invalid' });
@@ -374,7 +376,9 @@ app.delete('/api/models/manage', async (req, res) => {
     const success = await agentProvisioner.deleteModelConfig(id);
     if (success) {
       // Restart the gateway to apply
-      execPromise('openclaw gateway restart').catch(console.error);
+      setTimeout(() => {
+        execPromise('openclaw gateway restart').catch(console.error);
+      }, 1000);
       return res.json({ success: true });
     }
     return res.status(404).json({ success: false, error: 'Model not found' });
@@ -391,7 +395,9 @@ app.put('/api/models/manage/default', async (req, res) => {
     const success = await agentProvisioner.setDefaultModel(id);
     if (success) {
       // Restart the gateway to apply
-      execPromise('openclaw gateway restart').catch(console.error);
+      setTimeout(() => {
+        execPromise('openclaw gateway restart').catch(console.error);
+      }, 1000);
       return res.json({ success: true });
     }
     return res.status(404).json({ success: false, error: 'Model not found' });
@@ -422,7 +428,9 @@ app.delete('/api/endpoints/manage', async (req, res) => {
 
     const count = await agentProvisioner.deleteEndpointConfig(endpoint);
     if (count > 0) {
-      execPromise('openclaw gateway restart').catch(console.error);
+      setTimeout(() => {
+        execPromise('openclaw gateway restart').catch(console.error);
+      }, 1000);
       return res.json({ success: true, deleted: count });
     }
     return res.status(404).json({ success: false, error: 'Endpoint not found or no models under it' });
@@ -450,7 +458,9 @@ app.post('/api/endpoints', async (req, res) => {
     const success = await agentProvisioner.saveEndpoint(id, { baseUrl, apiKey, api });
     if (success) {
       // Restart the gateway to apply
-      execPromise('openclaw gateway restart').catch(console.error);
+      setTimeout(() => {
+        execPromise('openclaw gateway restart').catch(console.error);
+      }, 1000);
       return res.json({ success: true });
     }
     return res.status(400).json({ success: false, error: 'Failed to save endpoint' });

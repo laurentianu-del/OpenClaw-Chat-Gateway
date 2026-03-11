@@ -1387,6 +1387,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               </h3>
             </div>
             <div className="p-6 space-y-4">
+              {modelError && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
+                  <X className="w-4 h-4 shrink-0" />
+                  {modelError}
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-900 mb-1.5">
                   端点名称 (ID) <span className="text-red-500">*</span>
