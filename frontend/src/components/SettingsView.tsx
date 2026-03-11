@@ -56,6 +56,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [deleteModalMessage, setDeleteModalMessage] = useState('');
 
   // --- Model Management State ---
+  const [activeModelSubTab, setActiveModelSubTab] = useState<'endpoints' | 'models'>('endpoints');
   const [models, setModels] = useState<{ id: string; alias?: string; primary: boolean }[]>([]);
   const [newModelEndpoint, setNewModelEndpoint] = useState('');
   const [newModelName, setNewModelName] = useState('');
@@ -981,6 +982,31 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {/* Model Management Tab */}
           {settingsTab === 'models' && (
             <div className="space-y-6">
+              {/* Sub-tabs for Model Management */}
+              <div className="flex bg-white rounded-xl border border-gray-200 p-1 mb-2">
+                <button
+                  onClick={() => setActiveModelSubTab('endpoints')}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-medium rounded-lg transition-all ${
+                    activeModelSubTab === 'endpoints'
+                      ? 'bg-blue-50 text-blue-600 shadow-sm'
+                      : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
+                  }`}
+                >
+                  端点管理
+                </button>
+                <button
+                  onClick={() => setActiveModelSubTab('models')}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-medium rounded-lg transition-all ${
+                    activeModelSubTab === 'models'
+                      ? 'bg-blue-50 text-blue-600 shadow-sm'
+                      : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
+                  }`}
+                >
+                  模型列表
+                </button>
+              </div>
+
+              {activeModelSubTab === 'models' && (
               <div>
                 <h3 className="text-lg font-semibold text-gray-900 mb-1">添加模型</h3>
                 <p className="text-sm text-gray-500 mb-6">选择端点并输入模型 ID 来添加新模型到 openclaw.json 配置中。</p>
@@ -1049,7 +1075,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </div>
                 </div>
               </div>
+              )}
 
+              {activeModelSubTab === 'endpoints' && (
               <div>
                 <div className="flex justify-between items-center mb-4">
                   <div>
@@ -1128,7 +1156,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   )}
                 </div>
               </div>
+              )}
 
+              {activeModelSubTab === 'models' && (
               <div>
                 <h3 className="text-lg font-semibold text-gray-900 mb-1">现有模型列表</h3>
                 <p className="text-sm text-gray-500 mb-4">按模型 ID 升序排列，悬停列可进行编辑别名、设为默认或删除操作。</p>
@@ -1232,6 +1262,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </table>
                 </div>
               </div>
+              )}
             </div>
           )}
 
