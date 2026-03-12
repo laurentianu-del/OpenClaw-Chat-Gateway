@@ -920,7 +920,7 @@ app.post('/api/chat', async (req, res) => {
 
     const resetIdleTimeout = () => {
       clearTimeout(idleTimeout);
-      // 60s idle timeout between tokens or before first token
+      // 10-minute idle timeout between tokens or before first token to allow for complex tasks
       idleTimeout = setTimeout(() => {
         if (!streamEnded) {
           streamEnded = true;
@@ -931,7 +931,7 @@ app.post('/api/chat', async (req, res) => {
           res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
           res.end();
         }
-      }, 60000); 
+      }, 600000); 
     };
 
     const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
