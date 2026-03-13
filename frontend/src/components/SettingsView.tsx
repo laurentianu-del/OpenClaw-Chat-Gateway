@@ -19,6 +19,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [gatewaySaved, setGatewaySaved] = useState(false);
   const [gatewayError, setGatewayError] = useState(false);
   const [isDetectingAll, setIsDetectingAll] = useState(false);
+  const [detectError, setDetectError] = useState('');
+  const [maxPermissions, setMaxPermissions] = useState(false);
+  const [isTogglingPermissions, setIsTogglingPermissions] = useState(false);
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
   const [newHost, setNewHost] = useState('');
   const [editingHost, setEditingHost] = useState<string | null>(null);
@@ -137,6 +140,11 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     fetchCommands();
     fetchModels();
     fetchEndpoints();
+
+    fetch('/api/config/max-permissions')
+      .then(r => r.json())
+      .then(data => setMaxPermissions(!!data.enabled))
+      .catch(console.error);
   }, []);
 
   const fetchModels = async () => {
@@ -340,6 +348,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const handleDetectAll = async () => {
     setIsDetectingAll(true);
+    setDetectError('');
     try {
       const res = await fetch('/api/config/detect-all');
       const data = await res.json();
@@ -349,11 +358,11 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         if (data.data.password) setPassword(data.data.password);
         if (data.data.workspacePath) setOpenclawWorkspace(data.data.workspacePath);
       } else {
-        alert(data.message || '检测失败，请检查 OpenClaw 是否已正确安装或启动');
+        setDetectError(data.message || '检测失败，请检查 OpenClaw 是否已正确安装或启动');
       }
     } catch (err) {
       console.error(err);
-      alert('检测请求发生网络错误');
+      setDetectError('检测请求发生网络错误');
     } finally {
       setIsDetectingAll(false);
     }
@@ -810,15 +819,22 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <h3 className="text-lg font-semibold text-gray-900">连接设置</h3>
-                  <button
-                    type="button"
-                    onClick={handleDetectAll}
-                    disabled={isDetectingAll || isLoading}
-                    className="flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
-                  >
-                    {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-                    自动检测
-                  </button>
+                  <div className="flex flex-col items-end gap-1 relative">
+                    <button
+                      type="button"
+                      onClick={handleDetectAll}
+                      disabled={isDetectingAll || isLoading}
+                      className="flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
+                    >
+                      {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                      自动检测
+                    </button>
+                    {detectError && (
+                      <div className="absolute top-full mt-2 right-0 w-80 text-xs bg-red-50 text-red-600 border border-red-200 p-2 rounded-lg shadow-sm z-10 break-words pointer-events-none">
+                        {detectError}
+                      </div>
+                    )}
+                  </div>
                 </div>
                 <p className="text-sm text-gray-500 mb-6 mt-1">配置连接到 OpenClaw 网关的终结点和凭据。</p>
                 
@@ -882,6 +898,54 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     <p className="text-xs text-gray-400 mt-1.5">
                       配置此项后，上传的文件将存入该路径，以便 OpenClaw 识别。
                     </p>
+                  </div>
+                </div>
+
+                {/* Max Permissions Toggle */}
+                <div className="mt-8">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-1">权限设置</h3>
+                  <p className="text-sm text-gray-500 mb-4">控制 OpenClaw 网关的工具权限级别。</p>
+
+                  <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200">
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1 pr-4">
+                        <div className="text-sm font-medium text-gray-900">最大化权限</div>
+                        <p className="text-xs text-gray-400 mt-1">
+                          开启后将解锁浏览器自动化、命令执行（免确认）、文件操作等全部工具权限。关闭则使用默认 coding 预设。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={maxPermissions}
+                        disabled={isTogglingPermissions}
+                        onClick={async () => {
+                          setIsTogglingPermissions(true);
+                          try {
+                            const res = await fetch('/api/config/max-permissions', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({ enabled: !maxPermissions }),
+                            });
+                            const data = await res.json();
+                            if (data.success) setMaxPermissions(data.enabled);
+                          } catch (err) {
+                            console.error(err);
+                          } finally {
+                            setIsTogglingPermissions(false);
+                          }
+                        }}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-50 ${
+                          maxPermissions ? 'bg-blue-600' : 'bg-gray-200'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-200 ease-in-out ${
+                            maxPermissions ? 'translate-x-6' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
                   </div>
                 </div>
 

@@ -356,6 +356,65 @@ app.get('/api/config/detect-all', (req, res) => {
   }
 });
 
+// --- Max Permissions Toggle ---
+const MAX_PERMISSIONS_TOOLS = {
+  web: {
+    search: { enabled: false },
+    fetch: { enabled: true }
+  },
+  elevated: {
+    enabled: true,
+    allowFrom: { webchat: ['*'], '*': ['*'] }
+  },
+  exec: {
+    security: 'full',
+    ask: 'off'
+  }
+};
+
+app.get('/api/config/max-permissions', (_req, res) => {
+  try {
+    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    if (!fs.existsSync(configPath)) {
+      return res.json({ enabled: false });
+    }
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    // If tools has a "profile" key, it's using the simplified preset (not max permissions)
+    const enabled = !config.tools?.profile && config.tools?.exec?.security === 'full';
+    res.json({ enabled });
+  } catch (error: any) {
+    res.json({ enabled: false });
+  }
+});
+
+app.post('/api/config/max-permissions', (req, res) => {
+  try {
+    const { enabled } = req.body;
+    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    if (!fs.existsSync(configPath)) {
+      return res.status(404).json({ success: false, message: 'openclaw.json not found' });
+    }
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+
+    if (enabled) {
+      config.tools = MAX_PERMISSIONS_TOOLS;
+    } else {
+      config.tools = { profile: 'coding' };
+    }
+
+    // Ensure sandbox is off for local self-hosted setups
+    if (!config.agents) config.agents = {};
+    if (!config.agents.defaults) config.agents.defaults = {};
+    if (!config.agents.defaults.sandbox) config.agents.defaults.sandbox = {};
+    config.agents.defaults.sandbox.mode = 'off';
+
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    res.json({ success: true, enabled });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/api/config/restart', async (_req, res) => {
   try {
     // Disconnect all active clients first
