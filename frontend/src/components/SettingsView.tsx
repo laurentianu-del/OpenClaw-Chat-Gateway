@@ -83,6 +83,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   // --- Model Discovery State ---
   const [isDiscovering, setIsDiscovering] = useState(false);
+  const [hasFetched, setHasFetched] = useState(false);
+  const discoverAbortControllerRef = useRef<AbortController | null>(null);
   const [addModelError, setAddModelError] = useState('');
   const [existingModelTestStatus, setExistingModelTestStatus] = useState<Record<string, { status: 'testing'|'success'|'error', message?: string }>>({}); 
   const [isTestingExisting, setIsTestingExisting] = useState(false);
@@ -171,19 +173,51 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const handleDiscoverModels = async (endpointId: string) => {
     if (!endpointId) return;
+    
+    // Abort any ongoing fetch
+    if (discoverAbortControllerRef.current) {
+      discoverAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    discoverAbortControllerRef.current = controller;
+
     setIsDiscovering(true);
+    setHasFetched(false);
     setDiscoveredModels([]);
     setModelSearchQuery('');
     setIndividualTestStatus({});
+    setIsModelDropdownOpen(false); // keep closed until results are back
+
     try {
-      const res = await fetch(`/api/models/discover?endpoint=${encodeURIComponent(endpointId)}`);
+      const res = await fetch(`/api/models/discover?endpoint=${encodeURIComponent(endpointId)}`, {
+        signal: controller.signal
+      });
       const data = await res.json().catch(() => ({}));
       if (data.success) {
         setDiscoveredModels(data.models || []);
+        setHasFetched(true);
+        if ((data.models || []).length > 0) {
+          setIsModelDropdownOpen(true);
+        }
       }
     } catch (err: any) {
-      console.error(err);
+      if (err.name === 'AbortError') {
+        console.log('Discovery aborted');
+      } else {
+        console.error(err);
+      }
     } finally {
+      if (discoverAbortControllerRef.current === controller) {
+        setIsDiscovering(false);
+        discoverAbortControllerRef.current = null;
+      }
+    }
+  };
+
+  const cancelDiscovery = () => {
+    if (discoverAbortControllerRef.current) {
+      discoverAbortControllerRef.current.abort();
+      discoverAbortControllerRef.current = null;
       setIsDiscovering(false);
     }
   };
@@ -1788,7 +1822,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                               type="button"
                               onClick={() => {
                                 setNewModelEndpoint(ep);
-                                handleDiscoverModels(ep);
+                                setHasFetched(false);
                                 setEndpointSearchQuery('');
                                 setIsEndpointDropdownOpen(false);
                               }}
@@ -1806,7 +1840,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                             onClick={() => {
                               const val = endpointSearchQuery.trim();
                               setNewModelEndpoint(val);
-                              handleDiscoverModels(val);
+                              setHasFetched(false);
                               setEndpointSearchQuery('');
                               setIsEndpointDropdownOpen(false);
                             }}
@@ -1834,15 +1868,43 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               </div>
 
               <div className="flex-1 flex flex-col relative z-10" ref={dropdownRef}>
-                <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  模型 ID <span className="text-red-500">*</span>
-                </label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-sm font-medium text-gray-900">
+                    模型 ID <span className="text-red-500">*</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isDiscovering) {
+                        cancelDiscovery();
+                      } else {
+                        handleDiscoverModels(newModelEndpoint.trim());
+                      }
+                    }}
+                    disabled={!newModelEndpoint.trim()}
+                    title={isDiscovering ? "正在拉取模型，点击可取消。" : ""}
+                    className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all border flex items-center gap-1.5 ${
+                      !newModelEndpoint.trim()
+                        ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
+                        : isDiscovering
+                        ? 'bg-blue-50 text-blue-600 border-blue-200 hover:bg-blue-100'
+                        : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                    }`}
+                  >
+                    {isDiscovering && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    {isDiscovering 
+                      ? '自动拉取中...' 
+                      : (hasFetched && discoveredModels.length > 0)
+                        ? `自动拉取（${discoveredModels.length}）`
+                        : '自动拉取'
+                    }
+                  </button>
+                </div>
                 <div 
                   className="relative cursor-pointer block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus-within:bg-white focus-within:outline-none focus-within:ring-2 focus-within:ring-blue-500/20 transition-all text-sm min-h-[46px] flex items-center gap-2 flex-wrap"
                   onClick={() => {
-                    setIsModelDropdownOpen(true);
-                    if (discoveredModels.length === 0 && !isDiscovering) {
-                      handleDiscoverModels(newModelEndpoint.trim());
+                    if (hasFetched && discoveredModels.length > 0) {
+                      setIsModelDropdownOpen(true);
                     }
                   }}
                 >
@@ -1853,9 +1915,13 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       setNewModelName(e.target.value);
                       setModelSearchQuery(e.target.value);
                     }}
-                    placeholder={isDiscovering ? '正在发现模型...' : (discoveredModels.length > 0 ? `发现 ${discoveredModels.length} 个模型（点击或输入关键字过滤，也可以直接输入模型ID）` : '例如: gpt-4o (点击加载可用列表)')}
+                    placeholder={!hasFetched ? '例如: gpt-4o (可点击上方连网拉取或手动输入)' : (discoveredModels.length > 0 ? `发现 ${discoveredModels.length} 个模型（点击或输入关键字过滤，也可以直接输入模型ID）` : '未拉取到模型，请手动输入')}
                     className="bg-transparent border-none outline-none w-full text-sm placeholder-gray-400 py-1"
-                    onFocus={() => setIsModelDropdownOpen(true)}
+                    onFocus={() => {
+                      if (hasFetched && discoveredModels.length > 0) {
+                        setIsModelDropdownOpen(true);
+                      }
+                    }}
                   />
                   {newModelName && (
                     <button
@@ -1873,7 +1939,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   )}
                 </div>
 
-                {isModelDropdownOpen && (discoveredModels.length > 0 || isDiscovering) && (
+                {isModelDropdownOpen && (hasFetched && discoveredModels.length > 0) && (
                   <>
                   <div className="fixed inset-0 z-[40]" onClick={(e) => { e.stopPropagation(); setIsModelDropdownOpen(false); }} />
                   <div 
@@ -1938,14 +2004,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           </div>
                           
                           <div className="overflow-y-auto flex-1 p-1.5 space-y-0.5 min-h-[100px]" onClick={() => setIsModelDropdownOpen(false)}>
-                            {isDiscovering && discoveredModels.length === 0 && (
-                              <div className="py-8 text-center text-gray-400 text-sm flex flex-col items-center justify-center gap-3">
-                                <Loader2 className="w-6 h-6 animate-spin text-blue-500" /> 
-                                正在联机拉取端点模型列表...
-                              </div>
-                            )}
-                            
-                            {!isDiscovering && visibleDiscoveredModels.length === 0 && (
+                            {visibleDiscoveredModels.length === 0 && (
                               <div className="py-8 text-center text-gray-400 text-sm">
                                 {showOnlyConnected ? '没有找到检测成功的模型' : `未能找到匹配 "${modelSearchQuery}" 的模型`}
                               </div>
