@@ -1892,12 +1892,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     }`}
                   >
                     {isDiscovering && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                    {isDiscovering 
-                      ? '自动拉取中...' 
-                      : (hasFetched && discoveredModels.length > 0)
-                        ? `自动拉取（${discoveredModels.length}）`
-                        : '自动拉取'
-                    }
+                    {isDiscovering ? '自动拉取中...' : '自动拉取'}
                   </button>
                 </div>
                 <div 
@@ -1998,7 +1993,10 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                                 }`}
                               >
                                 {isAnyTesting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                                检测（{visibleDiscoveredModels.length}）
+                                {isAnyTesting
+                                  ? `检测中（${Object.values(individualTestStatus).filter(t => t.status === 'testing').length}）`
+                                  : '检测'
+                                }
                               </button>
                             </div>
                           </div>
