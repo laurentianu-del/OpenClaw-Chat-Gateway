@@ -1697,7 +1697,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   选择端点并选择模型 ID，注意：
                   <div className="text-red-500 font-bold mt-1 space-y-0.5 leading-relaxed">
                     <p>1）自动拉取模型不一定准确，可参考平台官方文档，手动输入模型ID添加。</p>
-                    <p>2）自动获取模型，也会消耗 Token！</p>
+                    <p>2）检测模型，也会消耗 Token！</p>
                   </div>
                 </div>
               </div>
