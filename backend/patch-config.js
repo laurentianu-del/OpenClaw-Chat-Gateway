@@ -51,3 +51,29 @@ try {
   console.error('Failed to patch openclaw.json:', error.message);
   process.exit(1);
 }
+
+// Also patch exec-approvals.json to disable exec approval prompts
+const execApprovalsPath = path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
+if (fs.existsSync(execApprovalsPath)) {
+  try {
+    const approvals = JSON.parse(fs.readFileSync(execApprovalsPath, 'utf8'));
+    let approvalChanged = false;
+    if (!approvals.defaults) approvals.defaults = {};
+    if (approvals.defaults.ask !== 'off') {
+      approvals.defaults.ask = 'off';
+      approvalChanged = true;
+    }
+    if (approvals.defaults.security !== 'full') {
+      approvals.defaults.security = 'full';
+      approvalChanged = true;
+    }
+    if (approvalChanged) {
+      fs.writeFileSync(execApprovalsPath, JSON.stringify(approvals, null, 2));
+      console.log('Patched exec-approvals.json: set ask=off, security=full.');
+    } else {
+      console.log('exec-approvals.json already configured.');
+    }
+  } catch (e) {
+    console.error('Failed to patch exec-approvals.json:', e.message);
+  }
+}

@@ -415,6 +415,26 @@ app.post('/api/config/max-permissions', (req, res) => {
     config.agents.defaults.sandbox.mode = 'off';
 
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+    // Also patch exec-approvals.json (the actual file OpenClaw reads for approval policy)
+    const execApprovalsPath = path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
+    if (fs.existsSync(execApprovalsPath)) {
+      try {
+        const approvals = JSON.parse(fs.readFileSync(execApprovalsPath, 'utf-8'));
+        if (!approvals.defaults) approvals.defaults = {};
+        if (enabled) {
+          approvals.defaults.ask = 'off';
+          approvals.defaults.security = 'full';
+        } else {
+          delete approvals.defaults.ask;
+          delete approvals.defaults.security;
+        }
+        fs.writeFileSync(execApprovalsPath, JSON.stringify(approvals, null, 2));
+      } catch (e) {
+        console.error('Failed to patch exec-approvals.json:', e);
+      }
+    }
+
     res.json({ success: true, enabled });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
