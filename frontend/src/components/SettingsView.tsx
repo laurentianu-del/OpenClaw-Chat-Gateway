@@ -18,6 +18,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [testResult, setTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
   const [gatewaySaved, setGatewaySaved] = useState(false);
   const [gatewayError, setGatewayError] = useState(false);
+  const [isDetectingAll, setIsDetectingAll] = useState(false);
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
   const [newHost, setNewHost] = useState('');
   const [editingHost, setEditingHost] = useState<string | null>(null);
@@ -337,21 +338,24 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     }
   };
 
-  const handleDetectWorkspace = async () => {
-    setIsLoading(true);
+  const handleDetectAll = async () => {
+    setIsDetectingAll(true);
     try {
-      const res = await fetch('/api/config/detect-workspace');
+      const res = await fetch('/api/config/detect-all');
       const data = await res.json();
-      if (data.success && data.path) {
-        setOpenclawWorkspace(data.path);
+      if (data.success && data.data) {
+        if (data.data.gatewayUrl) setUrl(data.data.gatewayUrl);
+        if (data.data.token) setToken(data.data.token);
+        if (data.data.password) setPassword(data.data.password);
+        if (data.data.workspacePath) setOpenclawWorkspace(data.data.workspacePath);
       } else {
-        alert(data.message || '检测失败，请手动输入');
+        alert(data.message || '检测失败，请检查 OpenClaw 是否已正确安装或启动');
       }
     } catch (err) {
       console.error(err);
       alert('检测请求发生网络错误');
     } finally {
-      setIsLoading(false);
+      setIsDetectingAll(false);
     }
   };
 
@@ -804,8 +808,19 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {settingsTab === 'gateway' && (
             <>
               <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-1">连接设置</h3>
-                <p className="text-sm text-gray-500 mb-6">配置连接到 OpenClaw 网关的终结点和凭据。</p>
+                <div className="flex items-center justify-between mb-1">
+                  <h3 className="text-lg font-semibold text-gray-900">连接设置</h3>
+                  <button
+                    type="button"
+                    onClick={handleDetectAll}
+                    disabled={isDetectingAll || isLoading}
+                    className="flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
+                  >
+                    {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                    自动检测
+                  </button>
+                </div>
+                <p className="text-sm text-gray-500 mb-6 mt-1">配置连接到 OpenClaw 网关的终结点和凭据。</p>
                 
                 <div className="space-y-5 sm:space-y-6 bg-white p-4 sm:p-6 rounded-2xl border border-gray-200">
                   <div>
@@ -861,16 +876,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         value={openclawWorkspace}
                         onChange={(e) => setOpenclawWorkspace(e.target.value)}
                         placeholder="/root/.openclaw/workspace-main"
-                        className="flex-1 px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
+                        className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
                       />
-                      <button
-                        type="button"
-                        onClick={handleDetectWorkspace}
-                        disabled={isLoading}
-                        className="px-4 py-2.5 rounded-xl border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
-                      >
-                        自动检测
-                      </button>
                     </div>
                     <p className="text-xs text-gray-400 mt-1.5">
                       配置此项后，上传的文件将存入该路径，以便 OpenClaw 识别。

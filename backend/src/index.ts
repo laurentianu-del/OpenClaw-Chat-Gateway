@@ -3,6 +3,7 @@ import axios from 'axios';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { createServer } from 'http';
 import multer from 'multer';
 import { WebSocket } from 'ws';
@@ -315,14 +316,44 @@ app.post('/api/config/test', async (req, res) => {
   }
 });
 
-app.get('/api/config/detect-workspace', (req, res) => {
-  const mainWorkspace = agentProvisioner.getWorkspacePath('main');
+app.get('/api/config/detect-all', (req, res) => {
+  try {
+    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    let gatewayUrl = '';
+    let token = '';
+    let password = '';
+    let workspacePath = '';
 
-  if (fs.existsSync(mainWorkspace)) {
-    return res.json({ success: true, path: mainWorkspace });
+    if (fs.existsSync(configPath)) {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      if (config.gateway) {
+        gatewayUrl = `ws://127.0.0.1:${config.gateway.port || 18789}`;
+        token = config.gateway.auth?.token || '';
+        password = config.gateway.auth?.password || '';
+      }
+    }
+
+    const mainWorkspace = agentProvisioner.getWorkspacePath('main');
+    if (fs.existsSync(mainWorkspace)) {
+      workspacePath = mainWorkspace;
+    }
+
+    if (!gatewayUrl && !workspacePath) {
+      return res.json({ success: false, message: 'Could not detect gateway config or workspace' });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        gatewayUrl,
+        token,
+        password,
+        workspacePath
+      }
+    });
+  } catch (error: any) {
+    res.json({ success: false, message: 'Error detecting config: ' + error.message });
   }
-
-  res.json({ success: false, message: 'Could not automatically detect workspace' });
 });
 
 app.post('/api/config/restart', async (_req, res) => {
