@@ -1,10 +1,47 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface LoginScreenProps {
   onLoginSuccess: () => void;
 }
 
+const AUTH_INVALID_PASSWORD_ERROR_CODE = 'auth.invalidPassword';
+
+interface LoginErrorResponse {
+  errorCode?: string;
+  errorParams?: Record<string, string | number | boolean | null> | null;
+  errorDetail?: string | null;
+  message?: string;
+  error?: string;
+}
+
+function resolveLoginErrorMessage(data: LoginErrorResponse, t: (key: string, options?: any) => string): string {
+  const detail = typeof data.errorDetail === 'string' && data.errorDetail.trim() ? data.errorDetail.trim() : '';
+
+  if (data.errorCode) {
+    const translated = t(data.errorCode, (data.errorParams || {}) as any);
+    if (translated !== data.errorCode) {
+      return detail ? `${translated}: ${detail}` : translated;
+    }
+  }
+
+  if (typeof data.message === 'string' && data.message.trim()) {
+    return data.message.trim();
+  }
+
+  if (typeof data.error === 'string' && data.error.trim()) {
+    return data.error.trim();
+  }
+
+  if (detail) {
+    return detail;
+  }
+
+  return t(AUTH_INVALID_PASSWORD_ERROR_CODE);
+}
+
 export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
+  const { t } = useTranslation();
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -20,17 +57,17 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ password }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (data.success) {
         if (data.token) {
           localStorage.setItem('clawui_auth_token', data.token);
         }
         onLoginSuccess();
       } else {
-        setError(data.message || '密码错误');
+        setError(resolveLoginErrorMessage(data, t));
       }
     } catch {
-      setError('连接服务器失败');
+      setError(t('auth.connectionFailed'));
     } finally {
       setIsLoading(false);
     }

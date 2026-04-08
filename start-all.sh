@@ -1,20 +1,22 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# ClawUI bootstrap
-pkill -f "python3 -m http.server 3004" 2>/dev/null || true
-pkill -f "node dist/index.js" 2>/dev/null || true
+PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+BACKEND_DIR="$PROJECT_ROOT/backend"
+PORT="${PORT:-3115}"
+CLAWUI_DATA_DIR="${CLAWUI_DATA_DIR:-.clawui_release}"
+LOG_FILE="${LOG_FILE:-/tmp/clawui_back.log}"
+
+pkill -f "$BACKEND_DIR/dist/index.js" 2>/dev/null || true
 sleep 1
 
-# start backend
-cd /home/ange/.openclaw/workspace/projects/clawui/backend
-nohup node dist/index.js >/tmp/clawui_back.log 2>&1 &
+cd "$PROJECT_ROOT"
+npm run build
 
-# start frontend static
-cd /home/ange/.openclaw/workspace/projects/clawui/frontend/dist
-nohup python3 -m http.server 3004 --bind 127.0.0.1 >/tmp/clawui_front.log 2>&1 &
+cd "$BACKEND_DIR"
+nohup env PORT="$PORT" CLAWUI_DATA_DIR="$CLAWUI_DATA_DIR" /usr/bin/node dist/index.js >"$LOG_FILE" 2>&1 &
 
 sleep 2
 
-echo "backend: $(ss -tlnp | grep ':4001 ' || true)"
-echo "frontend: $(ss -tlnp | grep ':3004 ' || true)"
+echo "backend: $(ss -tlnp | grep \":$PORT \" || true)"
+echo "frontend: served by backend on http://127.0.0.1:$PORT/"

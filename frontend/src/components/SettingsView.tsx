@@ -1,14 +1,130 @@
-import { useState, useEffect, useRef } from 'react';
-import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag, Activity } from 'lucide-react';
+import { useState, useEffect, useRef, Fragment, type ChangeEvent } from 'react';
+import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag, Activity, Globe, Zap, Wrench, ArrowUpDown, Link2, ChevronDown } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { SettingsTab } from '../App';
+import { applyLanguagePreference, normalizeLanguage, type SupportedLanguage } from '../i18n';
+import {
+  normalizeChatHistoryPageRounds,
+  persistChatHistoryPageRounds,
+  readChatHistoryPageRounds,
+} from '../utils/historyPagination';
+import ModelFallbackEditor, { type ModelFallbackMode } from './ModelFallbackEditor';
+import ModelSinglePicker from './ModelSinglePicker';
 
 interface SettingsViewProps {
   isConnected: boolean;
   settingsTab: SettingsTab;
   onMenuClick: () => void;
+  onModelsChanged?: () => void;
 }
 
-export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewProps) {
+function resolveStructuredErrorDisplay(
+  data: { errorCode?: string; errorParams?: Record<string, string | number | boolean | null> | null; errorDetail?: string | null; error?: string; message?: string },
+  t: (key: string, options?: any) => string,
+  fallbackKey: string
+): { message: string; detail: string } {
+  let message = '';
+  let detail = typeof data.errorDetail === 'string' && data.errorDetail.trim() ? data.errorDetail.trim() : '';
+
+  if (data.errorCode) {
+    const translated = t(data.errorCode, (data.errorParams || {}) as any);
+    if (translated !== data.errorCode) {
+      message = translated;
+    }
+  }
+
+  if (!message && typeof data.error === 'string' && data.error.trim()) {
+    message = data.error.trim();
+  }
+
+  if (!message && typeof data.message === 'string' && data.message.trim()) {
+    message = data.message.trim();
+  }
+
+  if (!message && detail) {
+    message = detail;
+    detail = '';
+  }
+
+  return {
+    message: message || t(fallbackKey),
+    detail,
+  };
+}
+
+type TestStatus = {
+  status: 'testing' | 'success' | 'error';
+  message?: string;
+  detail?: string;
+};
+
+type InlineErrorState = {
+  message: string;
+  detail: string;
+};
+
+type BrowserHealthIssue = 'permissions' | 'disabled' | 'stopped' | 'detect-error' | 'timeout' | 'unknown';
+
+type BrowserHealthSnapshot = {
+  healthy: boolean;
+  issue: BrowserHealthIssue | null;
+  checkedAt: number;
+  maxPermissionsEnabled: boolean | null;
+  profile: string | null;
+  enabled: boolean | null;
+  running: boolean | null;
+  transport: string | null;
+  chosenBrowser: string | null;
+  detectedBrowser: string | null;
+  headless: boolean | null;
+  detectError: string | null;
+  rawDetail: string | null;
+};
+
+type BrowserHealthNotice = {
+  tone: 'success' | 'warning';
+  message: string;
+};
+
+type AppVersionInfo = {
+  appName: string;
+  version: string;
+  releaseTag: string;
+  commit: string | null;
+  buildTime: string | null;
+  repositoryUrl: string | null;
+};
+
+type LatestVersionInfo = {
+  appName: string;
+  currentVersion: string;
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  status: 'update_available' | 'up_to_date' | 'no_release';
+  releaseTag: string | null;
+  releaseName: string | null;
+  publishedAt: string | null;
+  releaseNotes: string | null;
+  releaseUrl: string | null;
+  downloadUrl: string | null;
+  repositoryUrl: string | null;
+  canUpgrade: boolean;
+  upgradeSupported: boolean;
+  upgradeReasonCode?: string | null;
+  upgradeReason: string | null;
+};
+
+const EMPTY_INLINE_ERROR: InlineErrorState = { message: '', detail: '' };
+
+export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
+  const { t, i18n } = useTranslation();
+
+  const openSettingsErrorModal = (message: string, detail = '') => {
+    setGatewayErrorMessage(message);
+    setGatewayErrorDetail(detail);
+    setGatewayErrorModalOpen(true);
+  };
+
   // --- Gateway settings state ---
   const [url, setUrl] = useState('');
   const [token, setToken] = useState('');
@@ -25,18 +141,31 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
   const [newHost, setNewHost] = useState('');
   const [editingHost, setEditingHost] = useState<string | null>(null);
+  const [editHostValue, setEditHostValue] = useState('');
   const [isRestarting, setIsRestarting] = useState(false);
   const [restartSuccess, setRestartSuccess] = useState(false);
+  const [browserHealth, setBrowserHealth] = useState<BrowserHealthSnapshot | null>(null);
+  const [browserHealthError, setBrowserHealthError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [browserHealthNotice, setBrowserHealthNotice] = useState<BrowserHealthNotice | null>(null);
+  const [isCheckingBrowserHealth, setIsCheckingBrowserHealth] = useState(false);
+  const [isSelfHealingBrowser, setIsSelfHealingBrowser] = useState(false);
+  const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
+  const [appVersionError, setAppVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isLoadingAppVersion, setIsLoadingAppVersion] = useState(false);
+  const [latestVersionInfo, setLatestVersionInfo] = useState<LatestVersionInfo | null>(null);
+  const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
 
   // --- General settings state ---
-  const [aiName, setAiName] = useState('我的小龙虾');
+  const [aiName, setAiName] = useState(() => t('settings.general.aiNamePlaceholder'));
   const [loginEnabled, setLoginEnabled] = useState(false);
   const [loginPassword, setLoginPassword] = useState('123456');
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [generalSaved, setGeneralSaved] = useState(false);
   const [generalError, setGeneralError] = useState(false);
-  const [aiNameError, setAiNameError] = useState('');
+  const [aiNameError, setAiNameError] = useState<'' | 'required' | 'tooLong'>('');
   const [openclawWorkspace, setOpenclawWorkspace] = useState('');
+  const [historyPageRoundsInput, setHistoryPageRoundsInput] = useState(() => String(readChatHistoryPageRounds()));
 
   const getVisualLength = (str: string) => {
     let len = 0;
@@ -60,30 +189,56 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [deleteModalMessage, setDeleteModalMessage] = useState('');
 
   // --- Model Management State ---
-  const [activeModelSubTab, setActiveModelSubTab] = useState<'endpoints' | 'models'>(() => {
-    return (localStorage.getItem('openclaw_activeModelSubTab') as 'endpoints' | 'models') || 'endpoints';
+  const [expandedEndpoints, setExpandedEndpoints] = useState<Set<string>>(() => {
+    const saved = localStorage.getItem('openclaw_expandedEndpoints');
+    return saved ? new Set(JSON.parse(saved)) : new Set();
   });
 
   useEffect(() => {
-    localStorage.setItem('openclaw_activeModelSubTab', activeModelSubTab);
-  }, [activeModelSubTab]);
-  const [models, setModels] = useState<{ id: string; alias?: string; primary: boolean }[]>([]);
+    localStorage.setItem('openclaw_expandedEndpoints', JSON.stringify(Array.from(expandedEndpoints)));
+  }, [expandedEndpoints]);
+
+  const toggleEndpointExpanded = (epName: string) => {
+    setExpandedEndpoints(prev => {
+      const next = new Set(prev);
+      if (next.has(epName)) next.delete(epName);
+      else next.add(epName);
+      return next;
+    });
+  };
+  const [models, setModels] = useState<{ id: string; alias?: string; primary: boolean; input: string[] }[]>([]);
+  const [defaultModelId, setDefaultModelId] = useState('');
+  const [defaultModelError, setDefaultModelError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isSavingDefaultModel, setIsSavingDefaultModel] = useState(false);
+  const [globalFallbacks, setGlobalFallbacks] = useState<string[]>([]);
+  const [globalFallbackMode, setGlobalFallbackMode] = useState<ModelFallbackMode>('disabled');
+  const [globalFallbackError, setGlobalFallbackError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [, setIsSavingGlobalFallbacks] = useState(false);
+  const globalFallbackAutosaveTimerRef = useRef<number | null>(null);
+  const globalFallbackAutosaveUnlockTimerRef = useRef<number | null>(null);
+  const suppressGlobalFallbackAutosaveRef = useRef(true);
   const [newModelEndpoint, setNewModelEndpoint] = useState('');
   const [newModelName, setNewModelName] = useState('');
   const [newModelAlias, setNewModelAlias] = useState('');
+  const [newModelInput, setNewModelInput] = useState<string[]>(['text']);
   const [modelError, setModelError] = useState('');
 
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [editingAlias, setEditingAlias] = useState('');
+  const [editingInput, setEditingInput] = useState<string[]>([]);
+  const [gatewayErrorModalOpen, setGatewayErrorModalOpen] = useState(false);
+  const [gatewayErrorMessage, setGatewayErrorMessage] = useState('');
+  const [gatewayErrorDetail, setGatewayErrorDetail] = useState('');
   const [isEndpointDropdownOpen, setIsEndpointDropdownOpen] = useState(false);
   const [endpointSearchQuery, setEndpointSearchQuery] = useState('');
-  const [testModelStatus, setTestModelStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+
   const [testModelMessage, setTestModelMessage] = useState('');
   
   const [addModelTestStatus, setAddModelTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [addModelTestMessage, setAddModelTestMessage] = useState('');
   const [showForceAddModal, setShowForceAddModal] = useState(false);
   const editAliasInputRef = useRef<HTMLInputElement>(null);
+  const [modelActionError, setModelActionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
 
   // --- Model Discovery State ---
   const [isDiscovering, setIsDiscovering] = useState(false);
@@ -91,13 +246,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const discoverAbortControllerRef = useRef<AbortController | null>(null);
   const testAllAbortControllerRef = useRef<AbortController | null>(null);
   const [addModelError, setAddModelError] = useState('');
-  const [existingModelTestStatus, setExistingModelTestStatus] = useState<Record<string, { status: 'testing'|'success'|'error', message?: string }>>({}); 
-  const [isTestingExisting, setIsTestingExisting] = useState(false);
+  const [addModelErrorDetail, setAddModelErrorDetail] = useState('');
+  const [existingModelTestStatus, setExistingModelTestStatus] = useState<Record<string, TestStatus>>({}); 
+
   const [discoveredModels, setDiscoveredModels] = useState<string[]>([]);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
   const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
   const [showOnlyConnected, setShowOnlyConnected] = useState(false);
-  const [individualTestStatus, setIndividualTestStatus] = useState<Record<string, { status: 'testing'|'success'|'error', message?: string }>>({});
+  const [individualTestStatus, setIndividualTestStatus] = useState<Record<string, TestStatus>>({});
   
   const dropdownRef = useRef<HTMLDivElement>(null);
   const [modelDropdownMaxHeight, setModelDropdownMaxHeight] = useState<number | undefined>(undefined);
@@ -117,7 +273,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const [isAddModelModalOpen, setIsAddModelModalOpen] = useState(false);
   const [editingEndpoint, setEditingEndpoint] = useState<EndpointConfig | null>(null);
   const [newEndpointData, setNewEndpointData] = useState<EndpointConfig>({ id: '', baseUrl: '', apiKey: '', api: 'openai-completions' });
-
+  const [endpointTestStatus, setEndpointTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
+  const [endpointTestMessage, setEndpointTestMessage] = useState('');
+  const [endpointModalError, setEndpointModalError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   useEffect(() => {
     setTestResult(null);
   }, [url, token, password]);
@@ -134,11 +292,20 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         if (data.loginPassword) setLoginPassword(data.loginPassword);
         if (data.allowedHosts) setAllowedHosts(data.allowedHosts);
         if (data.openclawWorkspace) setOpenclawWorkspace(data.openclawWorkspace);
+        if (data.historyPageRounds !== undefined) {
+          const nextHistoryPageRounds = normalizeChatHistoryPageRounds(data.historyPageRounds);
+          setHistoryPageRoundsInput(String(nextHistoryPageRounds));
+          persistChatHistoryPageRounds(nextHistoryPageRounds);
+        }
+        if (data.language) {
+          void applyLanguagePreference(data.language);
+        }
       })
       .catch(console.error);
 
     fetchCommands();
     fetchModels();
+    fetchGlobalFallbacks();
     fetchEndpoints();
 
     fetch('/api/config/max-permissions')
@@ -147,15 +314,124 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       .catch(console.error);
   }, []);
 
+  const fetchCurrentVersionInfo = async () => {
+    setIsLoadingAppVersion(true);
+    setAppVersionError(EMPTY_INLINE_ERROR);
+    try {
+      const res = await fetch('/api/version');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setAppVersionError(resolveStructuredErrorDisplay(data, t, 'settings.about.currentVersionLoadFailed'));
+        setAppVersionInfo(null);
+        return null;
+      }
+      setAppVersionInfo(data as AppVersionInfo);
+      return data as AppVersionInfo;
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      setAppVersionError({
+        message: t('settings.about.currentVersionLoadFailed'),
+        detail,
+      });
+      setAppVersionInfo(null);
+      return null;
+    } finally {
+      setIsLoadingAppVersion(false);
+    }
+  };
+
+  const handleCheckLatestVersion = async () => {
+    setIsCheckingLatestVersion(true);
+    setLatestVersionError(EMPTY_INLINE_ERROR);
+    setLatestVersionInfo(null);
+    try {
+      const res = await fetch('/api/version/latest');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLatestVersionError(resolveStructuredErrorDisplay(data, t, 'settings.about.latestVersionLoadFailed'));
+        return;
+      }
+      const latestData = data as LatestVersionInfo;
+      setLatestVersionInfo(latestData);
+      if (!appVersionInfo) {
+        setAppVersionInfo(prev => prev || {
+          appName: latestData.appName,
+          version: latestData.currentVersion,
+          releaseTag: `v${latestData.currentVersion}`,
+          commit: null,
+          buildTime: null,
+          repositoryUrl: latestData.repositoryUrl,
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      setLatestVersionError({
+        message: t('settings.about.latestVersionLoadFailed'),
+        detail,
+      });
+    } finally {
+      setIsCheckingLatestVersion(false);
+    }
+  };
+
+  const handleLatestVersionAction = () => {
+    if (
+      latestVersionInfo?.status === 'update_available'
+      && latestVersionActionUrl
+      && typeof window !== 'undefined'
+    ) {
+      window.open(latestVersionActionUrl, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    void handleCheckLatestVersion();
+  };
+
+  useEffect(() => {
+    if (settingsTab !== 'about') return;
+    void fetchCurrentVersionInfo();
+  }, [settingsTab]);
+
   const fetchModels = async () => {
     try {
       const res = await fetch('/api/models');
       const data = await res.json();
       if (data.success) {
-        setModels(data.models || []);
+        const nextModels = data.models || [];
+        const nextDefaultModelId = nextModels.find((model: { id: string; primary: boolean }) => model.primary)?.id || '';
+        setModels(nextModels);
+        setDefaultModelId(nextDefaultModelId);
+        onModelsChanged?.();
       }
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const fetchGlobalFallbacks = async () => {
+    try {
+      const res = await fetch('/api/models/fallbacks');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        const nextFallbacks = Array.isArray(data?.config?.fallbacks) ? data.config.fallbacks : [];
+        suppressGlobalFallbackAutosaveRef.current = true;
+        if (globalFallbackAutosaveUnlockTimerRef.current !== null) {
+          window.clearTimeout(globalFallbackAutosaveUnlockTimerRef.current);
+        }
+        setGlobalFallbacks(nextFallbacks);
+        setGlobalFallbackMode(nextFallbacks.length > 0 ? 'custom' : 'disabled');
+        setGlobalFallbackError(EMPTY_INLINE_ERROR);
+        globalFallbackAutosaveUnlockTimerRef.current = window.setTimeout(() => {
+          suppressGlobalFallbackAutosaveRef.current = false;
+          globalFallbackAutosaveUnlockTimerRef.current = null;
+        }, 0);
+      } else {
+        setGlobalFallbackError(resolveStructuredErrorDisplay(data, t, 'settings.models.globalFallbackSaveFailed'));
+      }
+    } catch (err) {
+      setGlobalFallbackError({
+        message: t('settings.models.globalFallbackLoadFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
     }
   };
 
@@ -181,6 +457,98 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     }
   };
 
+  const handleSaveGlobalFallbacks = async () => {
+    setIsSavingGlobalFallbacks(true);
+    setGlobalFallbackError(EMPTY_INLINE_ERROR);
+
+    try {
+      const res = await fetch('/api/models/fallbacks', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fallbacks: globalFallbackMode === 'disabled' ? [] : globalFallbacks,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.success) {
+        const nextFallbacks = Array.isArray(data?.config?.fallbacks) ? data.config.fallbacks : [];
+        suppressGlobalFallbackAutosaveRef.current = true;
+        if (globalFallbackAutosaveUnlockTimerRef.current !== null) {
+          window.clearTimeout(globalFallbackAutosaveUnlockTimerRef.current);
+        }
+        setGlobalFallbacks(nextFallbacks);
+        setGlobalFallbackMode(nextFallbacks.length > 0 ? 'custom' : 'disabled');
+        globalFallbackAutosaveUnlockTimerRef.current = window.setTimeout(() => {
+          suppressGlobalFallbackAutosaveRef.current = false;
+          globalFallbackAutosaveUnlockTimerRef.current = null;
+        }, 0);
+        return;
+      }
+
+      setGlobalFallbackError(resolveStructuredErrorDisplay(data, t, 'settings.models.globalFallbackSaveFailed'));
+    } catch (err) {
+      setGlobalFallbackError({
+        message: t('settings.models.globalFallbackSaveFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsSavingGlobalFallbacks(false);
+    }
+  };
+
+  useEffect(() => {
+    if (suppressGlobalFallbackAutosaveRef.current) return;
+    if (globalFallbackMode === 'custom' && globalFallbacks.length === 0) return;
+
+    if (globalFallbackAutosaveTimerRef.current !== null) {
+      window.clearTimeout(globalFallbackAutosaveTimerRef.current);
+    }
+
+    globalFallbackAutosaveTimerRef.current = window.setTimeout(() => {
+      void handleSaveGlobalFallbacks();
+      globalFallbackAutosaveTimerRef.current = null;
+    }, 180);
+
+    return () => {
+      if (globalFallbackAutosaveTimerRef.current !== null) {
+        window.clearTimeout(globalFallbackAutosaveTimerRef.current);
+        globalFallbackAutosaveTimerRef.current = null;
+      }
+    };
+  }, [globalFallbackMode, globalFallbacks]);
+
+  useEffect(() => {
+    return () => {
+      if (globalFallbackAutosaveTimerRef.current !== null) {
+        window.clearTimeout(globalFallbackAutosaveTimerRef.current);
+      }
+      if (globalFallbackAutosaveUnlockTimerRef.current !== null) {
+        window.clearTimeout(globalFallbackAutosaveUnlockTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Capability definitions
+  const CAPABILITIES = [
+    { id: 'image',     label: t('settings.models.capability.image'), Icon: Eye,         color: 'text-violet-600 bg-violet-50 border-violet-200' },
+    { id: 'reasoning', label: t('settings.models.capability.reasoning'), Icon: Zap,         color: 'text-amber-600 bg-amber-50 border-amber-200' },
+    { id: 'tools',     label: t('settings.models.capability.tools'), Icon: Wrench,      color: 'text-pink-600 bg-pink-50 border-pink-200' },
+    { id: 'web',       label: t('settings.models.capability.web'), Icon: Globe,       color: 'text-blue-600 bg-blue-50 border-blue-200' },
+    { id: 'rerank',    label: t('settings.models.capability.rerank'), Icon: ArrowUpDown, color: 'text-gray-600 bg-gray-50 border-gray-200' },
+    { id: 'embed',     label: t('settings.models.capability.embed'), Icon: Link2,       color: 'text-gray-600 bg-gray-50 border-gray-200' },
+  ] as const;
+
+  const guessCapabilities = (modelId: string): string[] => {
+    const id = modelId.toLowerCase();
+    const caps = new Set<string>(['text']);
+    if (/vision|4v|claude-3|claude-opus|claude-sonnet|claude-haiku|gpt-4o|gpt-4-turbo|gemini|llava|qwen.*vl|intern.*vl|glm-4v|minicpm.*v|cogvlm|pixtral|phi.*vision|qvq|kimi.*vl|chatglm.*vl/.test(id)) caps.add('image');
+    if (/o1|o3|o4|thinking|reasoning|deepthink|r1|r2/.test(id)) caps.add('reasoning');
+    if (/embed|embedding|text-embedding|bge|e5-/.test(id)) caps.add('embed');
+    if (/rerank|reranker|bce-reranker/.test(id)) caps.add('rerank');
+    return Array.from(caps);
+  };
+
   const handleDiscoverModels = async (endpointId: string) => {
     if (!endpointId) return;
     
@@ -197,6 +565,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     setModelSearchQuery('');
     setIndividualTestStatus({});
     setIsModelDropdownOpen(false); // keep closed until results are back
+    setAddModelError('');
+    setAddModelErrorDetail('');
 
     try {
       const res = await fetch(`/api/models/discover?endpoint=${encodeURIComponent(endpointId)}`, {
@@ -209,12 +579,18 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         if ((data.models || []).length > 0) {
           setIsModelDropdownOpen(true);
         }
+      } else {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.discoverFailed');
+        setAddModelError(display.message);
+        setAddModelErrorDetail(display.detail);
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
         console.log('Discovery aborted');
       } else {
-        console.error(err);
+        const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+        setAddModelError(t('settings.models.discoverFailed'));
+        setAddModelErrorDetail(detail);
       }
     } finally {
       if (discoverAbortControllerRef.current === controller) {
@@ -246,7 +622,11 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       if (data.success) {
         setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'success', message: 'OK' }}));
       } else {
-        setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message: data.error || '失败' }}));
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
+        setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message: display.message, detail: display.detail || undefined }}));
+        if (!signal && display.detail) {
+          openSettingsErrorModal(display.message, display.detail);
+        }
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
@@ -257,7 +637,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           return next;
         });
       } else {
-        setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message: '网络错误' }}));
+        const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+        const message = t('settings.models.testNetworkError');
+        setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message, detail: detail || undefined }}));
+        if (!signal && detail) {
+          openSettingsErrorModal(message, detail);
+        }
       }
     }
   };
@@ -275,10 +660,19 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       if (res.ok && data.success) {
         setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'success' } }));
       } else {
-        setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message: data.error || '连通性测试失败' } }));
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
+        setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message: display.message, detail: display.detail || undefined } }));
+        if (display.detail) {
+          openSettingsErrorModal(display.message, display.detail);
+        }
       }
     } catch (err: any) {
-      setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message: '网络错误' } }));
+      const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+      const message = t('settings.models.testNetworkError');
+      setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message, detail: detail || undefined } }));
+      if (detail) {
+        openSettingsErrorModal(message, detail);
+      }
     }
   };
 
@@ -303,7 +697,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       await Promise.all(testPromises);
     } catch (error: any) {
       if (error.name !== 'AbortError') {
-        setAddModelError(error.message || '批量测试部分失败');
+        setAddModelError(error.message || t('settings.models.partialBatchTestFailed'));
+        setAddModelErrorDetail('');
       }
     } finally {
       if (testAllAbortControllerRef.current === controller) {
@@ -323,7 +718,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     setIsLoading(true);
     setGatewayError(false);
     if (!url.trim()) {
-      alert('网关地址不能为空');
+      setGatewayErrorMessage(t('settings.gateway.gatewayUrlRequired'));
+      setGatewayErrorDetail('');
+      setGatewayErrorModalOpen(true);
       setIsLoading(false);
       return;
     }
@@ -337,7 +734,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       if (res.ok) {
         setGatewaySaved(true);
         setTimeout(() => setGatewaySaved(false), 2000);
-      } else throw new Error('保存失败');
+      } else throw new Error(t('settings.gateway.saveFailed'));
     } catch (err) {
       setGatewayError(true);
       setTimeout(() => setGatewayError(false), 3000);
@@ -358,11 +755,15 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         if (data.data.password) setPassword(data.data.password);
         if (data.data.workspacePath) setOpenclawWorkspace(data.data.workspacePath);
       } else {
-        setDetectError(data.message || '检测失败，请检查 OpenClaw 是否已正确安装或启动');
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.detectFailed');
+        setDetectError(display.message);
+        if (display.detail) {
+          openSettingsErrorModal(display.message, display.detail);
+        }
       }
     } catch (err) {
       console.error(err);
-      setDetectError('检测请求发生网络错误');
+      setDetectError(t('settings.gateway.detectNetworkError'));
     } finally {
       setIsDetectingAll(false);
     }
@@ -378,13 +779,98 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         setTimeout(() => setRestartSuccess(false), 3000);
       } else {
         const data = await res.json().catch(() => ({}));
-        alert(data.error || '重启网关失败');
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.restartFailed');
+        setGatewayErrorMessage(display.message);
+        setGatewayErrorDetail(display.detail);
+        setGatewayErrorModalOpen(true);
       }
     } catch (err) {
       console.error(err);
-      alert('重启请求发生网络错误');
+      setGatewayErrorMessage(t('settings.gateway.restartNetworkError'));
+      setGatewayErrorDetail('');
+      setGatewayErrorModalOpen(true);
     } finally {
       setIsRestarting(false);
+    }
+  };
+
+  const applyBrowserHealthSnapshot = (snapshot: BrowserHealthSnapshot) => {
+    setBrowserHealth(snapshot);
+    if (typeof snapshot.maxPermissionsEnabled === 'boolean') {
+      setMaxPermissions(snapshot.maxPermissionsEnabled);
+    }
+  };
+
+  const handleToggleMaxPermissions = async () => {
+    setIsTogglingPermissions(true);
+    setBrowserHealthNotice(null);
+    setBrowserHealthError(EMPTY_INLINE_ERROR);
+    try {
+      const res = await fetch('/api/config/max-permissions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !maxPermissions }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setMaxPermissions(!!data.enabled);
+        setBrowserHealth(null);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsTogglingPermissions(false);
+    }
+  };
+
+  const handleCheckBrowserHealth = async () => {
+    setIsCheckingBrowserHealth(true);
+    setBrowserHealthError(EMPTY_INLINE_ERROR);
+    setBrowserHealthNotice(null);
+    try {
+      const res = await fetch('/api/config/browser-health');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.health) {
+        applyBrowserHealthSnapshot(data.health as BrowserHealthSnapshot);
+      } else {
+        setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHealthFailed'));
+      }
+    } catch (err) {
+      setBrowserHealthError({
+        message: t('gateway.browserHealthFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsCheckingBrowserHealth(false);
+    }
+  };
+
+  const handleSelfHealBrowser = async () => {
+    setIsSelfHealingBrowser(true);
+    setBrowserHealthError(EMPTY_INLINE_ERROR);
+    setBrowserHealthNotice(null);
+    try {
+      const res = await fetch('/api/config/browser-health/self-heal', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.after) {
+        const nextSnapshot = data.after as BrowserHealthSnapshot;
+        applyBrowserHealthSnapshot(nextSnapshot);
+        setBrowserHealthNotice({
+          tone: nextSnapshot.healthy ? 'success' : 'warning',
+          message: nextSnapshot.healthy
+            ? t('settings.gateway.browserSelfHealSuccess')
+            : t('settings.gateway.browserSelfHealNeedsAttention'),
+        });
+      } else {
+        setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserSelfHealFailed'));
+      }
+    } catch (err) {
+      setBrowserHealthError({
+        message: t('gateway.browserSelfHealFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsSelfHealingBrowser(false);
     }
   };
 
@@ -407,8 +893,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   };
 
   const handleUpdateHost = async () => {
-    if (!newHost.trim() || !editingHost) return;
-    const updated = allowedHosts.map(h => h === editingHost ? newHost.trim() : h);
+    if (!editHostValue.trim() || !editingHost) return;
+    const updated = allowedHosts.map(h => h === editingHost ? editHostValue.trim() : h);
     try {
       const res = await fetch('/api/config', {
         method: 'POST',
@@ -418,7 +904,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       if (res.ok) {
         setAllowedHosts(updated);
         setEditingHost(null);
-        setNewHost('');
+        setEditHostValue('');
       }
     } catch (err) {
       console.error(err);
@@ -427,12 +913,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const startEditHost = (host: string) => {
     setEditingHost(host);
-    setNewHost(host);
+    setEditHostValue(host);
   };
 
   const handleRemoveHost = (hostToRemove: string) => {
     setDeleteTarget({ type: 'host', value: hostToRemove });
-    setDeleteModalMessage(`确定要删除域名 "${hostToRemove}" 吗？删除后该域名将立即失去访问权限。`);
+    setDeleteModalMessage(t('settings.gateway.removeHostConfirm', { host: hostToRemove }));
     setIsDeleteModalOpen(true);
   };
 
@@ -445,10 +931,22 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ gatewayUrl: url, token, password }),
       });
-      const data = await res.json();
-      setTestResult(data);
+      const data = await res.json().catch(() => ({}));
+      if (data.success) {
+        setGatewayErrorModalOpen(false);
+        setGatewayErrorMessage('');
+        setGatewayErrorDetail('');
+        setTestResult({ success: true, message: data.message || '' });
+      } else {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.testFailed');
+        setTestResult({ success: false, message: display.message });
+        openSettingsErrorModal(display.message, display.detail);
+      }
     } catch (err) {
-      setTestResult({ success: false, message: '测试连接失败' });
+      const detail = err instanceof Error && err.message.trim() ? err.message.trim() : '';
+      const message = t('settings.gateway.testFailed');
+      setTestResult({ success: false, message });
+      openSettingsErrorModal(message, detail);
     } finally {
       setIsLoading(false);
     }
@@ -457,13 +955,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const handleSaveGeneral = async () => {
     setIsLoading(true);
     setGeneralError(false);
+    const nextHistoryPageRounds = commitHistoryPageRounds();
     if (!aiName.trim()) {
-      setAiNameError('AI 名称不能为空');
+      setAiNameError('required');
       setIsLoading(false);
       return;
     }
     if (getVisualLength(aiName) > 20) {
-      setAiNameError('AI 名称过长 (最多10个汉字或20个英文字符)');
+      setAiNameError('tooLong');
       setIsLoading(false);
       return;
     }
@@ -473,18 +972,60 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aiName, loginEnabled, loginPassword }),
+        body: JSON.stringify({ aiName, loginEnabled, loginPassword, historyPageRounds: nextHistoryPageRounds }),
       });
       if (res.ok) {
         setGeneralSaved(true);
         setTimeout(() => setGeneralSaved(false), 2000);
-      } else throw new Error('保存失败');
+      } else throw new Error(t('settings.general.saveError'));
     } catch (err) {
       setGeneralError(true);
       setTimeout(() => setGeneralError(false), 3000);
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const handleLanguageChange = async (event: ChangeEvent<HTMLSelectElement>) => {
+    const nextLanguage = normalizeLanguage(event.target.value) as SupportedLanguage;
+
+    if (normalizeLanguage(i18n.resolvedLanguage || i18n.language) === nextLanguage) {
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ language: nextLanguage }),
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || data?.success === false) {
+        throw new Error(
+          (typeof data?.error === 'string' && data.error.trim()) ||
+          (typeof data?.message === 'string' && data.message.trim()) ||
+          'Failed to persist preferred language'
+        );
+      }
+
+      await applyLanguagePreference(nextLanguage);
+    } catch (error) {
+      console.error('Failed to update language preference:', error);
+      setGeneralError(true);
+      setTimeout(() => setGeneralError(false), 3000);
+    }
+  };
+
+  const commitHistoryPageRounds = () => {
+    const nextValue = persistChatHistoryPageRounds(historyPageRoundsInput);
+    setHistoryPageRoundsInput(String(nextValue));
+    return nextValue;
+  };
+
+  const handleHistoryPageRoundsChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const digitsOnly = event.target.value.replace(/[^\d]/g, '');
+    setHistoryPageRoundsInput(digitsOnly);
   };
 
   const handleAddCommand = async () => {
@@ -532,7 +1073,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const handleDeleteCommand = (id: number) => {
     setDeleteTarget({ type: 'command', id });
-    setDeleteModalMessage('确定要删除此快捷指令吗？此操作不可恢复。');
+    setDeleteModalMessage(t('settings.commands.deleteConfirm'));
     setIsDeleteModalOpen(true);
   };
 
@@ -557,12 +1098,13 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           body: JSON.stringify({ id: deleteTarget.id }),
         });
         if (res.ok) {
+          setModelActionError(EMPTY_INLINE_ERROR);
           fetchModels();
+          fetchGlobalFallbacks();
   
         } else {
           const data = await res.json().catch(() => ({}));
-          setModelError(data.error || '删除模型失败');
-          setTimeout(() => setModelError(''), 3000);
+          setModelActionError(resolveStructuredErrorDisplay(data, t, 'settings.models.deleteModelFailed'));
         }
       } else if (deleteTarget.type === 'endpoint') {
         const res = await fetch('/api/endpoints/manage', {
@@ -571,17 +1113,29 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           body: JSON.stringify({ endpoint: deleteTarget.name }),
         });
         if (res.ok) {
+          setModelActionError(EMPTY_INLINE_ERROR);
           fetchModels();
+          fetchGlobalFallbacks();
           fetchEndpoints();
   
         } else {
           const data = await res.json().catch(() => ({}));
-          setModelError(data.error || '删除端点失败');
-          setTimeout(() => setModelError(''), 3000);
+          setModelActionError(resolveStructuredErrorDisplay(data, t, 'settings.models.deleteEndpointFailed'));
         }
       }
     } catch (err) {
       console.error(err);
+      if (deleteTarget.type === 'model') {
+        setModelActionError({
+          message: t('settings.models.deleteModelFailed'),
+          detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+        });
+      } else if (deleteTarget.type === 'endpoint') {
+        setModelActionError({
+          message: t('settings.models.deleteEndpointFailed'),
+          detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+        });
+      }
     } finally {
       setIsDeleteModalOpen(false);
       setDeleteTarget(null);
@@ -597,12 +1151,13 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const handleTestModel = async (e?: React.MouseEvent) => {
     if (e) e.preventDefault();
     if (!newModelEndpoint.trim() || !newModelName.trim()) {
-      setAddModelError('端点和模型名称不能为空以进行检测');
+      setAddModelError(t('settings.models.endpointModelRequiredForTest'));
+      setAddModelErrorDetail('');
       setTimeout(() => setAddModelError(''), 3000);
       return false;
     }
     setAddModelTestStatus('testing');
-    setAddModelTestMessage('正在检测模型连通性...');
+    setAddModelTestMessage(t('settings.models.testingConnectivity'));
     try {
       const res = await fetch('/api/models/test', {
         method: 'POST',
@@ -616,23 +1171,36 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
       if (res.ok && data.success) {
         setAddModelTestStatus('success');
-        setAddModelTestMessage(`模型连通性良好 (${data.latency}ms)`);
+        const latency = data.latency !== undefined ? `${data.latency}ms` : t('settings.models.unknownLatency');
+        setAddModelTestMessage(t('settings.models.connectivityGood', { latency }));
         return true;
       } else {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
         setAddModelTestStatus('error');
-        setAddModelTestMessage(data.error || '连通性测试失败');
+        setAddModelTestMessage(display.message);
+        setTestModelMessage(display.detail || display.message);
+        if (display.detail) {
+          openSettingsErrorModal(display.message, display.detail);
+        }
         return false;
       }
     } catch (err: any) {
-      setTestModelStatus('error');
-      setTestModelMessage('检测过程发生网络错误');
+      const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+      const message = t('settings.models.testNetworkError');
+      setAddModelTestStatus('error');
+      setAddModelTestMessage(message);
+      setTestModelMessage(detail || message);
+      if (detail) {
+        openSettingsErrorModal(message, detail);
+      }
       return false;
     }
   };
 
   const handleAddModel = async () => {
     if (!newModelEndpoint.trim() || !newModelName.trim()) {
-      setAddModelError('端点和模型名称不能为空');
+      setAddModelError(t('settings.models.endpointModelRequired'));
+      setAddModelErrorDetail('');
       setTimeout(() => setAddModelError(''), 3000);
       return;
     }
@@ -645,7 +1213,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         body: JSON.stringify({
           endpoint: newModelEndpoint.trim(),
           modelName: newModelName.trim(),
-          alias: newModelAlias.trim() || undefined
+          alias: newModelAlias.trim() || undefined,
+          input: newModelInput.length > 0 ? newModelInput : undefined,
         }),
       });
       
@@ -653,17 +1222,21 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         setNewModelEndpoint('');
         setNewModelName('');
         setNewModelAlias('');
+        setNewModelInput(['text']);
+        setAddModelError('');
+        setAddModelErrorDetail('');
         setIsAddModelModalOpen(false);
         fetchModels();
       } else {
         const data = await res.json().catch(() => ({}));
-        setModelError(data.error || '保存模型失败');
-        setTimeout(() => setModelError(''), 3000);
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.saveModelFailed');
+        setAddModelError(display.message);
+        setAddModelErrorDetail(display.detail);
       }
     } catch (err) {
       console.error(err);
-      setModelError('添加模型发生网络错误');
-      setTimeout(() => setModelError(''), 3000);
+      setAddModelError(t('settings.models.addModelNetworkError'));
+      setAddModelErrorDetail(err instanceof Error && err.message.trim() ? err.message.trim() : '');
     } finally {
       setIsLoading(false);
     }
@@ -671,46 +1244,75 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
   const handleDeleteModel = (id: string, isPrimary: boolean) => {
     setDeleteTarget({ type: 'model', id });
-    setDeleteModalMessage(
-      `确定要删除模型 "${id}" 吗？\n${isPrimary ? '注意：这是当前的默认模型！\n' : ''}如果该模型已被智能体使用，它们将自动恢复为默认模型。`
-    );
+    setDeleteModalMessage(t('settings.models.deleteModelConfirm', {
+      id,
+      defaultWarning: isPrimary ? t('settings.models.defaultModelWarning') : '',
+    }));
     setIsDeleteModalOpen(true);
+  };
+
+  const handleSaveDefaultModelSelection = async (id: string) => {
+    const nextId = id.trim();
+    if (!nextId) {
+      setDefaultModelError({
+        message: t('settings.models.defaultModelNoSelection'),
+        detail: '',
+      });
+      return;
+    }
+
+    const previousId = defaultModelId;
+    setDefaultModelId(nextId);
+    setDefaultModelError(EMPTY_INLINE_ERROR);
+    setIsSavingDefaultModel(true);
+
+    try {
+      const res = await fetch('/api/models/manage/default', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: nextId }),
+      });
+
+      if (res.ok) {
+        await fetchModels();
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      setDefaultModelId(previousId);
+      setDefaultModelError(resolveStructuredErrorDisplay(data, t, 'settings.models.setDefaultModelFailed'));
+    } catch (err) {
+      setDefaultModelId(previousId);
+      setDefaultModelError({
+        message: t('settings.models.setDefaultModelNetworkError'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsSavingDefaultModel(false);
+    }
   };
 
   const handleSetDefaultModel = async (id: string) => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/models/manage/default', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id }),
-      });
-      if (res.ok) {
-        fetchModels();
-
-      } else {
-        const data = await res.json().catch(() => ({}));
-        setModelError(data.error || '设置默认模型失败');
-        setTimeout(() => setModelError(''), 3000);
-      }
+      await handleSaveDefaultModelSelection(id);
     } catch (err) {
       console.error(err);
-      setModelError('设置默认模型发生网络错误');
-      setTimeout(() => setModelError(''), 3000);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const startEditModel = (model: { id: string; alias?: string }) => {
+  const startEditModel = (model: { id: string; alias?: string; input: string[] }) => {
     setEditingModelId(model.id);
     setEditingAlias(model.alias || '');
+    setEditingInput(model.input || []);
     setTimeout(() => editAliasInputRef.current?.focus(), 50);
   };
 
   const handleDeleteEndpoint = (endpoint: string, count: number) => {
     setDeleteTarget({ type: 'endpoint', name: endpoint });
-    setDeleteModalMessage(`确定要删除端点 "${endpoint}" 吗？\n这将删除该端点下的全部 ${count} 个模型。\n如果其中包含默认模型或被智能体使用的模型，将自动恢复为系统默认。`);
+    setDeleteModalMessage(t('settings.models.deleteEndpointConfirm', { endpoint, count }));
     setIsDeleteModalOpen(true);
   };
 
@@ -726,22 +1328,25 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       const res = await fetch('/api/models/manage', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: editingModelId, alias: editingAlias }),
+        body: JSON.stringify({ id: editingModelId, alias: editingAlias, input: editingInput }),
       });
       if (res.ok) {
+        setModelActionError(EMPTY_INLINE_ERROR);
         setEditingModelId(null);
         setEditingAlias('');
+        setEditingInput([]);
         fetchModels();
 
       } else {
         const data = await res.json().catch(() => ({}));
-        setModelError(data.error || '修改别名失败');
-        setTimeout(() => setModelError(''), 3000);
+        setModelActionError(resolveStructuredErrorDisplay(data, t, 'settings.models.editAliasFailed'));
       }
     } catch (err) {
       console.error(err);
-      setModelError('修改别名发生网络错误');
-      setTimeout(() => setModelError(''), 3000);
+      setModelActionError({
+        message: t('settings.models.editAliasNetworkError'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
     } finally {
       setIsLoading(false);
     }
@@ -750,19 +1355,24 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
   const openAddEndpointModal = () => {
     setEditingEndpoint(null);
     setNewEndpointData({ id: '', baseUrl: '', apiKey: '', api: 'openai-completions' });
+    setEndpointTestStatus('idle');
+    setEndpointTestMessage('');
+    setEndpointModalError(EMPTY_INLINE_ERROR);
     setIsEndpointModalOpen(true);
   };
 
   const openEditEndpointModal = (ep: EndpointConfig) => {
     setEditingEndpoint(ep);
     setNewEndpointData({ ...ep });
+    setEndpointTestStatus('idle');
+    setEndpointTestMessage('');
+    setEndpointModalError(EMPTY_INLINE_ERROR);
     setIsEndpointModalOpen(true);
   };
 
   const handleSaveEndpoint = async () => {
     if (!newEndpointData.id.trim() || !newEndpointData.baseUrl.trim() || !newEndpointData.api) {
-      setModelError('端点名称、URL和接口类型不能为空');
-      setTimeout(() => setModelError(''), 3000);
+      setEndpointModalError({ message: t('settings.models.endpointConfigRequired'), detail: '' });
       return;
     }
     setIsLoading(true);
@@ -773,20 +1383,65 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
         body: JSON.stringify(newEndpointData),
       });
       if (res.ok) {
+        setEndpointModalError(EMPTY_INLINE_ERROR);
         setIsEndpointModalOpen(false);
         fetchEndpoints();
 
       } else {
         const data = await res.json().catch(() => ({}));
-        setModelError(data.error || '保存端点失败');
-        setTimeout(() => setModelError(''), 3000);
+        setEndpointModalError(resolveStructuredErrorDisplay(data, t, 'settings.models.saveEndpointFailed'));
       }
     } catch (err) {
       console.error(err);
-      setModelError('保存端点发生网络错误');
-      setTimeout(() => setModelError(''), 3000);
+      setEndpointModalError({
+        message: t('settings.models.saveEndpointNetworkError'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleTestEndpoint = async () => {
+    if (!newEndpointData.baseUrl.trim() || !newEndpointData.api) {
+      setEndpointTestStatus('error');
+      setEndpointTestMessage(t('settings.models.fillBaseUrlApiType'));
+      return;
+    }
+    
+    setEndpointTestStatus('testing');
+    setEndpointTestMessage(t('settings.models.testing'));
+    
+    try {
+      const res = await fetch('/api/endpoints/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          baseUrl: newEndpointData.baseUrl,
+          apiKey: newEndpointData.apiKey,
+          api: newEndpointData.api
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setEndpointTestStatus('success');
+        setEndpointTestMessage(t('settings.models.endpointConnectionSuccess'));
+        setTimeout(() => setEndpointTestStatus('idle'), 3000);
+      } else {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.endpointConnectionFailed');
+        setEndpointTestStatus('error');
+        setEndpointTestMessage(display.message);
+        if (display.detail) {
+          openSettingsErrorModal(display.message, display.detail);
+        }
+      }
+    } catch (err: any) {
+      const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
+      setEndpointTestStatus('error');
+      setEndpointTestMessage(t('settings.models.networkConnectionError'));
+      if (detail) {
+        openSettingsErrorModal(t('settings.models.networkConnectionError'), detail);
+      }
     }
   };
 
@@ -795,12 +1450,95 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
     ...endpoints.map(ep => ep.id),
     ...models.map(m => m.id.split('/')[0]).filter(Boolean)
   ])).sort((a, b) => a.localeCompare(b));
+  const currentPrimaryModelId = models.find((model) => model.primary)?.id || '';
 
-  const headerTitle = settingsTab === 'gateway' ? '设置 - 网关' : settingsTab === 'general' ? '设置 - 通用' : settingsTab === 'commands' ? '设置 - 快捷指令' : settingsTab === 'models' ? '设置 - 模型管理' : '设置 - 关于';
+  const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
+  const latestVersionActionUrl = latestVersionInfo?.downloadUrl || latestVersionInfo?.releaseUrl || null;
+  const latestVersionButtonLabel = isCheckingLatestVersion
+    ? t('settings.about.checkInProgress')
+    : latestVersionInfo?.status === 'update_available'
+      ? t('settings.about.checkUpdateAvailableButton', {
+        version: latestVersionInfo.latestVersion || t('settings.about.unavailable'),
+      })
+      : latestVersionInfo?.status === 'up_to_date'
+        ? t('settings.about.checkUpToDateButton')
+        : latestVersionInfo?.status === 'no_release'
+          ? t('settings.about.checkNoReleaseButton')
+          : latestVersionError.message
+            ? t('settings.about.checkRetryButton')
+            : t('settings.about.checkNewVersion');
+  const latestVersionButtonTitle = latestVersionError.detail || latestVersionError.message || undefined;
+  const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
+  const browserHealthNotCheckedText = t('settings.gateway.browserHealthStates.notChecked');
+  const browserHealthValueFallback = browserHealth ? t('common.unknown') : browserHealthNotCheckedText;
+  const browserHealthFacts = [
+    {
+      label: t('settings.gateway.browserHealthPermissionsLabel'),
+      value: browserHealth?.maxPermissionsEnabled === null || !browserHealth
+        ? browserHealthValueFallback
+        : browserHealth.maxPermissionsEnabled
+          ? t('settings.gateway.browserHealthStates.permissionsEnabled')
+          : t('settings.gateway.browserHealthStates.permissionsDisabled'),
+    },
+    {
+      label: t('settings.gateway.browserHealthEnabledLabel'),
+      value: browserHealth?.enabled === null || !browserHealth
+        ? browserHealthValueFallback
+        : browserHealth.enabled
+          ? t('settings.gateway.browserHealthStates.enabled')
+          : t('settings.gateway.browserHealthStates.disabled'),
+    },
+    {
+      label: t('settings.gateway.browserHealthRunningLabel'),
+      value: browserHealth?.running === null || !browserHealth
+        ? browserHealthValueFallback
+        : browserHealth.running
+          ? t('settings.gateway.browserHealthStates.running')
+          : t('settings.gateway.browserHealthStates.stopped'),
+    },
+    {
+      label: t('settings.gateway.browserHealthTransportLabel'),
+      value: browserHealth?.transport || browserHealthValueFallback,
+    },
+    {
+      label: t('settings.gateway.browserHealthModeLabel'),
+      value: browserHealth?.headless === null || !browserHealth
+        ? browserHealthValueFallback
+        : browserHealth.headless
+          ? t('settings.gateway.browserHealthStates.headless')
+          : t('settings.gateway.browserHealthStates.windowed'),
+    },
+    {
+      label: t('settings.gateway.browserHealthBrowserLabel'),
+      value: browserHealth?.detectedBrowser || browserHealth?.chosenBrowser || browserHealthValueFallback,
+    },
+    {
+      label: t('settings.gateway.browserHealthProfileLabel'),
+      value: browserHealth?.profile || browserHealthValueFallback,
+    },
+  ];
+  const browserHealthDetail = browserHealth?.rawDetail || browserHealth?.detectError || browserHealthError.detail || browserHealthError.message || '';
+  const browserHealthDetailText = browserHealthDetail
+    || (browserHealthError.message
+      ? t('settings.gateway.browserHealthButtonNeedsAttention')
+      : browserHealth
+        ? browserHealth.healthy
+          ? t('settings.gateway.browserHealthButtonHealthy')
+          : t('settings.gateway.browserHealthButtonNeedsAttention')
+        : browserHealthNotCheckedText);
+  const headerTitle = settingsTab === 'gateway'
+    ? t('settings.gateway.headerTitle')
+    : settingsTab === 'general'
+      ? t('settings.general.headerTitle')
+      : settingsTab === 'commands'
+        ? t('settings.commands.headerTitle')
+        : settingsTab === 'models'
+          ? t('settings.models.headerTitle')
+          : t('settings.about.headerTitle');
 
   return (
     <div className="flex flex-col h-full bg-gray-50/50">
-      <header className="h-14 flex items-center px-4 sm:px-8 border-b border-gray-300 bg-white sticky top-0 z-10 gap-3">
+      <header className="h-14 flex items-center px-4 sm:px-8 border-b border-gray-200 bg-white sticky top-0 z-10 gap-3">
         <button 
           className="md:hidden text-gray-500 hover:text-gray-900 focus:outline-none pr-1"
           onClick={onMenuClick}
@@ -818,30 +1556,30 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
             <>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <h3 className="text-lg font-semibold text-gray-900">连接设置</h3>
+                  <h3 className="text-lg font-semibold text-gray-900">{t('settings.gateway.connectionTitle')}</h3>
                   <div className="flex flex-col items-end gap-1 relative">
                     <button
                       type="button"
                       onClick={handleDetectAll}
                       disabled={isDetectingAll || isLoading}
-                      className="flex shrink-0 items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 transition-all text-sm font-medium disabled:opacity-50"
+                      className={`${secondaryActionButtonClass} shrink-0`}
                     >
                       {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-                      自动检测
+                      {t('settings.gateway.autoDetect')}
                     </button>
                     {detectError && (
-                      <div className="absolute top-full mt-2 right-0 w-80 text-xs bg-red-50 text-red-600 border border-red-200 p-2 rounded-lg shadow-sm z-10 break-words pointer-events-none">
+                      <div className="absolute top-full mt-2 right-0 w-80 text-xs bg-red-50 text-red-600 border border-red-200 p-2 rounded-lg z-10 break-words pointer-events-none">
                         {detectError}
                       </div>
                     )}
                   </div>
                 </div>
-                <p className="text-sm text-gray-500 mb-6 mt-1">配置连接到 OpenClaw 网关的终结点和凭据。</p>
+                <p className="text-sm text-gray-500 mb-6 mt-1">{t('settings.gateway.description')}</p>
                 
                 <div className="space-y-5 sm:space-y-6 bg-white p-4 sm:p-6 rounded-2xl border border-gray-200">
                   <div>
-                    <label className="block text-sm font-medium text-gray-900 mb-2">
-                      网关地址 <span className="text-red-500">*</span>
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">
+                      {t('settings.gateway.gatewayUrlLabel')} <span className="text-red-500">*</span>
                     </label>
                     <input
                       type="text"
@@ -853,7 +1591,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-gray-900 mb-2">Token</label>
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.gateway.tokenLabel')}</label>
                     <input
                       type="text"
                       value={token}
@@ -863,7 +1601,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-gray-900 mb-2">密码</label>
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.gateway.passwordLabel')}</label>
                     <div className="relative">
                       <input
                         type={showPassword ? "text" : "password"}
@@ -883,8 +1621,8 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
                   {/* OpenClaw Workspace Path */}
                   <div className="border-t border-gray-100 pt-5">
-                    <label className="block text-sm font-medium text-gray-900 mb-2">
-                       OpenClaw 工作区路径
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">
+                      {t('settings.gateway.workspaceLabel')}
                     </label>
                     <div className="flex gap-2">
                       <input
@@ -896,22 +1634,22 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       />
                     </div>
                     <p className="text-xs text-gray-400 mt-1.5">
-                      配置此项后，上传的文件将存入该路径，以便 OpenClaw 识别。
+                      {t('settings.gateway.workspaceHint')}
                     </p>
                   </div>
                 </div>
 
                 {/* Max Permissions Toggle */}
                 <div className="mt-8">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-1">权限设置</h3>
-                  <p className="text-sm text-gray-500 mb-4">控制 OpenClaw 网关的工具权限级别。</p>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.gateway.permissionsTitle')}</h3>
+                  <p className="text-sm text-gray-500 mb-4">{t('settings.gateway.permissionsDescription')}</p>
 
                   <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200">
                     <div className="flex items-center justify-between">
                       <div className="flex-1 pr-4">
-                        <div className="text-sm font-medium text-gray-900">最大化权限</div>
+                        <div className="text-sm font-semibold text-gray-900">{t('settings.gateway.maxPermissionsLabel')}</div>
                         <p className="text-xs text-gray-400 mt-1">
-                          开启后将解锁浏览器自动化、命令执行（免确认）、文件操作等全部工具权限。关闭则使用默认 coding 预设。
+                          {t('settings.gateway.maxPermissionsHint')}
                         </p>
                       </div>
                       <button
@@ -919,93 +1657,169 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         role="switch"
                         aria-checked={maxPermissions}
                         disabled={isTogglingPermissions}
-                        onClick={async () => {
-                          setIsTogglingPermissions(true);
-                          try {
-                            const res = await fetch('/api/config/max-permissions', {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ enabled: !maxPermissions }),
-                            });
-                            const data = await res.json();
-                            if (data.success) setMaxPermissions(data.enabled);
-                          } catch (err) {
-                            console.error(err);
-                          } finally {
-                            setIsTogglingPermissions(false);
-                          }
-                        }}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-50 ${
-                          maxPermissions ? 'bg-blue-600' : 'bg-gray-200'
-                        }`}
+                        onClick={handleToggleMaxPermissions}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-50 ${ maxPermissions ? 'bg-blue-600' : 'bg-gray-200' }`}
                       >
                         <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-200 ease-in-out ${
-                            maxPermissions ? 'translate-x-6' : 'translate-x-1'
-                          }`}
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out ${ maxPermissions ? 'translate-x-6' : 'translate-x-1' }`}
                         />
                       </button>
                     </div>
                   </div>
                 </div>
 
+                <div className="mt-8">
+                  <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.gateway.browserHealthTitle')}</h3>
+                  <p className="text-sm text-gray-500 mb-4">{t('settings.gateway.browserHealthDescription')}</p>
+
+                  <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200 space-y-4">
+                    <div className="space-y-3">
+                      <div className="flex gap-2 flex-nowrap">
+                        <button
+                          type="button"
+                          onClick={handleCheckBrowserHealth}
+                          disabled={isCheckingBrowserHealth || isSelfHealingBrowser || isLoading}
+                          className={`${secondaryActionButtonClass} flex-1 min-w-0`}
+                        >
+                          {isCheckingBrowserHealth ? <Loader2 className="hidden sm:block w-4 h-4 animate-spin shrink-0" /> : <Activity className="hidden sm:block w-4 h-4 shrink-0" />}
+                          <span className="min-w-0 text-center leading-snug">
+                            {isCheckingBrowserHealth
+                              ? t('settings.gateway.checkingBrowserHealth')
+                              : t('settings.gateway.checkBrowserHealth')}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleSelfHealBrowser}
+                          disabled={isCheckingBrowserHealth || isSelfHealingBrowser || isLoading}
+                          className={`${secondaryActionButtonClass} flex-1 min-w-0`}
+                        >
+                          {isSelfHealingBrowser ? <Loader2 className="hidden sm:block w-4 h-4 animate-spin shrink-0" /> : <Wrench className="hidden sm:block w-4 h-4 shrink-0" />}
+                          <span className="min-w-0 text-center leading-snug">
+                            {isSelfHealingBrowser ? t('settings.gateway.selfHealingBrowser') : t('settings.gateway.selfHealBrowser')}
+                          </span>
+                        </button>
+                      </div>
+
+                      <p className="text-sm text-gray-500 whitespace-pre-wrap break-all">
+                        <span className="font-medium text-gray-600">{t('settings.gateway.browserHealthDetailLabel')}:</span>{' '}
+                        <span>{browserHealthDetailText}</span>
+                      </p>
+                    </div>
+
+                    {browserHealthNotice && (
+                      <div className={`p-3 rounded-xl border text-sm ${browserHealthNotice.tone === 'success' ? 'bg-green-50 text-green-700 border-green-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
+                        {browserHealthNotice.message}
+                      </div>
+                    )}
+
+                    {browserHealthError.message && (
+                      <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-start gap-2">
+                        <X className="w-4 h-4 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <div>{browserHealthError.message}</div>
+                          {browserHealthError.detail && (
+                            <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                              {browserHealthError.detail}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {browserHealthFacts.map((item) => (
+                        <div key={item.label} className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
+                          <div className="text-xs font-semibold uppercase tracking-wide text-gray-400">{item.label}</div>
+                          <div className="mt-1 text-sm text-gray-700 break-all">{item.value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
                 {/* Domain Management Section */}
                 <div className="mt-8">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-1">域名管理</h3>
-                  <p className="text-sm text-gray-500 mb-4">管理允许访问此网页的域名（用于反向代理安全白名单）。</p>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.gateway.domainManagementTitle')}</h3>
+                  <p className="text-sm text-gray-500 mb-4">{t('settings.gateway.domainManagementDescription')}</p>
                   
                   <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200 space-y-4">
-                    <div className="flex flex-col sm:flex-row gap-3">
+                    <div className="flex flex-row gap-3">
                       <input
                         type="text"
                         value={newHost}
                         onChange={(e) => setNewHost(e.target.value)}
-                        placeholder="例如: openclaw.abc.com"
+                        onKeyDown={(e) => e.key === 'Enter' && handleAddHost()}
+                        placeholder={t('settings.gateway.hostPlaceholder')}
                         className="flex-1 px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
                       />
                       <button
-                        onClick={editingHost ? handleUpdateHost : handleAddHost}
+                        onClick={handleAddHost}
                         disabled={!newHost.trim()}
                         className="px-6 py-2.5 rounded-xl bg-blue-600 text-white font-bold text-sm hover:bg-blue-700 transition-all disabled:opacity-50 flex items-center gap-2"
                       >
-                        {editingHost ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-                        {editingHost ? '保存' : '添加'}
+                        <Plus className="w-4 h-4" />
+                        <span className="hidden sm:inline">{t('common.add')}</span>
                       </button>
-                      {editingHost && (
-                        <button
-                          onClick={() => { setEditingHost(null); setNewHost(''); }}
-                          className="px-4 py-2.5 rounded-xl border border-gray-200 text-gray-500 hover:bg-gray-50 transition-all font-bold text-sm"
-                        >
-                          取消
-                        </button>
-                      )}
                     </div>
 
-                    <div className="space-y-2 max-h-[200px] overflow-y-auto pr-2">
+                    <div className="space-y-2 max-h-[200px] overflow-y-auto">
                        {allowedHosts.map(host => (
-                         <div key={host} className="flex items-center justify-between p-3 rounded-xl bg-gray-50 border border-gray-100 group">
-                           <span className="text-sm font-mono text-gray-700">{host}</span>
-                           <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                             <button 
-                               onClick={() => startEditHost(host)}
-                               className="p-1 px-2 text-gray-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                               title="编辑"
-                             >
-                               <Edit2 className="w-4 h-4" />
-                             </button>
-                             <button 
-                               onClick={() => handleRemoveHost(host)}
-                               className="p-1 px-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                               title="删除"
-                             >
-                               <Trash2 className="w-4 h-4" />
-                             </button>
-                           </div>
+                         <div key={host} className="flex w-full items-center justify-between gap-3 p-3 rounded-xl bg-gray-50 border border-gray-100 group">
+                           {editingHost === host ? (
+                             <>
+                               <input
+                                 type="text"
+                                 value={editHostValue}
+                                 onChange={(e) => setEditHostValue(e.target.value)}
+                                 onKeyDown={(e) => e.key === 'Enter' && handleUpdateHost()}
+                                 autoFocus
+                                 className="min-w-0 flex-1 w-full text-sm font-mono text-gray-700 bg-transparent outline-none border-none p-0"
+                               />
+                               <div className="flex items-center gap-1 shrink-0">
+                                 <button
+                                   onClick={handleUpdateHost}
+                                   disabled={!editHostValue.trim()}
+                                   className="p-1 px-2 text-green-600 hover:bg-green-50 rounded-lg transition-all disabled:opacity-50"
+                                   title={t('common.save')}
+                                 >
+                                   <Check className="w-4 h-4" />
+                                 </button>
+                                 <button
+                                   onClick={() => { setEditingHost(null); setEditHostValue(''); }}
+                                   className="p-1 px-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                   title={t('common.cancel')}
+                                 >
+                                   <X className="w-4 h-4" />
+                                 </button>
+                               </div>
+                             </>
+                           ) : (
+                             <>
+                               <span className="min-w-0 flex-1 text-sm font-mono text-gray-700 break-all">{host}</span>
+                               <div className="flex items-center gap-1 shrink-0 sm:opacity-0 sm:group-hover:opacity-100 transition-all">
+                                 <button
+                                   onClick={() => startEditHost(host)}
+                                   className="p-1 px-2 text-gray-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+                                   title={t('common.edit')}
+                                 >
+                                   <Edit2 className="w-4 h-4" />
+                                 </button>
+                                 <button
+                                   onClick={() => handleRemoveHost(host)}
+                                   className="p-1 px-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                                   title={t('common.delete')}
+                                 >
+                                   <Trash2 className="w-4 h-4" />
+                                 </button>
+                               </div>
+                             </>
+                           )}
                          </div>
                        ))}
                        {allowedHosts.length === 0 && (
                          <div className="text-center py-6 text-gray-400 text-sm italic">
-                           暂无添加的域名
+                           {t('settings.gateway.noHosts')}
                          </div>
                        )}
                     </div>
@@ -1013,54 +1827,41 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                 </div>
               </div>
 
-              <div className="flex flex-col-reverse sm:flex-row items-center justify-between pt-4 gap-4 sm:gap-0">
-                <div className="flex items-center gap-4 w-full sm:w-auto justify-center sm:justify-start">
+              <div className="flex flex-row items-center justify-between pt-4 gap-2 sm:gap-0">
                   <button
                     onClick={handleTest}
                     disabled={isLoading}
-                    className="inline-flex items-center px-5 py-2.5 border border-gray-200 text-sm font-medium rounded-xl text-gray-700 bg-white hover:bg-gray-50 transition-all disabled:opacity-50"
+                    className="inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 border border-gray-200 text-sm font-medium rounded-xl text-gray-700 bg-white hover:bg-gray-50 transition-all disabled:opacity-50"
                   >
-                    {isLoading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : '测试连接'}
+                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                    {testResult?.success ? <Check className="w-4 h-4 text-green-600" /> : testResult && !testResult.success ? <X className="w-4 h-4 text-red-500" /> : null}
+                    <span className={testResult?.success ? 'text-green-600 font-semibold' : testResult && !testResult.success ? 'text-red-500 font-semibold' : ''}>
+                      {isLoading ? '' : testResult?.success ? t('settings.gateway.connectionSuccess') : testResult && !testResult.success ? (testResult.message || t('settings.gateway.connectionFailed')) : <><span className="sm:hidden">{t('common.test')}</span><span className="hidden sm:inline">{t('settings.gateway.testConnection')}</span></>}
+                    </span>
                   </button>
-                  
-                  {testResult && (
-                    <div className={`flex items-center gap-2 text-sm ${testResult.success ? 'text-green-600' : 'text-red-500'} animate-in fade-in zoom-in-95 duration-200`}>
-                      {testResult.success ? <Check className="w-4 h-4" /> : <X className="w-4 h-4" />}
-                      <span className="font-semibold">{testResult.success ? '测试连接成功' : (testResult.message === '测试连接失败' ? '测试连接失败' : `测试连接失败: ${testResult.message}`)}</span>
-                    </div>
-                  )}
-                </div>
 
-                <div className="flex flex-wrap sm:flex-nowrap gap-3 items-center w-full sm:w-auto justify-center sm:justify-end">
+                <div className="flex gap-2 sm:gap-3 items-center">
                   <button
                     onClick={handleRestartGateway}
                     disabled={!testResult?.success || isRestarting}
-                    className={`inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-xl transition-all ${
-                      testResult?.success 
-                        ? 'text-orange-600 bg-orange-50 hover:bg-orange-100 border border-orange-200' 
-                        : 'text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed'
-                    }`}
+                    className={`inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 text-sm font-medium rounded-xl transition-all ${ testResult?.success ? 'text-orange-600 bg-orange-50 hover:bg-orange-100 border border-orange-200' : 'text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed' }`}
                   >
-                    {isRestarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Loader2 className="w-4 h-4" />}
-                    {restartSuccess ? '已重连' : '重启网关'}
+                    {isRestarting ? <Loader2 className="w-4 h-4 animate-spin sm:block hidden" /> : <Loader2 className="w-4 h-4 sm:block hidden" />}
+                    {restartSuccess ? t('settings.gateway.restarted') : <><span className="sm:hidden">{t('common.restart')}</span><span className="hidden sm:inline">{t('settings.gateway.restartGateway')}</span></>}
                   </button>
 
-                  <div className="h-6 w-px bg-gray-200 mx-1"></div>
+                  <div className="h-6 w-px bg-gray-200 hidden sm:block"></div>
                   {gatewayError && (
                     <span className="text-sm font-semibold text-red-500 animate-in fade-in zoom-in-95 duration-200 flex items-center gap-1">
-                      <X className="w-4 h-4" /> 保存出错
+                      <X className="w-4 h-4" /> {t('settings.gateway.saveError')}
                     </span>
                   )}
                   <button
                     onClick={handleSave}
                     disabled={isLoading || !testResult?.success}
-                    className={`inline-flex items-center gap-2 px-6 sm:px-8 py-2.5 text-sm font-medium rounded-xl text-white transition-all ${
-                      isLoading || !testResult?.success
-                        ? 'bg-gray-400 cursor-not-allowed'
-                        : 'bg-blue-600 hover:bg-blue-700'
-                    }`}
+                    className={`inline-flex items-center gap-2 px-5 sm:px-8 py-2.5 text-sm font-medium rounded-xl text-white transition-all ${ isLoading || !testResult?.success ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700' }`}
                   >
-                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : gatewaySaved ? <><Check className="w-4 h-4" /> 已保存</> : '保存设置'}
+                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : gatewaySaved ? <><Check className="w-4 h-4" /> {t('settings.gateway.saved')}</> : <><span className="sm:hidden">{t('common.save')}</span><span className="hidden sm:inline">{t('settings.gateway.save')}</span></>}
                   </button>
                 </div>
               </div>
@@ -1071,14 +1872,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {settingsTab === 'general' && (
             <>
               <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-1">通用设置</h3>
-                <p className="text-sm text-gray-500 mb-6">配置 AI 助手的基本信息和系统安全选项。</p>
+                <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.general.title')}</h3>
+                <p className="text-sm text-gray-500 mb-6">{t('settings.general.description')}</p>
 
                 <div className="space-y-6 bg-white p-6 rounded-2xl border border-gray-200">
                   {/* AI Name */}
                   <div>
-                    <label className="block text-sm font-medium text-gray-900 mb-2">
-                      AI 名称 <span className="text-red-500">*</span>
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">
+                      {t('settings.general.aiNameLabel')} <span className="text-red-500">*</span>
                     </label>
                     <input
                       type="text"
@@ -1087,47 +1888,87 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         setAiName(e.target.value);
                         if (aiNameError) setAiNameError('');
                       }}
-                      placeholder="我的小龙虾"
+                      placeholder={t('settings.general.aiNamePlaceholder')}
                       className={`block w-full px-4 py-2.5 rounded-xl border ${aiNameError ? 'border-red-500' : 'border-gray-200'} bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 ${aiNameError ? 'focus:ring-red-500/20' : 'focus:ring-blue-500/20'} transition-all text-sm`}
                     />
                     {aiNameError ? (
-                      <p className="text-xs text-red-500 mt-1.5 font-medium">{aiNameError}</p>
+                      <p className="text-xs text-red-500 mt-1.5 font-medium">
+                        {aiNameError === 'required' ? t('settings.general.aiNameRequired') : t('settings.general.aiNameTooLong')}
+                      </p>
                     ) : (
-                      <p className="text-xs text-gray-400 mt-1.5">AI 在对话中显示的名称，限制10个汉字（20个英文字符）</p>
+                      <p className="text-xs text-gray-400 mt-1.5">{t('settings.general.aiNameHint')}</p>
                     )}
+                  </div>
+
+                  {/* Language */}
+                  <div className="border-t border-gray-100 pt-6">
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.general.languageLabel')}</label>
+                    <div className="relative">
+                      <select
+                        value={currentLanguage}
+                        onChange={handleLanguageChange}
+                        className="block w-full appearance-none px-4 pr-14 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
+                      >
+                        <option value="zh-CN">{t('settings.general.languageOptions.zh-CN')}</option>
+                        <option value="zh-TW">{t('settings.general.languageOptions.zh-TW')}</option>
+                        <option value="en">{t('settings.general.languageOptions.en')}</option>
+                      </select>
+                      <span className="pointer-events-none absolute inset-y-0 right-5 flex items-center text-gray-500">
+                        <ChevronDown className="w-4 h-4" />
+                      </span>
+                    </div>
+                    <p className="text-xs text-gray-400 mt-1.5">{t('settings.general.languageHint')}</p>
+                  </div>
+
+                  <div className="border-t border-gray-100 pt-6">
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.general.historyPageRoundsLabel')}</label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={historyPageRoundsInput}
+                      onChange={handleHistoryPageRoundsChange}
+                      onBlur={commitHistoryPageRounds}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          commitHistoryPageRounds();
+                          (event.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      placeholder={t('settings.general.historyPageRoundsPlaceholder')}
+                      className="block w-full max-w-[220px] px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
+                    />
+                    <p className="text-xs text-gray-400 mt-1.5">{t('settings.general.historyPageRoundsHint')}</p>
                   </div>
 
                   {/* Login Password Toggle */}
                   <div className="border-t border-gray-100 pt-6">
                     <div className="flex items-center justify-between mb-4">
                       <div>
-                        <label className="block text-sm font-medium text-gray-900">登录密码保护</label>
-                        <p className="text-xs text-gray-400 mt-0.5">开启后，访问网页需要输入登录密码</p>
+                        <label className="block text-sm font-semibold text-gray-900">{t('settings.general.loginProtectionLabel')}</label>
+                        <p className="text-xs text-gray-400 mt-0.5">{t('settings.general.loginProtectionHint')}</p>
                       </div>
                       <button
                         type="button"
                         onClick={() => setLoginEnabled(!loginEnabled)}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ${
-                          loginEnabled ? 'bg-blue-600' : 'bg-gray-300'
-                        }`}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ${ loginEnabled ? 'bg-blue-600' : 'bg-gray-300' }`}
                       >
                         <span
-                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ${
-                            loginEnabled ? 'translate-x-6' : 'translate-x-1'
-                          }`}
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ${ loginEnabled ? 'translate-x-6' : 'translate-x-1' }`}
                         />
                       </button>
                     </div>
 
                     {loginEnabled && (
                       <div className="mt-3 animate-in slide-in-from-top-2 duration-200">
-                        <label className="block text-sm font-medium text-gray-900 mb-2">登录密码</label>
+                        <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.general.loginPasswordLabel')}</label>
                         <div className="relative">
                           <input
                             type={showLoginPassword ? "text" : "password"}
                             value={loginPassword}
                             onChange={(e) => setLoginPassword(e.target.value)}
-                            placeholder="请输入登录密码"
+                            placeholder={t('settings.general.loginPasswordPlaceholder')}
                             className="block w-full px-4 py-2.5 pr-12 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
                           />
                           <button
@@ -1138,7 +1979,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                             {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                           </button>
                         </div>
-                        <p className="text-xs text-gray-400 mt-1.5">默认密码为 123456</p>
+                        <p className="text-xs text-gray-400 mt-1.5">{t('settings.general.loginPasswordHint')}</p>
                       </div>
                     )}
                   </div>
@@ -1149,7 +1990,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                 <div className="flex items-center gap-3 w-full sm:w-auto">
                   {generalError && (
                     <span className="text-sm font-semibold text-red-500 animate-in fade-in zoom-in-95 duration-200 flex items-center gap-1">
-                      <X className="w-4 h-4" /> 保存出错
+                      <X className="w-4 h-4" /> {t('settings.general.saveError')}
                     </span>
                   )}
                   <button
@@ -1157,7 +1998,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     disabled={isLoading}
                     className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-8 py-2.5 text-sm font-medium rounded-xl text-white bg-blue-600 hover:bg-blue-700 transition-all disabled:opacity-50"
                   >
-                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : generalSaved ? <><Check className="w-4 h-4" /> 已保存</> : '保存设置'}
+                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : generalSaved ? <><Check className="w-4 h-4" /> {t('settings.general.saved')}</> : t('settings.general.save')}
                   </button>
                 </div>
               </div>
@@ -1168,14 +2009,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {settingsTab === 'commands' && (
             <div className="space-y-6">
               <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-1">快捷指令</h3>
-                <p className="text-sm text-gray-500 mb-6">管理聊天框中可用的快捷指令。</p>
+                <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.commands.title')}</h3>
+                <p className="text-sm text-gray-500 mb-6">{t('settings.commands.description')}</p>
 
                 {/* Add/Edit Form */}
                 <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200 mb-6">
                   <div className="flex flex-col sm:flex-row gap-4 items-end">
                     <div className="flex-1 w-full">
-                      <label className="block text-sm font-medium text-gray-900 mb-2">指令 (需以 / 开头)</label>
+                      <label className="block text-sm font-medium text-gray-900 mb-2">{t('settings.commands.commandLabel')}</label>
                       <input
                         type="text"
                         value={newCommand}
@@ -1185,12 +2026,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       />
                     </div>
                     <div className="flex-[2] w-full">
-                      <label className="block text-sm font-medium text-gray-900 mb-2">说明</label>
+                      <label className="block text-sm font-medium text-gray-900 mb-2">{t('settings.commands.descriptionLabel')}</label>
                       <input
                         type="text"
                         value={newDescription}
                         onChange={(e) => setNewDescription(e.target.value)}
-                        placeholder="列出所有可用的模型"
+                        placeholder={t('settings.commands.descriptionPlaceholder')}
                         className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
                       />
                     </div>
@@ -1201,14 +2042,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         className="h-[42px] px-6 rounded-xl bg-blue-600 text-white font-bold text-sm hover:bg-blue-700 transition-all disabled:opacity-50 flex-1 sm:flex-none flex items-center justify-center gap-2"
                       >
                         {editingId ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
-                        {editingId ? '保存' : '新增'}
+                        {editingId ? t('settings.commands.save') : t('settings.commands.addNew')}
                       </button>
                       {editingId && (
                         <button
                           onClick={() => { setEditingId(null); setNewCommand(''); setNewDescription(''); }}
                           className="h-[42px] px-4 rounded-xl border border-gray-200 text-gray-500 hover:bg-gray-50 transition-all font-bold text-sm flex-1 sm:flex-none"
                         >
-                          取消
+                          {t('common.cancel')}
                         </button>
                       )}
                     </div>
@@ -1221,9 +2062,9 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     <table className="w-full text-left border-collapse min-w-[500px]">
                     <thead>
                       <tr className="bg-gray-50 border-b border-gray-200">
-                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest w-1/3">指令</th>
-                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest">说明</th>
-                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest text-right w-24">操作</th>
+                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest w-1/3">{t('settings.commands.tableCommand')}</th>
+                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest">{t('settings.commands.tableDescription')}</th>
+                        <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-widest text-right w-24">{t('settings.commands.tableActions')}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
@@ -1236,14 +2077,14 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                               <button 
                                 onClick={() => startEdit(cmd)}
                                 className="p-2 text-gray-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
-                                title="编辑"
+                                title={t('common.edit')}
                               >
                                 <Edit2 className="w-4 h-4" />
                               </button>
                               <button 
                                 onClick={() => handleDeleteCommand(cmd.id)}
                                 className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                                title="删除"
+                                title={t('common.delete')}
                               >
                                 <Trash2 className="w-4 h-4" />
                               </button>
@@ -1254,7 +2095,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       {commands.length === 0 && (
                         <tr>
                           <td colSpan={3} className="px-6 py-12 text-center text-gray-400 text-sm italic">
-                            暂无快捷指令
+                            {t('settings.commands.empty')}
                           </td>
                         </tr>
                       )}
@@ -1269,371 +2110,489 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
           {/* Model Management Tab */}
           {settingsTab === 'models' && (
             <div className="space-y-6">
-              {/* Sub-tabs for Model Management */}
-              <div className="flex bg-white rounded-xl border border-gray-200 p-1 mb-6">
-                <button
-                  onClick={() => setActiveModelSubTab('endpoints')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-bold rounded-lg transition-all ${
-                    activeModelSubTab === 'endpoints'
-                      ? 'bg-blue-50 text-blue-600 shadow-sm'
-                      : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
-                  }`}
-                >
-                  端点管理
-                </button>
-                <button
-                  onClick={() => setActiveModelSubTab('models')}
-                  className={`flex-1 flex items-center justify-center gap-2 py-2.5 text-sm font-bold rounded-lg transition-all ${
-                    activeModelSubTab === 'models'
-                      ? 'bg-blue-50 text-blue-600 shadow-sm'
-                      : 'text-gray-500 hover:text-gray-900 hover:bg-gray-50'
-                  }`}
-                >
-                  模型管理
-                </button>
-              </div>
-
-              {activeModelSubTab === 'models' && (
+              {/* Header */}
+              <div className="flex justify-between items-start sm:items-center">
                 <div>
-                  <div className="flex justify-between items-start sm:items-center mb-6">
-                    <div>
-                      <h3 className="text-lg font-semibold text-gray-900 mb-1">模型管理</h3>
-                      <p className="text-sm text-gray-500">管理可用的 AI 模型，支持多提供商。</p>
-                    </div>
-                    <button
-                      onClick={() => {
-                          setNewModelEndpoint('');
-                          setNewModelName('');
-                          setNewModelAlias('');
-                          setAddModelTestStatus('idle');
-                          setTestModelMessage('');
-                          setDiscoveredModels([]);
-                          setModelSearchQuery('');
-                          setIndividualTestStatus({});
-                          setShowOnlyConnected(false);
-                          setModelError('');
-                          setAddModelError('');
-                          setIsAddModelModalOpen(true);
-                      }}
-                      className="h-[40px] px-5 rounded-xl bg-blue-600 text-white font-medium text-sm hover:bg-blue-700 transition-all flex items-center gap-1.5 shrink-0"
-                    >
-                      <Plus className="w-4 h-4" />
-                      添加模型
-                    </button>
-                  </div>
-                  
-                  {modelError && (
-                    <div className="mb-4 p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
-                      <X className="w-4 h-4 shrink-0" />
-                      {modelError}
-                    </div>
-                  )}
-
-                  {testModelStatus !== 'idle' && (
-                    <div className={`mb-4 p-3 text-sm rounded-xl border flex items-center gap-2 animate-in fade-in duration-300 ${
-                      testModelStatus === 'testing' ? 'bg-blue-50 text-blue-600 border-blue-100' :
-                      testModelStatus === 'success' ? 'bg-green-50 text-green-600 border-green-100' :
-                      'bg-red-50 text-red-600 border-red-100'
-                    }`}>
-                      {testModelStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin shrink-0" /> :
-                      testModelStatus === 'success' ? <Check className="w-4 h-4 shrink-0" /> :
-                      <X className="w-4 h-4 shrink-0" />}
-                      {testModelMessage}
-                    </div>
-                  )}
+                  <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.models.title')}</h3>
+                  <p className="text-sm text-gray-500">{t('settings.models.description')}</p>
                 </div>
-              )}
-
-              {activeModelSubTab === 'endpoints' && (
-              <div>
-                <div className="flex justify-between items-start sm:items-center mb-6">
-                  <div>
-                    <h3 className="text-lg font-semibold text-gray-900 mb-1">端点管理</h3>
-                    <p className="text-sm text-gray-500">管理 API 服务提供商的连接设置，如 Base URL 和 API Key。</p>
-                  </div>
-                  <button
-                    onClick={openAddEndpointModal}
-                    className="h-[40px] px-5 rounded-xl bg-blue-600 text-white font-medium text-sm hover:bg-blue-700 transition-all flex items-center gap-1.5 shrink-0"
-                  >
-                    <Plus className="w-4 h-4" />
-                    新增端点
-                  </button>
-                </div>
-                <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden mb-6">
-                  {knownEndpoints.length === 0 ? (
-                    <div className="px-4 py-8 text-center text-gray-400 text-sm">暂无端点</div>
-                  ) : (
-                    <table className="w-full text-left border-collapse">
-                      <thead>
-                        <tr className="bg-gray-50 border-b border-gray-200">
-                          <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-sm w-[40%]">端点名称</th>
-                          <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-sm w-[20%]">接口类型</th>
-                          <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-center text-sm w-[20%]">模型</th>
-                          <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-center text-sm w-[20%]">操作</th>
-                        </tr>
-                      </thead>
-                        {knownEndpoints.map(epName => {
-                          const epCount = models.filter(m => m.id.startsWith(`${epName}/`)).length;
-                          const epConfig = endpoints.find(e => e.id === epName) || { id: epName, baseUrl: '', apiKey: '', api: 'openai-completions' };
-                          
-                          // Convert api internal name to display name
-                          const displayApi = epConfig.api === 'openai-completions' ? 'OpenAI' : 
-                                             epConfig.api === 'anthropic-messages' ? 'Anthropic' :
-                                             epConfig.api === 'google-genai' ? 'Gemini' : 
-                                             epConfig.api === 'ollama' ? 'Ollama' : epConfig.api;
-
-                          return (
-                            <tbody key={epName} className="group border-b border-gray-100 last:border-b-0 bg-white hover:bg-gray-50/50 transition-colors text-base">
-                              <tr>
-                                <td className="px-4 pt-4 pb-1 align-bottom text-gray-700">
-                                  {epName}
-                                </td>
-                                <td className="px-4 pt-4 pb-1 align-bottom">
-                                  <span className="px-2 py-0.5 rounded-md bg-gray-100/80 border border-gray-200 text-gray-500 text-xs font-mono">
-                                    {displayApi}
-                                  </span>
-                                </td>
-                                <td className="px-4 py-4 align-middle text-gray-500 text-sm text-center" rowSpan={2}>
-                                  {epCount} 个
-                                </td>
-                                <td className="px-4 py-4 align-middle text-center" rowSpan={2}>
-                                  <div className="flex items-center justify-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                                    <button
-                                      onClick={() => openEditEndpointModal(epConfig)}
-                                      className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
-                                      title="编辑端点"
-                                    >
-                                      <Edit2 className="w-4 h-4" />
-                                    </button>
-                                    <button
-                                      onClick={() => handleDeleteEndpoint(epName, epCount)}
-                                      className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
-                                      title="删除整个端点"
-                                    >
-                                      <Trash2 className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                              <tr>
-                                <td colSpan={2} className="px-4 pb-4 pt-1 align-top text-gray-500 text-sm break-all max-w-[400px]">
-                                  {epConfig.baseUrl || '-'}
-                                </td>
-                              </tr>
-                            </tbody>
-                          );
-                        })}
-                    </table>
-                  )}
-                </div>
+                <button
+                  onClick={openAddEndpointModal}
+                  className="h-[40px] px-5 rounded-xl bg-blue-600 text-white font-medium text-sm hover:bg-blue-700 transition-all flex items-center gap-1.5 shrink-0"
+                >
+                  <Plus className="w-4 h-4" />
+                  {t('settings.models.addEndpoint')}
+                </button>
               </div>
+
+              {modelActionError.message && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-start gap-2">
+                  <X className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div>{modelActionError.message}</div>
+                    {modelActionError.detail && (
+                      <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {modelActionError.detail}
+                      </div>
+                    )}
+                  </div>
+                </div>
               )}
 
-              {activeModelSubTab === 'models' && (
-              <div>
-                <div className="flex justify-between items-center mb-4">
-                  <div>
-                    <h3 className="text-lg font-semibold text-gray-900 mb-1">现有模型</h3>
-                    <p className="text-sm text-gray-500">按模型 ID 升序排列，悬停列可进行编辑别名、设为默认或删除操作。</p>
-                  </div>
-                  <button
-                    onClick={async () => {
-                      setIsTestingExisting(true);
-                      setExistingModelTestStatus({});
-                      const testPromises = models.map(async (model) => {
-                        const slashIndex = model.id.indexOf('/');
-                        if (slashIndex === -1) return;
-                        const endpoint = model.id.substring(0, slashIndex);
-                        const modelName = model.id.substring(slashIndex + 1);
-                        setExistingModelTestStatus(prev => ({...prev, [model.id]: { status: 'testing' }}));
-                        try {
-                          const res = await fetch('/api/models/test', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ endpoint, modelName })
-                          });
-                          const data = await res.json().catch(() => ({}));
-                          if (data.success) {
-                            setExistingModelTestStatus(prev => ({...prev, [model.id]: { status: 'success' }}));
-                          } else {
-                            setExistingModelTestStatus(prev => ({...prev, [model.id]: { status: 'error', message: data.error || '检测失败' }}));
-                          }
-                        } catch (err: any) {
-                          setExistingModelTestStatus(prev => ({...prev, [model.id]: { status: 'error', message: '网络错误' }}));
-                        }
-                      });
-                      await Promise.all(testPromises);
-                      setIsTestingExisting(false);
-                    }}
-                    disabled={isTestingExisting || models.length === 0}
-                    className={`h-[36px] px-4 rounded-lg text-sm font-medium transition-all border flex items-center gap-1.5 shrink-0 ${
-                      isTestingExisting || models.length === 0
-                        ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
-                        : 'text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border-indigo-200'
-                    }`}
-                  >
-                    {isTestingExisting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                    检测
-                  </button>
+              {modelError && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
+                  <X className="w-4 h-4 shrink-0" />
+                  {modelError}
                 </div>
-                <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
-                  <table className="w-full text-left border-collapse">
-                    <thead>
-                      <tr className="bg-gray-50 border-b border-gray-200">
-                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-sm">模型 ID</th>
-                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-sm">别名</th>
-                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap w-24 text-sm">状态</th>
-                        <th className="px-4 py-3 font-medium text-gray-500 whitespace-nowrap text-right w-32 text-sm">操作</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {models.length === 0 ? (
-                        <tr>
-                          <td colSpan={4} className="px-4 py-8 text-center text-gray-400">
-                            暂无模型配置
-                          </td>
-                        </tr>
-                      ) : (
-                        [...models].sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: 'base' })).map((model) => (
-                          <tr key={model.id} className={`hover:bg-gray-50/50 transition-colors text-base ${editingModelId === model.id ? 'bg-blue-50/30' : 'group'}`}>
-                            <td className="px-4 py-4 text-gray-700">{model.id}</td>
-                            <td className="px-4 py-3 text-gray-600">
-                              {editingModelId === model.id ? (
-                                <input
-                                  ref={editAliasInputRef}
-                                  type="text"
-                                  value={editingAlias}
-                                  onChange={(e) => setEditingAlias(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') handleSaveModelAlias();
-                                    if (e.key === 'Escape') cancelEditModel();
-                                  }}
-                                  placeholder="输入别名（可留空）"
-                                  className="w-full px-2 py-1 text-sm border border-blue-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-400/30"
-                                />
-                              ) : (
-                                model.alias || <span className="text-gray-300">-</span>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="flex items-center gap-2">
-                                {(() => {
-                                  const testData = existingModelTestStatus[model.id];
-                                  if (testData?.status === 'testing') return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
-                                  if (testData?.status === 'success') return <Check className="w-4 h-4 text-green-500" />;
-                                  if (testData?.status === 'error') return <span title={testData.message}><X className="w-4 h-4 text-red-500" /></span>;
-                                  return null;
-                                })()}
-                                {model.primary ? (
-                                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700">
-                                    默认
-                                  </span>
-                                ) : null}
-                              </div>
-                            </td>
-                            <td className="px-4 py-3 text-right">
-                              {editingModelId === model.id ? (
-                                <div className="flex items-center justify-end gap-1">
-                                  <button
-                                    onClick={handleSaveModelAlias}
-                                    disabled={isLoading}
-                                    className="p-1.5 text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
-                                    title="保存"
-                                  >
-                                    <Check className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={cancelEditModel}
-                                    className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-                                    title="取消"
-                                  >
-                                    <X className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                              ) : (
-                                <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                  <button
-                                    onClick={() => startEditModel(model)}
-                                    className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-                                    title="修改别名"
-                                  >
-                                    <Edit2 className="w-4 h-4" />
-                                  </button>
-                                  {!model.primary && (
-                                    <button
-                                      onClick={() => handleSetDefaultModel(model.id)}
-                                      className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                                      title="设为默认"
-                                    >
-                                      <Check className="w-4 h-4" />
-                                    </button>
-                                  )}
-                                  <button
-                                    onClick={() => {
-                                      const [endpoint, ...nameParts] = model.id.split('/');
-                                      const modelName = nameParts.join('/');
-                                      handleTestExistingSingleModel(model.id, endpoint, modelName);
-                                    }}
-                                    disabled={existingModelTestStatus[model.id]?.status === 'testing' || isTestingExisting}
-                                    className={`p-1.5 rounded-lg transition-colors ${
-                                      existingModelTestStatus[model.id]?.status === 'testing' || isTestingExisting
-                                        ? 'text-gray-300 cursor-not-allowed'
-                                        : 'text-gray-400 hover:text-purple-600 hover:bg-purple-50'
-                                    }`}
-                                    title="测试可用性"
-                                  >
-                                    <Activity className="w-4 h-4" />
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteModel(model.id, model.primary)}
-                                    className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                    title="删除"
-                                  >
+              )}
+
+              {/* Unified Endpoint + Model List */}
+              <div className="space-y-3">
+                {knownEndpoints.length === 0 ? (
+                  <div className="bg-white rounded-2xl border border-gray-200 px-4 py-12 text-center text-gray-400 text-sm">
+                    {t('settings.models.emptyEndpoints')}
+                  </div>
+                ) : (
+                  knownEndpoints.map(epName => {
+                    const epModels = models.filter(m => m.id.startsWith(`${epName}/`)).sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: 'base' }));
+                    const epConfig = endpoints.find(e => e.id === epName) || { id: epName, baseUrl: '', apiKey: '', api: 'openai-completions' };
+                    const displayApi = epConfig.api === 'openai-completions' ? 'OpenAI' : 
+                                       epConfig.api === 'anthropic-messages' ? 'Anthropic' :
+                                       epConfig.api === 'google-genai' ? 'Gemini' : 
+                                       epConfig.api === 'ollama' ? 'Ollama' : epConfig.api;
+                    const isExpanded = expandedEndpoints.has(epName);
+
+                    return (
+                      <div key={epName} className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+                        {/* Endpoint Header Row */}
+                        <div
+                          className="flex items-center gap-3 px-4 py-4 cursor-pointer hover:bg-gray-50/80 transition-colors select-none group"
+                          onClick={() => toggleEndpointExpanded(epName)}
+                        >
+                          <ChevronDown className={`w-6 h-6 text-gray-400 transition-transform duration-200 shrink-0 ${isExpanded ? 'rotate-180' : ''}`} />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2.5 mb-0.5">
+                              <span className="font-semibold text-gray-900 text-base">{epName}</span>
+                              <span className="px-2 py-0.5 rounded-md bg-gray-100/80 border border-gray-200 text-gray-500 text-xs font-mono">
+                                {displayApi}
+                              </span>
+                              <span className="hidden sm:inline text-xs text-gray-400">{t('settings.models.modelCount', { count: epModels.length })}</span>
+                            </div>
+                            <div className="text-sm text-gray-400 truncate">{epConfig.baseUrl || '-'}</div>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0" onClick={e => e.stopPropagation()}>
+                            <button
+                              onClick={() => {
+                                setNewModelEndpoint(epName);
+                                setNewModelName('');
+                                setNewModelAlias('');
+                                setAddModelTestStatus('idle');
+                                setTestModelMessage('');
+                                setDiscoveredModels([]);
+                                setModelSearchQuery('');
+                                setIndividualTestStatus({});
+                                setShowOnlyConnected(false);
+                                setModelError('');
+                                setAddModelError('');
+                                setAddModelErrorDetail('');
+                                setIsAddModelModalOpen(true);
+                              }}
+                              className="flex items-center gap-1 px-2 py-1.5 text-sm text-gray-400 hover:text-green-600 hover:bg-green-50 rounded-lg transition-all"
+                              title={t('settings.models.addModel')}
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline">{t('settings.models.addModel')}</span>
+                            </button>
+                            <button
+                              onClick={() => openEditEndpointModal(epConfig)}
+                              className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-all"
+                              title={t('settings.models.editEndpoint')}
+                            >
+                              <Edit2 className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleDeleteEndpoint(epName, epModels.length)}
+                              className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-all"
+                              title={t('settings.models.deleteEntireEndpoint')}
+                            >
                               <Trash2 className="w-4 h-4" />
-                                    </button>
-                                  </div>
-                                )}
-                              </td>
-                            </tr>
-                          ))
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Expanded Models Section */}
+                        {isExpanded && (
+                          <div className="border-t border-gray-100">
+                            {epModels.length === 0 ? (
+                              <div className="px-6 py-6 text-center text-gray-400 text-sm">
+                                {t('settings.models.noModelsPrefix')}
+                                <button
+                                  onClick={() => {
+                                    setNewModelEndpoint(epName);
+                                    setNewModelName('');
+                                    setNewModelAlias('');
+                                    setAddModelTestStatus('idle');
+                                    setTestModelMessage('');
+                                    setDiscoveredModels([]);
+                                    setModelSearchQuery('');
+                                    setIndividualTestStatus({});
+                                    setShowOnlyConnected(false);
+                                    setModelError('');
+                                    setAddModelError('');
+                                    setAddModelErrorDetail('');
+                                    setIsAddModelModalOpen(true);
+                                  }}
+                                  className="text-blue-600 hover:text-blue-700 font-medium hover:underline"
+                                >
+                                  {t('settings.models.clickToAdd')}
+                                </button>
+                              </div>
+                            ) : (
+                              <table className="w-full text-left border-collapse">
+                                <thead>
+                                  <tr className="bg-gray-50/80 border-b border-gray-100">
+                                    <th className="px-6 py-2.5 font-medium text-gray-500 whitespace-nowrap text-xs">{t('settings.models.tableModelId')}</th>
+                                    <th className="px-4 py-2.5 font-medium text-gray-500 whitespace-nowrap text-xs">{t('settings.models.tableAlias')}</th>
+                                    <th className="px-4 py-2.5 font-medium text-gray-500 whitespace-nowrap w-20 text-xs">{t('settings.models.tableStatus')}</th>
+                                    <th className="px-4 py-2.5 font-medium text-gray-500 whitespace-nowrap text-right w-28 text-xs">{t('settings.models.tableActions')}</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {epModels.map((model, idx) => {
+                                    const modelName = model.id.substring(epName.length + 1);
+                                    return (
+                                      <Fragment key={model.id}>
+                                      <tr className={`transition-colors text-sm ${editingModelId === model.id ? 'bg-blue-50/30' : 'group'}`}>
+                                        <td className="px-6 py-3 text-gray-700">
+                                          <div className="text-[13px]">{modelName}</div>
+                                        </td>
+                                        <td className="px-4 py-3 text-gray-600 text-[13px]">
+                                          {editingModelId === model.id ? (
+                                            <input
+                                              ref={editAliasInputRef}
+                                              type="text"
+                                              value={editingAlias}
+                                              onChange={(e) => setEditingAlias(e.target.value)}
+                                              onKeyDown={(e) => {
+                                                if (e.key === 'Enter') handleSaveModelAlias();
+                                                if (e.key === 'Escape') cancelEditModel();
+                                              }}
+                                              placeholder={t('settings.models.aliasPlaceholder')}
+                                              className="w-full px-2 py-1 text-[13px] border border-blue-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-blue-400/30"
+                                            />
+                                          ) : (
+                                            model.alias || <span className="text-gray-300">-</span>
+                                          )}
+                                        </td>
+                                        <td className="px-4 py-3">
+                                          <div className="flex items-center gap-2">
+                                            {(() => {
+                                              const testData = existingModelTestStatus[model.id];
+                                              if (testData?.status === 'testing') return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
+                                              if (testData?.status === 'success') return <Check className="w-4 h-4 text-green-500" />;
+                                              if (testData?.status === 'error') return <span title={testData.detail || testData.message}><X className="w-4 h-4 text-red-500" /></span>;
+                                              return null;
+                                            })()}
+                                            {model.primary ? (
+                                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-700 whitespace-nowrap">
+                                                {t('settings.models.defaultTag')}
+                                              </span>
+                                            ) : null}
+                                          </div>
+                                        </td>
+                                        <td className="px-4 py-3 text-right">
+                                          {editingModelId === model.id ? (
+                                            <div className="flex items-center justify-end gap-1">
+                                              <button
+                                                onClick={handleSaveModelAlias}
+                                                disabled={isLoading}
+                                                className="p-1.5 text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors"
+                                                title={t('common.save')}
+                                              >
+                                                <Check className="w-3.5 h-3.5" />
+                                              </button>
+                                              <button
+                                                onClick={cancelEditModel}
+                                                className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                                                title={t('common.cancel')}
+                                              >
+                                                <X className="w-3.5 h-3.5" />
+                                              </button>
+                                            </div>
+                                          ) : (
+                                            <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                                              <button
+                                                onClick={() => startEditModel(model)}
+                                                className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                                                title={t('settings.models.editAlias')}
+                                              >
+                                                <Edit2 className="w-4 h-4" />
+                                              </button>
+                                              {!model.primary && (
+                                                <button
+                                                  onClick={() => handleSetDefaultModel(model.id)}
+                                                  className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                                  title={t('settings.models.setDefault')}
+                                                >
+                                                  <Check className="w-4 h-4" />
+                                                </button>
+                                              )}
+                                              <button
+                                                onClick={() => {
+                                                  handleTestExistingSingleModel(model.id, epName, modelName);
+                                                }}
+                                                disabled={existingModelTestStatus[model.id]?.status === 'testing'}
+                                                className={`p-1.5 rounded-lg transition-colors ${ existingModelTestStatus[model.id]?.status === 'testing' ? 'text-gray-300 cursor-not-allowed' : 'text-gray-400 hover:text-purple-600 hover:bg-purple-50' }`}
+                                                title={t('settings.models.testAvailability')}
+                                              >
+                                                <Activity className="w-4 h-4" />
+                                              </button>
+                                              <button
+                                                onClick={() => handleDeleteModel(model.id, model.primary)}
+                                                className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                                title={t('common.delete')}
+                                              >
+                                                <Trash2 className="w-4 h-4" />
+                                              </button>
+                                            </div>
+                                          )}
+                                        </td>
+                                      </tr>
+                                      {/* Capabilities row */}
+                                      {editingModelId === model.id ? (
+                                        <tr className="bg-blue-50/30">
+                                          <td colSpan={3} className="px-6 pt-0 pb-3">
+                                            <div className="flex flex-nowrap gap-1">
+                                              {CAPABILITIES.map(cap => {
+                                                const active = editingInput.includes(cap.id);
+                                                return (
+                                                  <button
+                                                    key={cap.id}
+                                                    type="button"
+                                                    onClick={() => setEditingInput(prev =>
+                                                      prev.includes(cap.id) ? prev.filter(i => i !== cap.id) : [...prev, cap.id]
+                                                    )}
+                                                    className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-medium border transition-all ${ active ? 'text-blue-600 bg-blue-50 border-blue-200' : 'text-gray-400 bg-gray-50 border-gray-200' }`}
+                                                  >
+                                                    <cap.Icon className="w-2.5 h-2.5" />
+                                                    {cap.label}
+                                                  </button>
+                                                );
+                                              })}
+                                            </div>
+                                          </td>
+                                          <td></td>
+                                        </tr>
+                                      ) : (
+                                        (model.input || []).filter(i => i !== 'text').length > 0 && (
+                                          <tr>
+                                            <td colSpan={3} className="px-6 pt-0 pb-3">
+                                              <div className="flex flex-nowrap gap-1">
+                                                {CAPABILITIES.filter(c => (model.input || []).includes(c.id)).map(cap => (
+                                                  <span key={cap.id} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-medium border text-blue-600 bg-blue-50 border-blue-200">
+                                                    <cap.Icon className="w-2.5 h-2.5" />
+                                                    {cap.label}
+                                                  </span>
+                                                ))}
+                                              </div>
+                                            </td>
+                                            <td></td>
+                                          </tr>
+                                        )
+                                      )}
+                                      {idx < epModels.length - 1 && (
+                                        <tr><td colSpan={4} className="p-0"><div className="mx-5 border-b border-gray-200"></div></td></tr>
+                                      )}
+                                      </Fragment>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            )}
+                          </div>
                         )}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+                      </div>
+                    );
+                  })
                 )}
               </div>
-            )}
+
+              <div className="space-y-4 pt-2">
+                <div className="space-y-1">
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    {t('settings.models.defaultModelTitle')}
+                  </h3>
+                  <p className="text-sm text-gray-500 leading-relaxed">
+                    {t('settings.models.defaultModelDescription')}
+                  </p>
+                </div>
+
+                {defaultModelError.message ? (
+                  <div className="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600">
+                    <div>{defaultModelError.message}</div>
+                    {defaultModelError.detail ? (
+                      <div className="mt-2 rounded-lg border border-red-100 bg-white/80 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {defaultModelError.detail}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="min-w-0 rounded-2xl border border-gray-200 bg-white p-4 sm:p-6">
+                  <ModelSinglePicker
+                    availableModels={[...models].sort((a, b) => {
+                      const labelA = a.alias || a.id;
+                      const labelB = b.alias || b.id;
+                      return labelA.localeCompare(labelB, undefined, { sensitivity: 'base' });
+                    })}
+                    selectedModelId={defaultModelId}
+                    onSelectedModelIdChange={(id) => {
+                      void handleSaveDefaultModelSelection(id);
+                    }}
+                    placeholder={t('settings.models.defaultModelPlaceholder')}
+                    emptyText={t('settings.models.defaultModelEmpty')}
+                    allModelsTabLabel={t('sidebar.allModels')}
+                    defaultBadgeLabel={t('settings.models.defaultTag')}
+                    visionBadgeLabel={t('sidebar.visionModel')}
+                    disabled={isSavingDefaultModel || models.length === 0}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-4 pt-2">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-lg font-semibold text-gray-900 mb-1">
+                      {t('settings.models.globalFallbackTitle')}
+                    </h3>
+                    <p className="text-sm text-gray-500 leading-relaxed">
+                      {t('settings.models.globalFallbackDescription')}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={globalFallbackMode !== 'disabled'}
+                    aria-label={t('settings.models.globalFallbackTitle')}
+                    onClick={() => setGlobalFallbackMode((prev) => prev === 'disabled' ? 'custom' : 'disabled')}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 ${globalFallbackMode !== 'disabled' ? 'bg-blue-600' : 'bg-gray-200'}`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out ${globalFallbackMode !== 'disabled' ? 'translate-x-6' : 'translate-x-1'}`}
+                    />
+                  </button>
+                </div>
+
+                {globalFallbackError.message ? (
+                  <div className="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600">
+                    <div>{globalFallbackError.message}</div>
+                    {globalFallbackError.detail ? (
+                      <div className="mt-2 rounded-lg border border-red-100 bg-white/80 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {globalFallbackError.detail}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {globalFallbackMode !== 'disabled' ? (
+                  <ModelFallbackEditor
+                    availableModels={[...models].sort((a, b) => {
+                      const labelA = a.alias || a.id;
+                      const labelB = b.alias || b.id;
+                      return labelA.localeCompare(labelB, undefined, { sensitivity: 'base' });
+                    })}
+                    mode={globalFallbackMode}
+                    onModeChange={(mode) => setGlobalFallbackMode(mode)}
+                    selectedModelIds={globalFallbacks}
+                    onSelectedModelIdsChange={(ids) => {
+                      setGlobalFallbacks(ids);
+                      if (ids.length === 0) {
+                        setGlobalFallbackMode('disabled');
+                      } else if (globalFallbackMode !== 'custom') {
+                        setGlobalFallbackMode('custom');
+                      }
+                    }}
+                    excludedModelIds={currentPrimaryModelId ? [currentPrimaryModelId] : []}
+                    title=""
+                    description=""
+                    customLabel={t('settings.models.fallbackModeCustom')}
+                    customHint=""
+                    disabledLabel={t('settings.models.fallbackModeDisabled')}
+                    disabledHint=""
+                    hideModeSelector
+                    searchPlaceholder={t('settings.models.fallbackSearchPlaceholder')}
+                    selectedTitle={t('settings.models.fallbackSelectedTitle')}
+                    availableTitle={t('settings.models.fallbackAvailableTitle')}
+                    emptySelectedText={t('settings.models.fallbackSelectedEmpty')}
+                    emptyAvailableText={t('settings.models.fallbackAvailableEmpty')}
+                    defaultBadgeLabel={t('settings.models.defaultTag')}
+                    allModelsTabLabel={t('sidebar.allModels')}
+                    visionBadgeLabel={t('sidebar.visionModel')}
+                    selectionUiVariant="model-picker"
+                    className="min-w-0"
+                  />
+                ) : null}
+              </div>
+            </div>
+          )}
 
             {/* About System Tab */}
 
             {settingsTab === 'about' && (
-              <div className="flex flex-col items-center justify-center min-h-[60vh]">
-                <div className="bg-white rounded-3xl border border-gray-200 p-10 w-full max-w-lg text-center flex flex-col items-center">
+              <div className="space-y-6">
+                <div className="bg-white rounded-2xl border border-gray-200 p-4 sm:p-6 w-full">
+                  <div className="flex w-full flex-col gap-6">
                   
-                  {/* Logo Section */}
-                  <div className="mb-6 w-max text-center flex flex-col items-center">
-                    <div className="text-[2.5rem] font-black text-[#1a1c1e] tracking-tight leading-tight mb-0.5">OpenClaw</div>
-                    <div className="text-[1.1rem] font-bold text-[#94a3b8] tracking-[0.35em] uppercase leading-tight">CHAT GATEWAY</div>
-                  </div>
-
-                  {/* Version Info */}
-                  <div className="space-y-4 mb-8">
-                    <div className="text-2xl font-medium text-gray-800">Ver: 1.00</div>
-                    <div>
-                      <a href="#" className="text-[#3b82f6] hover:text-blue-700 font-medium text-lg transition-colors underline-offset-4 hover:underline">
-                        检查新版本
-                      </a>
+                  {/* Header */}
+                  <div className="flex w-full flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+                    <div className="w-full text-left sm:w-auto">
+                      <div className="text-2xl font-black text-gray-900 tracking-tighter leading-tight mb-1">OpenClaw</div>
+                      <div className="text-[1.15rem] font-bold text-gray-400 tracking-widest uppercase leading-tight">CHAT GATEWAY</div>
+                    </div>
+                    <div className="flex flex-col items-start gap-3 sm:items-end">
+                      <div className="flex items-baseline text-left text-sm text-gray-700 sm:text-right">
+                        <span className="font-normal">
+                          {t('settings.about.currentVersionLabel')}:&nbsp;
+                        </span>
+                        <span className="font-normal text-gray-900">
+                          {isLoadingAppVersion
+                            ? t('settings.about.loadingVersion')
+                            : appVersionInfo?.version || t('settings.about.unavailable')}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleLatestVersionAction}
+                        disabled={isCheckingLatestVersion}
+                        title={latestVersionButtonTitle}
+                        className="inline-flex max-w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {isCheckingLatestVersion ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+                        <span className="whitespace-normal break-words">{latestVersionButtonLabel}</span>
+                      </button>
                     </div>
                   </div>
 
+                  <div className="w-full border-t border-gray-200" />
+
+                  {/* Version Status */}
+                  <div className="w-full">
+
+                    {appVersionError.message && (
+                      <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                        <div className="font-semibold">{appVersionError.message}</div>
+                        {appVersionError.detail ? <div className="mt-1 whitespace-pre-wrap text-red-600">{appVersionError.detail}</div> : null}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Author Info */}
-                  <div className="text-xl font-medium text-gray-700 mb-10">
-                    安格视界 / AnGeWorld
+                  <div className="w-full text-center text-xl font-medium leading-8 text-gray-700">
+                    {t('settings.about.authorName')}
                   </div>
 
                   {/* Links Row */}
-                  <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-4 mb-6">
+                  <div className="flex flex-wrap items-center justify-center gap-x-6 gap-y-4">
                     <a 
                       href="https://github.com/liandu2024/OpenClaw-Chat-Gateway" 
                       target="_blank" 
@@ -1650,7 +2609,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     className="flex items-center gap-2 text-[#3b82f6] hover:text-blue-700 transition-colors group text-[13px] sm:text-[15px] font-medium"
                   >
                     <Send className="w-5 h-5 text-[#3b82f6] group-hover:-translate-y-0.5 transition-transform" />
-                    <span>安格视界TG群</span>
+                    <span>{t('settings.about.tgGroup')}</span>
                   </a>
                   <a 
                     href="https://blog.angeworld.cc/market" 
@@ -1659,22 +2618,31 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     className="flex items-center gap-2 text-[#3b82f6] hover:text-blue-700 transition-colors group text-[13px] sm:text-[15px] font-medium"
                   >
                     <ShoppingBag className="w-5 h-5 text-[#ef4444] group-hover:-translate-y-0.5 transition-transform" />
-                    <span>安格超市</span>
+                    <span>{t('settings.about.market')}</span>
                   </a>
                 </div>
 
                 {/* API Button Row */}
-                <div className="w-full flex justify-center mb-8 px-2">
+                <div className="w-full flex flex-col items-center gap-3 px-2">
                   <a 
                     href="https://ai.opendoor.cn" 
                     target="_blank" 
                     rel="noreferrer"
                     className="flex items-center justify-center px-6 py-2.5 rounded-xl sm:rounded-full bg-[#fefce8] border border-blue-300 text-[#3b82f6] hover:bg-yellow-100 hover:border-blue-400 transition-all font-bold text-[11px] min-[380px]:text-[12px] sm:text-[14px] max-w-full text-center"
                   >
-                    芝麻开门 AI 接口 : https://ai.opendoor.cn
+                    {t('settings.about.openDoorApiLabel')}
+                  </a>
+                  <a 
+                    href="https://ai.superdoor.top/register?promo=ANGEWORLD" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="flex items-center justify-center px-6 py-2.5 rounded-xl sm:rounded-full bg-[#fefce8] border border-blue-300 text-[#3b82f6] hover:bg-yellow-100 hover:border-blue-400 transition-all font-bold text-[11px] min-[380px]:text-[12px] sm:text-[14px] max-w-full text-center"
+                  >
+                    {t('settings.about.superDoorApiLabel')}
                   </a>
                 </div>
 
+                  </div>
               </div>
             </div>
           )}
@@ -1686,28 +2654,28 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       {isDeleteModalOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" onClick={() => setIsDeleteModalOpen(false)}></div>
-          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-sm overflow-hidden relative z-10 animate-in fade-in zoom-in-95 duration-200">
+          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-sm max-h-[calc(100vh-2rem)] overflow-y-auto relative z-10 animate-in fade-in zoom-in-95 duration-200">
             <div className="p-6 text-center">
               <div className="mx-auto flex items-center justify-center h-12 w-12 rounded-full bg-red-100 mb-4">
                 <Trash2 className="h-6 w-6 text-red-600" />
               </div>
-              <h3 className="text-lg font-bold text-gray-900 mb-2">确认删除</h3>
+              <h3 className="text-lg font-bold text-gray-900 mb-2">{t('common.confirmDelete')}</h3>
               <p className="text-sm text-gray-500">{deleteModalMessage}</p>
             </div>
             <div className="p-4 bg-gray-50 flex gap-3 border-t border-gray-100">
               <button
                 type="button"
                 onClick={() => setIsDeleteModalOpen(false)}
-                className="flex-1 px-4 py-2.5 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 rounded-xl font-semibold transition-all"
+                className="flex-1 px-4 py-2.5 text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-xl font-semibold transition-all"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
                 onClick={executeDelete}
                 className="flex-1 px-4 py-2.5 text-white bg-red-600 hover:bg-red-700 rounded-xl font-semibold transition-all"
               >
-                确认删除
+                {t('common.confirmDelete')}
               </button>
             </div>
           </div>
@@ -1718,20 +2686,33 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       {isEndpointModalOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" onClick={() => setIsEndpointModalOpen(false)}></div>
-          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-md overflow-hidden relative z-10 animate-in fade-in zoom-in-95 duration-200 shadow-xl">
+          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-2xl max-h-[calc(100vh-2rem)] overflow-y-auto relative z-10 animate-in fade-in zoom-in-95 duration-200">
             <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-center">
               <h3 className="text-lg font-bold text-gray-900">
-                {editingEndpoint ? '编辑端点设置' : '新增端点'}
+                {editingEndpoint ? t('settings.models.endpointModalEditTitle') : t('settings.models.endpointModalCreateTitle')}
               </h3>
-              <button 
+              <button
                 onClick={() => setIsEndpointModalOpen(false)}
                 className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-                title="关闭"
+                title={t('common.close')}
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <div className="p-6 space-y-4">
+              {endpointModalError.message && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-start gap-2">
+                  <X className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div>{endpointModalError.message}</div>
+                    {endpointModalError.detail && (
+                      <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {endpointModalError.detail}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               {modelError && (
                 <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
                   <X className="w-4 h-4 shrink-0" />
@@ -1740,40 +2721,45 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               )}
               <div>
                 <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  端点名称 (ID) <span className="text-red-500">*</span>
+                  {t('settings.models.endpointNameLabel')} <span className="text-red-500">*</span>
                 </label>
                 <input
                   type="text"
                   value={newEndpointData.id}
                   onChange={(e) => setNewEndpointData({ ...newEndpointData, id: e.target.value })}
                   disabled={!!editingEndpoint}
-                  placeholder="例如: openai, my-company"
+                  placeholder={t('settings.models.endpointNamePlaceholder')}
                   className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm disabled:opacity-60 disabled:cursor-not-allowed"
                 />
               </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  接口类型 <span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={newEndpointData.api}
-                  onChange={(e) => setNewEndpointData({ ...newEndpointData, api: e.target.value })}
-                  className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
-                >
-                  <option value="openai-completions">OpenAI 兼容 (Chat Completions)</option>
-                  <option value="anthropic-messages">Anthropic (Messages)</option>
-                  <option value="google-genai">Google Gemini (GenAI)</option>
-                  <option value="cohere-chat">Cohere Chat</option>
-                  <option value="mistral-chat">Mistral Chat</option>
-                  <option value="ollama">Ollama</option>
-                </select>
-                <p className="text-xs text-gray-500 mt-1.5 ml-1">取决于提供商的底层 API 格式，通常为 OpenAI 兼容。</p>
-              </div>
+
+	              <div>
+	                <label className="block text-sm font-medium text-gray-900 mb-1.5">
+	                  {t('settings.models.apiTypeLabel')} <span className="text-red-500">*</span>
+	                </label>
+	                <div className="relative">
+	                  <select
+	                    value={newEndpointData.api}
+	                    onChange={(e) => setNewEndpointData({ ...newEndpointData, api: e.target.value })}
+	                    className="block w-full appearance-none px-4 pr-14 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
+	                  >
+	                    <option value="openai-completions">{t('settings.models.openaiCompatibleLabel')}</option>
+	                    <option value="anthropic-messages">Anthropic (Messages)</option>
+	                    <option value="google-genai">Google Gemini (GenAI)</option>
+	                    <option value="cohere-chat">Cohere Chat</option>
+	                    <option value="mistral-chat">Mistral Chat</option>
+	                    <option value="ollama">Ollama</option>
+	                  </select>
+	                  <span className="pointer-events-none absolute inset-y-0 right-5 flex items-center text-gray-500">
+	                    <ChevronDown className="w-4 h-4" />
+	                  </span>
+	                </div>
+	                <p className="text-xs text-gray-500 mt-1.5 ml-1">{t('settings.models.apiTypeHint')}</p>
+	              </div>
 
               <div>
                 <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  Base URL <span className="text-red-500">*</span>
+                  {t('settings.models.baseUrlLabel')} <span className="text-red-500">*</span>
                 </label>
                 <input
                   type="text"
@@ -1786,7 +2772,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
 
               <div>
                 <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                  API Key
+                  {t('settings.models.apiKeyLabel')}
                 </label>
                 <div className="relative">
                   <input
@@ -1810,18 +2796,33 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               <button
                 type="button"
                 onClick={() => setIsEndpointModalOpen(false)}
-                className="flex-[0.8] px-4 py-2.5 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 rounded-xl font-semibold transition-all"
+                className="flex-[0.5] px-3 py-2.5 text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-xl font-semibold transition-all text-sm whitespace-nowrap"
               >
-                取消
+                {t('common.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={handleTestEndpoint}
+                disabled={endpointTestStatus === 'testing' || !newEndpointData.baseUrl || !newEndpointData.api}
+                className={`flex-[1.5] px-3 py-2.5 rounded-xl font-semibold transition-all flex items-center justify-center gap-1.5 disabled:opacity-50 text-sm overflow-hidden ${ endpointTestStatus === 'testing' ? 'bg-blue-50 text-blue-600 border border-blue-200' : endpointTestStatus === 'success' ? 'bg-green-50 text-green-600 border border-green-200' : endpointTestStatus === 'error' ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-white text-gray-700 border border-gray-200 hover:text-purple-700 hover:border-purple-200 hover:bg-purple-50' }`}
+                title={endpointTestStatus !== 'idle' ? endpointTestMessage : t('settings.models.pretestEndpoint')}
+              >
+                {endpointTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin shrink-0" /> :
+                 endpointTestStatus === 'success' ? <Check className="w-4 h-4 shrink-0" /> :
+                 endpointTestStatus === 'error' ? <X className="w-4 h-4 shrink-0" /> :
+                 <Activity className="w-4 h-4 shrink-0" />}
+                <span className="truncate">
+                  {endpointTestStatus === 'idle' ? t('common.test') : endpointTestMessage}
+                </span>
               </button>
               <button
                 type="button"
                 onClick={handleSaveEndpoint}
                 disabled={isLoading}
-                className="flex-[1.2] px-4 py-2.5 text-white bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+                className="flex-[0.8] px-3 py-2.5 text-white bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 disabled:opacity-50 text-sm whitespace-nowrap"
               >
                 {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                保存端点
+                {t('settings.models.saveEndpoint')}
               </button>
             </div>
           </div>
@@ -1832,22 +2833,22 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       {isAddModelModalOpen && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" onClick={() => setIsAddModelModalOpen(false)}></div>
-          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-2xl min-h-[400px] overflow-visible relative z-10 animate-in fade-in zoom-in-95 duration-200 shadow-xl flex flex-col">
+          <div className="bg-white rounded-2xl border border-gray-200 w-full max-w-2xl min-h-[400px] max-h-[calc(100vh-2rem)] overflow-y-auto relative z-10 animate-in fade-in zoom-in-95 duration-200 flex flex-col">
             <div className="px-6 py-5 border-b border-gray-100 flex justify-between items-start bg-gray-50/50 rounded-t-2xl">
               <div>
-                <h3 className="text-lg font-bold text-gray-900 mt-1">添加模型</h3>
+                <h3 className="text-lg font-bold text-gray-900 mt-1">{t('settings.models.addModelTitle')}</h3>
                 <div className="text-xs text-gray-500 mt-1">
-                  选择端点并选择模型 ID，注意：
+                  {t('settings.models.addModelIntro')}
                   <div className="text-red-500 font-bold mt-1 space-y-0.5 leading-relaxed">
-                    <p>1）自动拉取模型不一定准确，可参考平台官方文档，手动输入模型ID添加。</p>
-                    <p>2）检测模型，也会消耗 Token！</p>
+                    <p>{t('settings.models.addModelNoteAutoFetch')}</p>
+                    <p>{t('settings.models.addModelNoteTestConsumesToken')}</p>
                   </div>
                 </div>
               </div>
               <button 
                 onClick={() => setIsAddModelModalOpen(false)}
                 className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
-                title="关闭"
+                title={t('common.close')}
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1855,28 +2856,23 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
             
             <div className="p-6 space-y-5 flex-1 overflow-visible flex flex-col">
               {addModelError && (
-                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-center gap-2">
-                  <X className="w-4 h-4 shrink-0" />
-                  {addModelError}
-                </div>
-              )}
-              {addModelTestStatus !== 'idle' && (
-                <div className={`p-3 text-sm rounded-xl border flex items-center gap-2 animate-in fade-in duration-300 ${
-                  addModelTestStatus === 'testing' ? 'bg-blue-50 text-blue-600 border-blue-100' :
-                  addModelTestStatus === 'success' ? 'bg-green-50 text-green-600 border-green-100' :
-                  'bg-red-50 text-red-600 border-red-100'
-                }`}>
-                  {addModelTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin shrink-0" /> :
-                    addModelTestStatus === 'success' ? <Check className="w-4 h-4 shrink-0" /> :
-                    <X className="w-4 h-4 shrink-0" />}
-                  {addModelTestMessage}
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl border border-red-100 flex items-start gap-2">
+                  <X className="w-4 h-4 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div>{addModelError}</div>
+                    {addModelErrorDetail && (
+                      <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {addModelErrorDetail}
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-5 z-[210]">
                 <div className="relative">
                   <label className="block text-sm font-medium text-gray-900 mb-1.5">
-                    所属端点 <span className="text-red-500">*</span>
+                    {t('settings.models.endpointLabel')} <span className="text-red-500">*</span>
                   </label>
                   <div className="relative">
                     <input
@@ -1891,7 +2887,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         setEndpointSearchQuery('');
                         setIsEndpointDropdownOpen(true);
                       }}
-                      placeholder={newModelEndpoint ? newModelEndpoint : "点击选择或输入端点"}
+                      placeholder={newModelEndpoint ? newModelEndpoint : t('settings.models.endpointPlaceholder')}
                       className="w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl focus:bg-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 outline-none transition-all text-sm font-mono text-gray-900 pr-8"
                     />
                     {newModelEndpoint && (
@@ -1904,7 +2900,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           setIsEndpointDropdownOpen(false);
                         }}
                         className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-all"
-                        title="清除"
+                        title={t('common.clear')}
                       >
                         <X className="w-3.5 h-3.5" />
                       </button>
@@ -1919,7 +2915,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           handleDiscoverModels(endpointSearchQuery.trim());
                         }
                       }} />
-                      <div className="absolute z-[20] top-full left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl max-h-[160px] overflow-y-auto shadow-lg">
+                      <div className="absolute z-[20] top-full left-0 right-0 mt-1 bg-white border border-gray-200 rounded-xl max-h-[160px] overflow-y-auto">
                         {knownEndpoints
                           .filter(ep => {
                             if (!endpointSearchQuery) return true;
@@ -1935,9 +2931,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                                 setEndpointSearchQuery('');
                                 setIsEndpointDropdownOpen(false);
                               }}
-                              className={`w-full text-left px-4 py-2 text-sm hover:bg-blue-50 transition-colors flex items-center gap-2 ${
-                                newModelEndpoint === ep ? 'bg-blue-50 text-blue-600' : 'text-gray-700'
-                              }`}
+                              className={`w-full text-left px-4 py-2 text-sm hover:bg-blue-50 transition-colors flex items-center gap-2 ${ newModelEndpoint === ep ? 'bg-blue-50 text-blue-600' : 'text-gray-700' }`}
                             >
                               <span className="font-mono text-xs max-w-[200px] truncate">{ep}</span>
                             </button>
@@ -1955,7 +2949,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                             }}
                             className="w-full text-left px-4 py-2 text-sm text-blue-600 hover:bg-blue-50 transition-colors border-t border-gray-100 bg-gray-50 flex items-center justify-between"
                           >
-                            <span>使用新端点: <strong className="font-mono">{endpointSearchQuery}</strong></span>
+                            <span>{t('settings.models.useNewEndpoint')} <strong className="font-mono">{endpointSearchQuery}</strong></span>
                             <Plus className="w-4 h-4" />
                           </button>
                         )}
@@ -1965,12 +2959,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                 </div>
                 
                 <div>
-                  <label className="block text-sm font-medium text-gray-900 mb-1.5">别名（可选）</label>
+                  <label className="block text-sm font-medium text-gray-900 mb-1.5">{t('settings.models.aliasOptionalLabel')}</label>
                   <input
                     type="text"
                     value={newModelAlias}
                     onChange={(e) => setNewModelAlias(e.target.value)}
-                    placeholder="例如: GPT 4O"
+                    placeholder={t('settings.models.aliasExamplePlaceholder')}
                     className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
                   />
                 </div>
@@ -1979,7 +2973,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
               <div className="flex-1 flex flex-col relative z-10" ref={dropdownRef}>
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="block text-sm font-medium text-gray-900">
-                    模型 ID <span className="text-red-500">*</span>
+                    {t('settings.models.modelIdLabel')} <span className="text-red-500">*</span>
                   </label>
                   <button
                     type="button"
@@ -1993,21 +2987,15 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                       }
                     }}
                     disabled={!newModelEndpoint.trim()}
-                    title={isDiscovering ? "正在拉取模型，点击可取消。" : ""}
-                    className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all border flex items-center gap-1.5 ${
-                      !newModelEndpoint.trim()
-                        ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
-                        : isDiscovering
-                        ? 'bg-blue-50 text-blue-600 border-blue-200 hover:bg-blue-100'
-                        : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-                    }`}
+                    title={isDiscovering ? t('settings.models.fetchingModelsTitle') : ""}
+                    className={`text-xs px-3 py-1.5 rounded-lg font-medium transition-all border flex items-center gap-1.5 ${ !newModelEndpoint.trim() ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : isDiscovering ? 'bg-blue-50 text-blue-600 border-blue-200 hover:bg-blue-100' : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50' }`}
                   >
                     {isDiscovering && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                     {isDiscovering 
-                      ? '自动拉取中...' 
+                      ? t('settings.models.autoFetching')
                       : (hasFetched && discoveredModels.length > 0) 
-                        ? '手动输入' 
-                        : '自动拉取'
+                        ? t('settings.models.manualInput')
+                        : t('settings.models.autoFetch')
                     }
                   </button>
                 </div>
@@ -2025,8 +3013,12 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                     onChange={(e) => {
                       setNewModelName(e.target.value);
                       setModelSearchQuery(e.target.value);
+                      // Auto-detect capabilities when user types a model name
+                      if (e.target.value.trim()) {
+                        setNewModelInput(guessCapabilities(e.target.value.trim()));
+                      }
                     }}
-                    placeholder={!hasFetched ? '例如: gpt-4o (可点击上方连网拉取或手动输入)' : (discoveredModels.length > 0 ? `发现 ${discoveredModels.length} 个模型（点击或输入关键字过滤，也可以直接输入模型ID）` : '未拉取到模型，请手动输入')}
+                    placeholder={!hasFetched ? t('settings.models.modelPlaceholderNoFetch') : (discoveredModels.length > 0 ? t('settings.models.modelPlaceholderFetched', { count: discoveredModels.length }) : t('settings.models.modelPlaceholderEmpty'))}
                     className="bg-transparent border-none outline-none w-full text-sm placeholder-gray-400 py-1"
                     onFocus={() => {
                       if (hasFetched && discoveredModels.length > 0) {
@@ -2043,7 +3035,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                         setModelSearchQuery('');
                       }}
                       className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100 transition-all"
-                      title="清除"
+                      title={t('common.clear')}
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
@@ -2054,7 +3046,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   <>
                   <div className="fixed inset-0 z-[40]" onClick={(e) => { e.stopPropagation(); setIsModelDropdownOpen(false); }} />
                   <div 
-                    className="absolute z-50 left-0 right-0 top-[80px] bg-white border border-gray-200 rounded-xl shadow-2xl flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200"
+                    className="absolute z-50 left-0 right-0 top-[80px] bg-white border border-gray-200 rounded-xl flex flex-col overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200"
                     style={{ maxHeight: modelDropdownMaxHeight ? `${modelDropdownMaxHeight}px` : '350px' }}
                   >
                     {(() => {
@@ -2070,7 +3062,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           <div className="flex items-center justify-between px-3 py-2.5 border-b border-gray-100 bg-gray-50/95 backdrop-blur">
                             <span className="text-sm text-gray-700 font-semibold flex items-center gap-1.5">
                               <span className="w-2.5 h-2.5 rounded-full bg-green-500"></span>
-                              模型 ({visibleDiscoveredModels.length})
+                              {t('settings.models.modelListTitle', { count: visibleDiscoveredModels.length })}
                             </span>
                             
                             <div className="flex items-center gap-3">
@@ -2078,50 +3070,36 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                                 <button
                                   onClick={(e) => { e.stopPropagation(); setShowOnlyConnected(false); }}
                                   disabled={isAnyTesting}
-                                  className={`text-sm px-3 py-1.5 rounded-md font-medium transition-all border ${
-                                    !showOnlyConnected
-                                      ? 'bg-white text-gray-800 border-gray-200'
-                                      : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-200/50'
-                                  } ${isAnyTesting ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  className={`text-sm px-3 py-1.5 rounded-md font-medium transition-all border ${ !showOnlyConnected ? 'bg-white text-gray-800 border-gray-200' : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-200/50' } ${isAnyTesting ? 'opacity-50 cursor-not-allowed' : ''}`}
                                 >
-                                  全部
+                                  {t('settings.models.filterAll')}
                                 </button>
                                 <button
                                   onClick={(e) => { e.stopPropagation(); setShowOnlyConnected(true); }}
                                   disabled={isAnyTesting || !hasAnyTests}
-                                  className={`text-sm px-3 py-1.5 rounded-md font-medium transition-all border ${
-                                    showOnlyConnected
-                                      ? 'bg-white text-green-700 border-green-200'
-                                      : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-200/50'
-                                  } ${(isAnyTesting || !hasAnyTests) ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                  title={!hasAnyTests ? "尚未进行任何连通性检测" : ""}
+                                  className={`text-sm px-3 py-1.5 rounded-md font-medium transition-all border ${ showOnlyConnected ? 'bg-white text-green-700 border-green-200' : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-200/50' } ${(isAnyTesting || !hasAnyTests) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                  title={!hasAnyTests ? t('settings.models.noConnectivityTestsYet') : ""}
                                 >
-                                  有效
+                                  {t('settings.models.filterValid')}
                                 </button>
                               </div>
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
-                                  if (isAnyTesting) {
-                                    cancelTestAll();
-                                  } else {
-                                    handleTestAllFiltered();
-                                  }
-                                }}
-                                disabled={!isAnyTesting && visibleDiscoveredModels.length === 0}
-                                title={isAnyTesting ? "模型检测中，点击可取消检测" : ""}
-                                className={`text-sm flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition-all border ${
-                                  !isAnyTesting && visibleDiscoveredModels.length === 0
-                                    ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
-                                    : isAnyTesting
-                                    ? 'text-red-600 bg-red-50 hover:bg-red-100 border-red-200'
-                                    : 'text-indigo-700 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border-indigo-200'
-                                }`}
-                              >
-                                {isAnyTesting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                                {isAnyTesting
-                                  ? `检测中（${Object.values(individualTestStatus).filter(t => t.status === 'testing').length}）`
-                                  : '检测'
+                                if (isAnyTesting) {
+                                  cancelTestAll();
+                                } else {
+                                  handleTestAllFiltered();
+                                }
+                              }}
+                              disabled={!isAnyTesting && visibleDiscoveredModels.length === 0}
+                              title={isAnyTesting ? t('settings.models.fetchingModelsTitle') : ""}
+                              className={`text-sm flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-medium transition-all border ${ !isAnyTesting && visibleDiscoveredModels.length === 0 ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : isAnyTesting ? 'text-red-600 bg-red-50 hover:bg-red-100 border-red-200' : 'text-indigo-700 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 border-indigo-200' }`}
+                            >
+                              {isAnyTesting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                              {isAnyTesting
+                                  ? t('settings.models.testingCount', { count: Object.values(individualTestStatus).filter(t => t.status === 'testing').length })
+                                  : t('settings.models.testModels')
                                 }
                               </button>
                             </div>
@@ -2130,7 +3108,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                           <div className="overflow-y-auto flex-1 p-1.5 space-y-0.5 min-h-[100px]" onClick={() => setIsModelDropdownOpen(false)}>
                             {visibleDiscoveredModels.length === 0 && (
                               <div className="py-8 text-center text-gray-400 text-sm">
-                                {showOnlyConnected ? '没有找到检测成功的模型' : `未能找到匹配 "${modelSearchQuery}" 的模型`}
+                                {showOnlyConnected ? t('settings.models.noValidModelsFound') : t('settings.models.noMatchingModels', { query: modelSearchQuery })}
                               </div>
                             )}
                             {visibleDiscoveredModels.map(m => {
@@ -2141,10 +3119,7 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                               return (
                                 <div 
                                   key={m}
-                                  className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm transition-all ${
-                                    isExisting ? 'opacity-60 bg-gray-50/50 cursor-not-allowed' :
-                                    isSelected ? 'bg-blue-50/80 border-blue-100 font-medium cursor-pointer shadow-sm' : 'hover:bg-gray-100 cursor-pointer border-transparent'
-                                  } border`}
+                                  className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm transition-all ${ isExisting ? 'opacity-60 bg-gray-50/50 cursor-not-allowed' : isSelected ? 'bg-blue-50/80 border-blue-100 font-medium cursor-pointer ' : 'hover:bg-gray-100 cursor-pointer border-transparent' } border`}
                                   onClick={(e) => {
                                     if (isExisting) return;
                                     e.preventDefault();
@@ -2153,26 +3128,28 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                                     } else {
                                       setNewModelName(m);
                                       setIsModelDropdownOpen(false);
+                                      // Auto-detect capabilities when a model is selected from dropdown
+                                      setNewModelInput(guessCapabilities(m));
                                     }
                                   }}
                                 >
                                   <div className="flex items-center gap-3 overflow-hidden flex-1">
                                     <span className={`truncate ${isSelected ? 'text-blue-900' : 'text-gray-700'}`} title={m}>{m}</span>
-                                    {isExisting && <span className="text-[10px] bg-gray-200 text-gray-600 px-2 py-0.5 rounded-full ml-1 shrink-0 font-medium">已在使用</span>}
+                                    {isExisting && <span className="text-[10px] bg-gray-200 text-gray-600 px-2 py-0.5 rounded-full ml-1 shrink-0 font-medium">{t('settings.models.alreadyInUse')}</span>}
                                   </div>
 
                                   {!isExisting && (
                                     <div className="flex items-center gap-2 shrink-0 ml-3" onClick={e => e.stopPropagation()}>
                                       {testData?.status === 'testing' && <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin" />}
-                                      {testData?.status === 'success' && <span title="有效"><Check className="w-3.5 h-3.5 text-green-500" /></span>}
-                                      {testData?.status === 'error' && <span title={testData.message}><X className="w-3.5 h-3.5 text-red-500" /></span>}
+                                      {testData?.status === 'success' && <span title={t('settings.models.valid')}><Check className="w-3.5 h-3.5 text-green-500" /></span>}
+                                      {testData?.status === 'error' && <span title={testData.detail || testData.message}><X className="w-3.5 h-3.5 text-red-500" /></span>}
                                       
                                       <button 
                                         onClick={(e) => handleTestSingleModel(m, e)}
                                         className="text-xs text-gray-500 hover:text-indigo-600 px-2 py-1 border border-gray-200 rounded hover:bg-gray-50 transition-colors"
-                                        title="独立检测此模型"
+                                        title={t('settings.models.testSingleModel')}
                                       >
-                                        检测
+                                        {t('common.test')}
                                       </button>
                                     </div>
                                   )}
@@ -2187,32 +3164,65 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   </>
                 )}
               </div>
+
+              {/* Model Capabilities Section */}
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <label className="block text-sm font-medium text-gray-900">{t('settings.models.capabilitiesLabel')}</label>
+                  <span className="text-xs text-gray-400">{t('settings.models.capabilitiesHint')}</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {CAPABILITIES.map(cap => {
+                    const active = newModelInput.includes(cap.id);
+                    return (
+                      <button
+                        key={cap.id}
+                        type="button"
+                        onClick={() => setNewModelInput(prev =>
+                          prev.includes(cap.id) ? prev.filter(i => i !== cap.id) : [...prev, cap.id]
+                        )}
+                        className={`inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${ active ? 'text-blue-600 bg-blue-50 border-blue-200' : 'text-gray-400 bg-gray-50 border-gray-200 hover:bg-gray-100' }`}
+                      >
+                        <cap.Icon className="w-3.5 h-3.5" />
+                        {cap.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
 
-            <div className="p-5 bg-gray-50 flex gap-3 border-t border-gray-100 rounded-b-2xl justify-end">
+            <div className="p-4 bg-gray-50 flex gap-3 border-t border-gray-100 rounded-b-2xl">
               <button
                 type="button"
                 onClick={() => setIsAddModelModalOpen(false)}
-                className="px-5 py-2.5 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 rounded-xl font-semibold transition-all"
+                className="flex-[0.5] px-3 py-2.5 text-gray-700 bg-white border border-gray-200 hover:bg-gray-50 rounded-xl font-semibold transition-all text-sm whitespace-nowrap"
               >
-                取消
+                {t('common.cancel')}
               </button>
               <button
                 type="button"
                 onClick={handleTestModel}
                 disabled={addModelTestStatus === 'testing' || !newModelEndpoint.trim() || !newModelName.trim()}
-                className="px-5 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 rounded-xl font-semibold transition-all disabled:opacity-50 flex items-center gap-2"
+                className={`flex-[1.5] px-3 py-2.5 rounded-xl font-semibold transition-all flex items-center justify-center gap-1.5 disabled:opacity-50 text-sm overflow-hidden ${ addModelTestStatus === 'testing' ? 'bg-blue-50 text-blue-600 border border-blue-200' : addModelTestStatus === 'success' ? 'bg-green-50 text-green-600 border border-green-200' : addModelTestStatus === 'error' ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:text-indigo-800 hover:bg-indigo-100' }`}
+                title={addModelTestStatus !== 'idle' ? addModelTestMessage : t('settings.models.testThisModel')}
               >
-                {addModelTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin" /> : '检测'}
+                {addModelTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin shrink-0" /> :
+                 addModelTestStatus === 'success' ? <Check className="w-4 h-4 shrink-0" /> :
+                 addModelTestStatus === 'error' ? <X className="w-4 h-4 shrink-0" /> :
+                 <Activity className="w-4 h-4 shrink-0" />}
+                <span className="truncate">
+                  {addModelTestStatus === 'idle' ? t('common.test') : addModelTestMessage}
+                </span>
               </button>
               <button
                 type="button"
                 onClick={() => handleAddModel()}
                 disabled={isLoading || addModelTestStatus === 'testing' || !newModelEndpoint.trim() || !newModelName.trim()}
-                className="px-6 py-2.5 text-white bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all disabled:opacity-50 flex items-center gap-2 shadow-sm"
+                className="flex-[0.8] px-3 py-2.5 text-white bg-blue-600 hover:bg-blue-700 rounded-xl font-semibold transition-all disabled:opacity-50 flex items-center justify-center gap-2 text-sm whitespace-nowrap"
               >
                 {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                添加
+                {t('settings.models.add')}
               </button>
             </div>
           </div>
@@ -2220,17 +3230,17 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
       )}
       {showForceAddModal && (
         <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
-          <div className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+          <div className="bg-white rounded-2xl w-full max-w-md max-h-[calc(100vh-2rem)] overflow-y-auto animate-in zoom-in-95 duration-200">
             <div className="p-6">
-              <h3 className="text-xl font-bold text-gray-900 mb-2">模型连通性检测失败</h3>
+              <h3 className="text-xl font-bold text-gray-900 mb-2">{t('settings.models.forceAddTitle')}</h3>
               <p className="text-sm text-gray-700 mb-6 bg-red-50 p-3 rounded-lg border border-red-100">{testModelMessage}</p>
-              <p className="text-sm text-gray-600 mb-6">该模型似乎无法正确访问。确定要强行将其加入系统吗？</p>
+              <p className="text-sm text-gray-600 mb-6">{t('settings.models.forceAddDescription')}</p>
               <div className="flex items-center justify-end gap-3">
                 <button
                   onClick={() => setShowForceAddModal(false)}
                   className="px-5 py-2.5 rounded-xl text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 transition-colors cursor-pointer"
                 >
-                  取消
+                  {t('common.cancel')}
                 </button>
                 <button
                   onClick={() => {
@@ -2239,9 +3249,32 @@ export default function SettingsView({ settingsTab, onMenuClick }: SettingsViewP
                   }}
                   className="px-5 py-2.5 rounded-xl text-sm font-medium text-white bg-red-600 hover:bg-red-700 transition-colors cursor-pointer"
                 >
-                  强制添加
+                  {t('settings.models.forceAdd')}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Gateway Error Modal */}
+      {gatewayErrorModalOpen && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity animate-in fade-in duration-200" onClick={() => setGatewayErrorModalOpen(false)}></div>
+          <div className="bg-white rounded-[32px] border border-gray-200 w-full max-w-[420px] max-h-[calc(100vh-2rem)] overflow-y-auto relative z-10 animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-8 text-center">
+	              <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-3xl bg-red-50 mb-6 border border-red-100"><X className="h-8 w-8 text-red-500" /></div>
+	              <h3 className="text-xl font-black text-gray-900 mb-2 tracking-tight">{t('settings.gateway.configErrorTitle')}</h3>
+	              <p className="text-sm text-gray-500 leading-relaxed px-2">{gatewayErrorMessage}</p>
+                {gatewayErrorDetail && (
+                  <div className="mt-4 text-left bg-gray-50 border border-gray-200 rounded-2xl px-4 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-wider text-gray-400 mb-1.5">{t('settings.gateway.errorDetailLabel')}</p>
+                    <p className="text-xs text-gray-500 whitespace-pre-wrap break-all font-mono">{gatewayErrorDetail}</p>
+                  </div>
+                )}
+	            </div>
+            <div className="p-5 bg-gray-50/80 border-t border-gray-100">
+              <button type="button" onClick={() => setGatewayErrorModalOpen(false)} className="w-full px-4 py-3 text-white bg-blue-600 hover:bg-blue-700 active:scale-95 rounded-2xl font-bold text-sm transition-all">{t('common.gotIt')}</button>
             </div>
           </div>
         </div>

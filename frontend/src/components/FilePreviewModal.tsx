@@ -1,5 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { X, Download, Loader2 } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
+
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -18,9 +23,49 @@ interface FilePreviewModalProps {
   onClose: () => void;
 }
 
+const TEXT_SELECTION_STYLE = {
+  userSelect: 'text' as const,
+  WebkitUserSelect: 'text' as const,
+  WebkitTouchCallout: 'default' as const,
+};
+
+function buildRenderedHtmlDocument(content: string): string {
+  return `
+    <style>
+      .preview-root {
+        color: #1f2937;
+        line-height: 1.7;
+        font-size: 15px;
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      .preview-root h1 { font-size: 24px; font-weight: 800; margin: 24px 0 12px; color: #111827; }
+      .preview-root h2 { font-size: 20px; font-weight: 700; margin: 20px 0 10px; color: #1f2937; }
+      .preview-root h3 { font-size: 17px; font-weight: 600; margin: 16px 0 8px; color: #374151; }
+      .preview-root p { margin: 8px 0; }
+      .preview-root ul, .preview-root ol { padding-left: 24px; margin: 8px 0; }
+      .preview-root li { margin: 4px 0; }
+      .preview-root table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
+      .preview-root th, .preview-root td { border: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
+      .preview-root th { background: #f9fafb; font-weight: 600; color: #374151; }
+      .preview-root tr:nth-child(even) { background: #fafbfc; }
+      .preview-root tr:hover { background: #f0f4ff; }
+      .preview-root img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; }
+      .preview-root a { color: #2563eb; text-decoration: none; }
+      .preview-root a:hover { text-decoration: underline; }
+      .preview-root blockquote { border-left: 3px solid #d1d5db; padding-left: 16px; margin: 12px 0; color: #6b7280; }
+      .preview-root pre, .preview-root code {
+        user-select: text;
+        -webkit-user-select: text;
+      }
+    </style>
+    <div class="preview-root">${content}</div>
+  `;
+}
+
 type PreviewState = 
   | { status: 'loading' }
-  | { status: 'ready'; type: 'image' | 'pdf' | 'html' | 'text' | 'code' | 'unsupported'; content?: string; pdfUrl?: string }
+  | { status: 'ready'; type: 'image' | 'video' | 'audio' | 'pdf' | 'html' | 'text' | 'code' | 'unsupported'; content?: string; pdfUrl?: string; pdfData?: Uint8Array }
   | { status: 'error'; message: string };
 
 // Cache capabilities result
@@ -42,6 +87,8 @@ function getFileType(filename: string): string {
   const cleanName = filename.replace(/[\uff08（(].*$/, '').trim();
   const ext = cleanName.split('.').pop()?.toLowerCase() || '';
   if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico'].includes(ext)) return 'image';
+  if (['mp4', 'webm', 'ogg', 'mov', 'avi'].includes(ext)) return 'video';
+  if (['mp3', 'flac', 'wav', 'm4a', 'aac', 'opus'].includes(ext)) return 'audio';
   if (ext === 'pdf') return 'pdf';
   if (['doc', 'docx'].includes(ext)) return 'docx';
   if (['xls', 'xlsx'].includes(ext)) return 'xlsx';
@@ -52,6 +99,16 @@ function getFileType(filename: string): string {
   return 'unknown';
 }
 
+function getFileExtension(filename: string): string {
+  const cleanName = filename.replace(/[\uff08（(].*$/, '').trim();
+  return cleanName.split('.').pop()?.toLowerCase() || '';
+}
+
+function getDefaultViewMode(filename: string): 'source' | 'render' {
+  const ext = getFileExtension(filename);
+  return ['md', 'markdown', 'html', 'htm'].includes(ext) ? 'render' : 'source';
+}
+
 function extractPathParam(url: string): string | null {
   try {
     const match = url.match(/[?&]path=([^&]+)/);
@@ -59,6 +116,51 @@ function extractPathParam(url: string): string | null {
   } catch {
     return null;
   }
+}
+
+function buildPreviewUrl(url: string): string {
+  const pathParam = extractPathParam(url);
+  if (pathParam && url.startsWith('/api/files/download')) {
+    return `/api/files/preview?path=${pathParam}&mode=source`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    const filenameInUrl = url.split('/').pop();
+    if (filenameInUrl) {
+      const rawFilename = decodeURIComponent(filenameInUrl);
+      return `/api/files/preview?filename=${encodeURIComponent(rawFilename)}&mode=source`;
+    }
+  }
+
+  return url;
+}
+
+function buildPreviewDataUrl(url: string, mode: 'source' | 'converted' = 'source'): string | null {
+  const pathParam = extractPathParam(url);
+  if (pathParam && url.startsWith('/api/files/download')) {
+    return `/api/files/preview-data?path=${pathParam}&mode=${mode}`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    const filenameInUrl = url.split('/').pop();
+    if (filenameInUrl) {
+      const rawFilename = decodeURIComponent(filenameInUrl);
+      return `/api/files/preview-data?filename=${encodeURIComponent(rawFilename)}&mode=${mode}`;
+    }
+  }
+
+  return null;
+}
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const normalized = base64.trim();
+  const binary = window.atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return bytes;
 }
 
 // Zoomable Wrapper for mobile pinch-to-zoom using react-zoom-pan-pinch
@@ -120,11 +222,13 @@ function ZoomableWrapper({ children, center = false }: { children: React.ReactNo
 }
 
 // PDF Canvas Viewer — renders each page as a canvas (works on mobile)
-function PdfCanvasViewer({ pdfUrl }: { pdfUrl: string }) {
+function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8Array }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [pageCount, setPageCount] = useState(0);
+   const [pageCount, setPageCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const { t } = useTranslation();
+
 
   useEffect(() => {
     let cancelled = false;
@@ -132,7 +236,11 @@ function PdfCanvasViewer({ pdfUrl }: { pdfUrl: string }) {
       try {
         setLoading(true);
         setError('');
-        const pdf = await pdfjsLib.getDocument(pdfUrl).promise;
+        const source = pdfData ? { data: pdfData } : pdfUrl;
+        if (!source) {
+          throw new Error(t('filePreview.loadPdfFail'));
+        }
+        const pdf = await pdfjsLib.getDocument(source as any).promise;
         if (cancelled) return;
         setPageCount(pdf.numPages);
 
@@ -178,15 +286,16 @@ function PdfCanvasViewer({ pdfUrl }: { pdfUrl: string }) {
         }
         setLoading(false);
       } catch (err: any) {
-        if (!cancelled) {
-          setError(err.message || '无法加载 PDF');
+         if (!cancelled) {
+          setError(err.message || t('filePreview.loadPdfFail'));
           setLoading(false);
         }
+
       }
     };
     loadPdf();
     return () => { cancelled = true; };
-  }, [pdfUrl]);
+  }, [pdfData, pdfUrl, t]);
 
   if (error) {
     return (
@@ -200,27 +309,37 @@ function PdfCanvasViewer({ pdfUrl }: { pdfUrl: string }) {
   }
 
   return (
-    <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative shadow-sm min-h-[400px]">
+    <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[400px]">
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
           <div className="flex flex-col items-center gap-3 text-gray-500">
-            <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-            <span className="text-sm font-medium">正在渲染文档...</span>
+             <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+            <span className="text-sm font-medium">{t('filePreview.renderingDoc')}</span>
           </div>
+
         </div>
       )}
       <div ref={containerRef} className="p-4" />
       {!loading && pageCount > 0 && (
-        <div className="sticky bottom-0 bg-white/90 backdrop-blur-sm border-t border-gray-100 px-4 py-2 text-center text-xs text-gray-400 font-medium">
-          共 {pageCount} 页
+         <div className="sticky bottom-0 bg-white/90 backdrop-blur-sm border-t border-gray-100 px-4 py-2 text-center text-xs text-gray-400 font-medium">
+          {t('filePreview.totalPages', { count: pageCount })}
         </div>
+
       )}
     </div>
   );
 }
 
-export default function FilePreviewModal({ url, filename, onClose }: FilePreviewModalProps) {
+ export default function FilePreviewModal({ url, filename, onClose }: FilePreviewModalProps) {
   const [preview, setPreview] = useState<PreviewState>({ status: 'loading' });
+  const [viewMode, setViewMode] = useState<'source' | 'render'>(() => getDefaultViewMode(filename));
+  const { t } = useTranslation();
+  const previewUrl = buildPreviewUrl(url);
+
+  useEffect(() => {
+    setViewMode(getDefaultViewMode(filename));
+  }, [filename, url]);
+
 
   // --- History API Integration for Mobile Back Gesture ---
   useEffect(() => {
@@ -253,21 +372,23 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
   async function loadPreview() {
     try {
       // Proactive check to ensure file exists before attempting any rendering logic
-      const headResponse = await fetch(url, { method: 'HEAD' });
-      if (!headResponse.ok) {
+      const headResponse = await fetch(previewUrl, { method: 'HEAD' });
+       if (!headResponse.ok) {
         if (headResponse.status === 404) {
-          setPreview({ status: 'error', message: '文件未找到或已被删除' });
+          setPreview({ status: 'error', message: t('filePreview.fileNotFound') });
           return;
         }
+
         // If it's another error (like 500), we still let it try the specific loaders 
-        // which might have better error handling, or we can just throw here.
+         // which might have better error handling, or we can just throw here.
         // Let's throw to be safe and clear.
-        throw new Error(`无法访问文件 (${headResponse.status})`);
+        throw new Error(t('filePreview.accessFail', { status: headResponse.status }));
       }
     } catch (err: any) {
-      setPreview({ status: 'error', message: err.message || '网络请求失败，文件不可访问' });
+      setPreview({ status: 'error', message: err.message || t('filePreview.networkFail') });
       return;
     }
+
 
     const fileType = getFileType(filename);
 
@@ -275,8 +396,14 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
       case 'image':
         setPreview({ status: 'ready', type: 'image' });
         return;
+      case 'video':
+        setPreview({ status: 'ready', type: 'video' });
+        return;
+      case 'audio':
+        setPreview({ status: 'ready', type: 'audio' });
+        return;
       case 'pdf':
-        setPreview({ status: 'ready', type: 'pdf' });
+        await loadPdfData('source');
         return;
       case 'docx':
       case 'xlsx':
@@ -297,25 +424,8 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
     const caps = await getCapabilities();
 
     if (caps.libreoffice) {
-      const pathParam = extractPathParam(url);
-      if (pathParam) {
-        const previewUrl = `/api/files/preview?path=${pathParam}`;
-        setPreview({ status: 'ready', type: 'pdf', pdfUrl: previewUrl });
-        return;
-      }
-      
-      // Support for /uploads/filename
-      if (url.startsWith('/uploads/')) {
-        const filenameInUrl = url.split('/').pop();
-        if (filenameInUrl) {
-          // The filename in URL is likely already encoded by the browser/server.
-          // We decode it first to get the raw name, then encode it for the query param.
-          const rawFilename = decodeURIComponent(filenameInUrl);
-          const previewUrl = `/api/files/preview?filename=${encodeURIComponent(rawFilename)}`;
-          setPreview({ status: 'ready', type: 'pdf', pdfUrl: previewUrl });
-          return;
-        }
-      }
+      await loadPdfData('converted');
+      return;
     }
 
     switch (fileType) {
@@ -332,22 +442,53 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
   }
 
   async function loadDocxFallback() {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(response.status === 404 ? '文件未找到或已被删除' : `加载失败 (${response.status})`);
+     try {
+      const response = await fetch(previewUrl);
+      if (!response.ok) throw new Error(response.status === 404 ? t('filePreview.fileNotFound') : t('filePreview.loadFailStatus', { status: response.status }));
       const arrayBuffer = await response.arrayBuffer();
+
       const result = await mammoth.convertToHtml({ arrayBuffer });
-      setPreview({ status: 'ready', type: 'html', content: result.value });
+       setPreview({ status: 'ready', type: 'html', content: result.value });
     } catch (err: any) {
-      setPreview({ status: 'error', message: `无法预览 Word 文档: ${err.message}` });
+      setPreview({ status: 'error', message: t('filePreview.previewWordFail', { message: err.message }) });
+    }
+
+  }
+
+  async function loadPdfData(mode: 'source' | 'converted') {
+    try {
+      const dataUrl = buildPreviewDataUrl(url, mode);
+      if (!dataUrl) {
+        throw new Error(t('filePreview.loadPdfFail'));
+      }
+
+      const response = await fetch(dataUrl);
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message = payload?.message || payload?.error || t('filePreview.loadPdfFail');
+        throw new Error(message);
+      }
+
+      if (!payload?.data || typeof payload.data !== 'string') {
+        throw new Error(t('filePreview.loadPdfFail'));
+      }
+
+      setPreview({
+        status: 'ready',
+        type: 'pdf',
+        pdfData: decodeBase64ToBytes(payload.data),
+      });
+    } catch (err: any) {
+      setPreview({ status: 'error', message: err.message || t('filePreview.loadPdfFail') });
     }
   }
 
   async function loadXlsxFallback() {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(response.status === 404 ? '文件未找到或已被删除' : `加载失败 (${response.status})`);
+     try {
+      const response = await fetch(previewUrl);
+      if (!response.ok) throw new Error(response.status === 404 ? t('filePreview.fileNotFound') : t('filePreview.loadFailStatus', { status: response.status }));
       const arrayBuffer = await response.arrayBuffer();
+
       const workbook = XLSX.read(arrayBuffer, { type: 'array' });
       
       const htmlParts: string[] = [];
@@ -359,17 +500,19 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
         );
       });
 
-      setPreview({ status: 'ready', type: 'html', content: htmlParts.join('') });
+       setPreview({ status: 'ready', type: 'html', content: htmlParts.join('') });
     } catch (err: any) {
-      setPreview({ status: 'error', message: `无法预览表格文件: ${err.message}` });
+      setPreview({ status: 'error', message: t('filePreview.previewExcelFail', { message: err.message }) });
     }
+
   }
 
   async function loadText(type: 'text' | 'code') {
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(response.status === 404 ? '文件未找到或已被删除' : `加载失败 (${response.status})`);
+     try {
+      const response = await fetch(previewUrl);
+      if (!response.ok) throw new Error(response.status === 404 ? t('filePreview.fileNotFound') : t('filePreview.loadFailStatus', { status: response.status }));
       const buffer = await response.arrayBuffer();
+
       
       let decoder = new TextDecoder('utf-8', { fatal: true });
       let text = '';
@@ -379,11 +522,12 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
         decoder = new TextDecoder('gbk');
         text = decoder.decode(buffer);
       }
-      
+       
       setPreview({ status: 'ready', type, content: text });
     } catch (err: any) {
-      setPreview({ status: 'error', message: `无法预览文本文件: ${err.message}` });
+      setPreview({ status: 'error', message: t('filePreview.previewTextFail', { message: err.message }) });
     }
+
   }
 
   function handleDownload() {
@@ -396,6 +540,12 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
   }
 
   const ext = filename.split('.').pop()?.toUpperCase() || '';
+  const normalizedExt = getFileExtension(filename);
+  const supportsRenderToggle = ['md', 'markdown', 'html', 'htm'].includes(normalizedExt);
+  const isMarkdownFile = ['md', 'markdown'].includes(normalizedExt);
+  const isHtmlFile = ['html', 'htm'].includes(normalizedExt);
+  const isRenderedMode = supportsRenderToggle && viewMode === 'render';
+  const renderedHtmlDocument = buildRenderedHtmlDocument(preview.status === 'ready' ? (preview.content || '') : '');
   const { Icon, typeText, bgColor } = getFileIconInfo(filename);
 
   return (
@@ -409,7 +559,7 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-3 min-w-0">
-          <div className={`hidden sm:flex w-8 h-8 rounded-lg ${bgColor} items-center justify-center flex-shrink-0 text-white border border-black/5 shadow-sm`}>
+          <div className={`hidden sm:flex w-8 h-8 rounded-lg ${bgColor} items-center justify-center flex-shrink-0 text-white border border-black/5`}>
             <Icon className="w-4 h-4" />
           </div>
           <div className="min-w-0">
@@ -418,15 +568,42 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {supportsRenderToggle && (
+            <div className="flex items-center h-9 rounded-xl border border-gray-200 bg-gray-200/80 p-1">
+              <button
+                type="button"
+                onClick={() => setViewMode('source')}
+                className={`h-full rounded-lg px-3 text-xs transition-colors ${
+                  !isRenderedMode
+                    ? 'bg-white text-gray-900 font-semibold border border-gray-200'
+                    : 'font-normal text-gray-500 hover:text-gray-700 hover:font-semibold'
+                }`}
+              >
+                {t('filePreview.viewSource')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('render')}
+                className={`h-full rounded-lg px-3 text-xs transition-colors ${
+                  isRenderedMode
+                    ? 'bg-white text-gray-900 font-semibold border border-gray-200'
+                    : 'font-normal text-gray-500 hover:text-gray-700 hover:font-semibold'
+                }`}
+              >
+                {t('filePreview.viewRendered')}
+              </button>
+            </div>
+          )}
 
 
-          <button 
+           <button 
             onClick={handleDownload}
-            className="h-9 flex items-center gap-1.5 px-4 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold transition-all border border-gray-200"
+            className="w-9 h-9 sm:w-auto flex items-center justify-center sm:gap-1.5 sm:px-4 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold transition-all border border-gray-200"
           >
             <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">下载</span>
+            <span className="hidden sm:inline">{t('common.download')}</span>
           </button>
+
           <button 
             onClick={handleClose}
             className="w-9 h-9 flex items-center justify-center rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition-all border border-gray-200"
@@ -441,12 +618,13 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
         className="flex-1 flex items-center justify-center p-0 sm:p-6 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {preview.status === 'loading' && (
+         {preview.status === 'loading' && (
           <div className="flex flex-col items-center gap-4 text-gray-500">
             <Loader2 className="w-10 h-10 animate-spin text-blue-500" />
-            <p className="text-sm font-medium">正在加载预览...</p>
+            <p className="text-sm font-medium">{t('filePreview.loadingPreview')}</p>
           </div>
         )}
+
 
         {preview.status === 'error' && (
           <div className="flex flex-col items-center gap-4 text-gray-600 bg-white p-8 rounded-3xl max-w-md text-center">
@@ -456,70 +634,108 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
             <p className="text-sm font-medium">{preview.message}</p>
             <button
               onClick={handleClose}
-              className="px-8 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-xl text-white text-sm font-bold transition-all flex items-center gap-2"
+               className="px-8 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-xl text-white text-sm font-bold transition-all flex items-center gap-2"
             >
-              关闭
+              {t('common.close')}
             </button>
+
           </div>
         )}
 
         {preview.status === 'ready' && preview.type === 'image' && (
           <ZoomableWrapper center>
             <div className="p-4 flex items-center justify-center min-h-full">
-              <img 
-                src={url} 
+                <img 
+                src={previewUrl} 
                 alt={filename}
-                className="max-w-full max-h-[80vh] object-contain rounded-xl border-4 border-white shadow-lg"
+                className="max-w-full max-h-[80vh] object-contain rounded-xl border-4 border-white"
               />
             </div>
           </ZoomableWrapper>
         )}
 
+        {preview.status === 'ready' && preview.type === 'video' && (
+          <div className="p-4 flex items-center justify-center min-h-full w-full max-w-5xl mx-auto">
+            <video 
+              src={previewUrl} 
+              controls 
+              autoPlay
+              playsInline
+              className="max-w-full max-h-[80vh] rounded-xl shadow-2xl bg-black border-4 border-white"
+            >
+              {t('common.browserNotSupportVideo')}
+            </video>
+          </div>
+        )}
+
+        {preview.status === 'ready' && preview.type === 'audio' && (
+          <div className="p-4 flex items-center justify-center min-h-full w-full max-w-3xl mx-auto">
+            <div className="w-full rounded-2xl border border-gray-200 bg-white p-6 sm:p-8">
+              <audio
+                src={previewUrl}
+                controls
+                autoPlay
+                preload="metadata"
+                className="w-full"
+              >
+                {t('common.browserNotSupportAudio')}
+              </audio>
+            </div>
+          </div>
+        )}
+
         {preview.status === 'ready' && preview.type === 'pdf' && (
           <ZoomableWrapper>
-            <PdfCanvasViewer pdfUrl={preview.pdfUrl || url} />
+            <PdfCanvasViewer pdfUrl={preview.pdfUrl || previewUrl} pdfData={preview.pdfData} />
           </ZoomableWrapper>
         )}
 
-        {preview.status === 'ready' && preview.type === 'html' && (
-          <ZoomableWrapper>
-            <div 
-              className="w-full max-w-5xl mx-auto overflow-hidden bg-white sm:rounded-2xl p-4 sm:p-10 sm:border border-gray-200 shadow-sm"
-              dangerouslySetInnerHTML={{ __html: `
-                <style>
-                  .preview-root { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1f2937; line-height: 1.7; font-size: 15px; }
-                  .preview-root h1 { font-size: 24px; font-weight: 800; margin: 24px 0 12px; color: #111827; }
-                  .preview-root h2 { font-size: 20px; font-weight: 700; margin: 20px 0 10px; color: #1f2937; }
-                  .preview-root h3 { font-size: 17px; font-weight: 600; margin: 16px 0 8px; color: #374151; }
-                  .preview-root p { margin: 8px 0; }
-                  .preview-root ul, .preview-root ol { padding-left: 24px; margin: 8px 0; }
-                  .preview-root li { margin: 4px 0; }
-                  .preview-root table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
-                  .preview-root th, .preview-root td { border: 1px solid #e5e7eb; padding: 8px 12px; text-align: left; }
-                  .preview-root th { background: #f9fafb; font-weight: 600; color: #374151; }
-                  .preview-root tr:nth-child(even) { background: #fafbfc; }
-                  .preview-root tr:hover { background: #f0f4ff; }
-                  .preview-root img { max-width: 100%; height: auto; border-radius: 8px; margin: 8px 0; }
-                  .preview-root a { color: #2563eb; text-decoration: none; }
-                  .preview-root a:hover { text-decoration: underline; }
-                  .preview-root blockquote { border-left: 3px solid #d1d5db; padding-left: 16px; margin: 12px 0; color: #6b7280; }
-                </style>
-                <div class="preview-root">${preview.content || ''}</div>
-              ` }}
+        {preview.status === 'ready' && preview.type === 'html' && !isHtmlFile && (
+          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+            <div
+              className="w-full max-w-5xl mx-auto overflow-hidden bg-white sm:rounded-2xl p-4 sm:p-10 sm:border border-gray-200 cursor-text"
+              style={TEXT_SELECTION_STYLE}
+              dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
             />
-          </ZoomableWrapper>
+          </div>
         )}
 
-        {preview.status === 'ready' && (preview.type === 'text' || preview.type === 'code') && (
-          <ZoomableWrapper>
-            <div className="w-full max-w-5xl mx-auto flex-1 bg-white sm:bg-slate-50 sm:rounded-2xl sm:border border-gray-200 shadow-sm">
-              <pre 
-                className="p-6 sm:p-10 leading-relaxed text-slate-800 font-mono whitespace-pre-wrap break-words transition-all duration-200"
+        {preview.status === 'ready' && isHtmlFile && isRenderedMode && (
+          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+            <div
+              className="w-full max-w-5xl mx-auto bg-white sm:bg-slate-50 sm:rounded-2xl sm:border border-gray-200 overflow-hidden p-4 sm:p-10 cursor-text"
+              style={TEXT_SELECTION_STYLE}
+              dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
+            />
+          </div>
+        )}
+
+        {preview.status === 'ready' && isMarkdownFile && isRenderedMode && (
+          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+            <div
+              className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 p-5 sm:p-10 cursor-text"
+              style={TEXT_SELECTION_STYLE}
+            >
+              <div className="prose prose-sm sm:prose-base max-w-none prose-slate break-words select-text">
+                <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                  {preview.content || ''}
+                </ReactMarkdown>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {preview.status === 'ready' && (preview.type === 'text' || preview.type === 'code') && !isRenderedMode && (
+          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+            <div className="w-full max-w-5xl mx-auto flex-1 bg-white sm:bg-slate-50 sm:rounded-2xl sm:border border-gray-200">
+              <pre
+                className="p-6 sm:p-10 leading-relaxed text-slate-800 font-mono whitespace-pre-wrap break-words transition-all duration-200 cursor-text select-text"
+                style={TEXT_SELECTION_STYLE}
               >
                 {preview.content}
               </pre>
             </div>
-          </ZoomableWrapper>
+          </div>
         )}
 
         {preview.status === 'ready' && preview.type === 'unsupported' && (
@@ -527,22 +743,24 @@ export default function FilePreviewModal({ url, filename, onClose }: FilePreview
             <div className={`w-20 h-20 rounded-3xl ${bgColor.replace('bg-', 'bg-opacity-10 bg-')} flex items-center justify-center`}>
               <Icon className={`w-10 h-10 ${bgColor.replace('bg-', 'text-')}`} />
             </div>
-            <div>
+             <div>
               <p className="text-gray-900 font-bold text-xl mb-1">{filename}</p>
-              <p className="text-gray-500 text-sm">该文件类型暂不支持在线预览</p>
+              <p className="text-gray-500 text-sm">{t('filePreview.unsupportedType')}</p>
               {ext !== 'PDF' && (
                 <p className="text-blue-500/60 text-xs mt-2 font-medium bg-blue-50 py-1 px-3 rounded-full inline-block">
-                  安装 LibreOffice 可提升办公文档预览效果
+                  {t('filePreview.installLibreOffice')}
                 </p>
               )}
             </div>
-            <button
+
+             <button
               onClick={handleDownload}
               className="px-8 py-3 bg-blue-600 hover:bg-blue-700 rounded-xl text-white text-sm font-bold transition-all flex items-center gap-2"
             >
               <Download className="w-4 h-4" />
-              下载文件
+              {t('common.downloadFile')}
             </button>
+
           </div>
         )}
       </div>

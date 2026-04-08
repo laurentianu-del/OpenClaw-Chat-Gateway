@@ -1,23 +1,65 @@
 import { useState, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
-import ChatView from './components/ChatView';
+import UnifiedChatView from './components/UnifiedChatView';
 import SettingsView from './components/SettingsView';
 import LoginScreen from './components/LoginScreen';
+import { requestActiveContextRefresh, type ActiveContextRefreshDetail } from './utils/contextRefresh';
 
-export type ViewType = 'chat' | 'settings';
+export type ViewType = 'chat' | 'settings' | 'groups';
 export type SettingsTab = 'gateway' | 'general' | 'models' | 'commands' | 'about';
+const LAST_CONVERSATION_VIEW_STORAGE_KEY = 'clawui_last_conversation_view';
+const BOOTSTRAP_REQUEST_TIMEOUT_MS = 8000;
+
+type SessionSummary = {
+  id: string;
+  name: string;
+  agentId?: string;
+  characterId?: string;
+  model?: string;
+  process_start_tag?: string;
+  process_end_tag?: string;
+};
+
+async function fetchJsonWithTimeout<T>(input: RequestInfo | URL, init?: RequestInit, timeoutMs = BOOTSTRAP_REQUEST_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+    return await response.json() as T;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
 
 export default function App() {
   const getHashState = () => {
     const hash = window.location.hash.replace('#', '');
-    if (!hash) return { view: 'chat' as ViewType, tab: 'gateway' as SettingsTab };
+    if (!hash) {
+      const savedView = localStorage.getItem('clawui_current_view') as ViewType | null;
+      const savedTab = localStorage.getItem('clawui_settings_tab') as SettingsTab | null;
+      const savedGroupId = localStorage.getItem('clawui_active_group');
+      return {
+        view: savedView === 'settings' || savedView === 'groups' ? savedView : 'chat' as ViewType,
+        tab: savedTab === 'general' || savedTab === 'models' || savedTab === 'commands' || savedTab === 'about' ? savedTab : 'gateway' as SettingsTab,
+        groupId: savedGroupId || null,
+      };
+    }
     
-    if (hash === 'settings') return { view: 'settings' as ViewType, tab: 'gateway' as SettingsTab };
+    if (hash === 'settings') return { view: 'settings' as ViewType, tab: 'gateway' as SettingsTab, groupId: null as string | null };
     if (hash.startsWith('settings/')) {
       const tab = hash.split('/')[1] as SettingsTab;
-      return { view: 'settings' as ViewType, tab };
+      return { view: 'settings' as ViewType, tab, groupId: null as string | null };
     }
-    return { view: 'chat' as ViewType, tab: 'gateway' as SettingsTab };
+    if (hash.startsWith('group/')) {
+      const groupId = hash.split('/')[1];
+      return { view: 'groups' as ViewType, tab: 'gateway' as SettingsTab, groupId };
+    }
+    if (hash === 'groups') return { view: 'groups' as ViewType, tab: 'gateway' as SettingsTab, groupId: localStorage.getItem('clawui_active_group') };
+    return { view: 'chat' as ViewType, tab: 'gateway' as SettingsTab, groupId: null as string | null };
   };
 
   const initialState = getHashState();
@@ -30,16 +72,29 @@ export default function App() {
     return localStorage.getItem('clawui_active_session') || '';
   });
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-  const [sessions, setSessions] = useState<{id: string, name: string, characterId?: string, model?: string}[]>([]);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [availableModels, setAvailableModels] = useState<any[]>([]);
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(() => {
+    return initialState.groupId || localStorage.getItem('clawui_active_group') || null;
+  });
+  const [lastConversationView, setLastConversationView] = useState<'chat' | 'groups'>(() => {
+    if (initialState.view === 'chat' || initialState.view === 'groups') {
+      return initialState.view;
+    }
+
+    const saved = localStorage.getItem(LAST_CONVERSATION_VIEW_STORAGE_KEY);
+    return saved === 'groups' ? 'groups' : 'chat';
+  });
+  const [pendingContextRefresh, setPendingContextRefresh] = useState<ActiveContextRefreshDetail | null>(null);
 
   // --- Hash Routing Integration for Back Gesture & Deep Linking ---
   useEffect(() => {
     const handleHashChange = () => {
-      const { view, tab } = getHashState();
+      const { view, tab, groupId } = getHashState();
       setCurrentView(view);
       setSettingsTab(tab);
-      // If we navigate back via hash, close mobile menu
+      if (groupId) setActiveGroupId(groupId);
       setIsMobileMenuOpen(false);
     };
 
@@ -55,13 +110,20 @@ export default function App() {
 
   // Sync view state to hash and localStorage
   useEffect(() => {
-    const newHash = currentView === 'settings' ? `settings/${settingsTab}` : 'chat';
+    let newHash: string;
+    if (currentView === 'settings') {
+      newHash = `settings/${settingsTab}`;
+    } else if (currentView === 'groups') {
+      newHash = activeGroupId ? `group/${activeGroupId}` : 'groups';
+    } else {
+      newHash = 'chat';
+    }
     if (window.location.hash.replace('#', '') !== newHash) {
       window.location.hash = newHash;
     }
     localStorage.setItem('clawui_current_view', currentView);
     localStorage.setItem('clawui_settings_tab', settingsTab);
-  }, [currentView, settingsTab]);
+  }, [currentView, settingsTab, activeGroupId]);
 
   // Sync activeSessionId to localStorage
   useEffect(() => {
@@ -69,6 +131,21 @@ export default function App() {
       localStorage.setItem('clawui_active_session', activeSessionId);
     }
   }, [activeSessionId]);
+
+  // Sync activeGroupId to localStorage
+  useEffect(() => {
+    if (activeGroupId) {
+      localStorage.setItem('clawui_active_group', activeGroupId);
+    } else {
+      localStorage.removeItem('clawui_active_group');
+    }
+  }, [activeGroupId]);
+
+  useEffect(() => {
+    if (currentView !== 'chat' && currentView !== 'groups') return;
+    setLastConversationView(currentView);
+    localStorage.setItem(LAST_CONVERSATION_VIEW_STORAGE_KEY, currentView);
+  }, [currentView]);
 
   // Wrapper for view/tab changes
   const navigateTo = (view: ViewType, tab?: SettingsTab, openMenu?: boolean) => {
@@ -83,12 +160,37 @@ export default function App() {
     }
   };
 
+  const handleReturnToConversation = () => {
+    const targetView = lastConversationView === 'groups' ? 'groups' : 'chat';
+    const refreshDetail = targetView === 'groups'
+      ? (activeGroupId ? { mode: 'group', id: activeGroupId } as const : null)
+      : (activeSessionId ? { mode: 'chat', id: activeSessionId } as const : null);
+
+    if (refreshDetail) {
+      setPendingContextRefresh(refreshDetail);
+    }
+
+    navigateTo(targetView, settingsTab, false);
+  };
+
+  useEffect(() => {
+    if (!pendingContextRefresh) return;
+
+    const targetView = pendingContextRefresh.mode === 'group' ? 'groups' : 'chat';
+    if (currentView !== targetView) return;
+
+    const timer = window.setTimeout(() => {
+      requestActiveContextRefresh(pendingContextRefresh);
+      setPendingContextRefresh(null);
+    }, 0);
+
+    return () => window.clearTimeout(timer);
+  }, [currentView, pendingContextRefresh]);
+
   const reloadSessions = async () => {
     try {
-      const res = await fetch('/api/sessions');
-      const data = await res.json();
+      const data = await fetchJsonWithTimeout<SessionSummary[]>('/api/sessions');
       setSessions(data);
-      setSessionsLoaded(true);
       // Auto-select first session if currently active is not in the list or empty
       if (data.length > 0) {
         setActiveSessionId(prev => {
@@ -98,6 +200,8 @@ export default function App() {
       }
     } catch (err) {
       console.error('Failed to reload sessions:', err);
+    } finally {
+      setSessionsLoaded(true);
     }
   };
 
@@ -123,8 +227,7 @@ export default function App() {
       try {
         const token = localStorage.getItem('clawui_auth_token');
         const url = token ? `/api/auth/check?token=${encodeURIComponent(token)}` : '/api/auth/check';
-        const res = await fetch(url);
-        const data = await res.json();
+        const data = await fetchJsonWithTimeout<{ loginRequired?: boolean }>(url);
         if (data.loginRequired) {
           localStorage.removeItem('clawui_auth_token');
           setIsAuthenticated(false);
@@ -146,13 +249,8 @@ export default function App() {
   useEffect(() => {
     const checkStatus = async () => {
       try {
-        const res = await fetch('/api/gateway/status');
-        if (res.ok) {
-          const data = await res.json();
-          setIsConnected(!!data.connected); 
-        } else {
-          setIsConnected(false);
-        }
+        const data = await fetchJsonWithTimeout<{ connected?: boolean }>('/api/gateway/status');
+        setIsConnected(!!data.connected);
       } catch (e) {
         setIsConnected(false);
       }
@@ -164,19 +262,29 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  const reloadModels = async () => {
+    try {
+      const data = await fetchJsonWithTimeout<{ success?: boolean; models?: any[] }>('/api/models');
+      if (data.success && Array.isArray(data.models)) setAvailableModels(data.models);
+    } catch (err) {
+      console.error('Failed to reload models:', err);
+    }
+  };
+
+  useEffect(() => {
+    reloadModels();
+    const modelTimer = setInterval(reloadModels, 30000);
+    return () => clearInterval(modelTimer);
+  }, []);
+
   // Show login screen if not authenticated (and auth check is done)
   if (isAuthenticated === false) {
     return <LoginScreen onLoginSuccess={() => setIsAuthenticated(true)} />;
   }
 
-  // Always render the real UI, but hide it until data is ready.
-  // This prevents progressive paint / "expanding" artifacts.
-  const appReady = isAuthenticated === true && sessionsLoaded;
-
   return (
     <div
       className="flex fixed inset-0 h-[100dvh] w-full overflow-hidden bg-gray-50 text-gray-900 font-sans antialiased"
-      style={{ opacity: appReady ? 1 : 0 }}
     >
       <Sidebar 
         currentView={currentView} 
@@ -189,20 +297,39 @@ export default function App() {
         reloadSessions={reloadSessions}
         reorderSessions={reorderSessions}
         navigateTo={navigateTo}
+        onReturnToConversation={handleReturnToConversation}
+        availableModels={availableModels}
+        activeGroupId={activeGroupId}
+        onSelectGroup={setActiveGroupId}
       />
       <main className="flex-1 flex flex-col min-w-0 bg-white overflow-hidden md:overflow-visible md:relative md:z-[60]">
         {currentView === 'chat' ? (
-          <ChatView 
-            isConnected={isConnected} 
-            activeSessionId={activeSessionId} 
+          <UnifiedChatView
+            mode="chat"
+            isConnected={isConnected}
+            activeSessionId={activeSessionId}
             onMenuClick={() => navigateTo(currentView, settingsTab, true)}
             sessions={sessions}
+            availableModels={availableModels}
+          />
+        ) : currentView === 'groups' ? (
+          <UnifiedChatView
+            mode="group"
+            onMenuClick={() => navigateTo(currentView, settingsTab, true)}
+            sessions={sessions}
+            availableModels={availableModels}
+            activeGroupId={activeGroupId}
+            onSelectGroup={(id) => {
+              setActiveGroupId(id);
+              navigateTo('groups');
+            }}
           />
         ) : (
           <SettingsView 
             isConnected={isConnected} 
             settingsTab={settingsTab} 
             onMenuClick={() => navigateTo(currentView, settingsTab, true)}
+            onModelsChanged={reloadModels}
           />
         )}
       </main>

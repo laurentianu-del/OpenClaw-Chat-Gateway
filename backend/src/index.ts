@@ -7,16 +7,45 @@ import os from 'os';
 import { createServer } from 'http';
 import multer from 'multer';
 import { WebSocket } from 'ws';
-import OpenClawClient from './openclaw-client';
+import OpenClawClient, { extractOpenClawMessageText } from './openclaw-client';
 import SessionManager from './session-manager';
 import ConfigManager from './config-manager';
 import DB from './db';
 import AgentProvisioner from './agent-provisioner';
-import { exec } from 'child_process';
+import { GroupChatEngine, createAgentResponseFailedMessage, getStructuredGroupMessage } from './group-chat-engine';
+import {
+  deleteGroupWorkspace,
+  ensureGroupWorkspace,
+  getAgentMemoryDbPath,
+  getAgentStatePath,
+  getGroupRuntimeSessionKey,
+  getGroupWorkspacePath,
+  getGroupRuntimeAgentPrefix,
+  getLegacyGroupRuntimeAgentId,
+  getGroupRuntimeAgentId,
+  getSharedGroupRuntimeAgentId,
+  resetGroupWorkspace,
+  validateGroupId,
+} from './group-workspace';
+import { exec, execFile, spawn } from 'child_process';
 import util from 'util';
 import net from 'net';
+import sharp from 'sharp';
+import { rewriteMessageWithWorkspaceUploads } from './message-upload-rewrite';
+import { rewriteVisibleFileLinks } from './file-link-rewrite';
+import type { ChatRow, MessagePageInfo, MessageSearchMatch, StoredFileRow } from './db';
+import {
+  type ChatHistorySnapshot,
+  extractLatestAssistantOutcomeRecord,
+  extractSettledAssistantOutcome,
+  getHistorySnapshot,
+  shouldPreferSettledAssistantText,
+} from './chat-history-reconciliation';
+import { selectPreferredTextSnapshot } from './text-snapshot-protection';
+import { getCurrentAppVersionInfo, getLatestVersionInfo } from './app-version';
 
 const execPromise = util.promisify(exec);
+const execFilePromise = util.promisify(execFile);
 
 const app = express();
 const server = createServer(app);
@@ -33,22 +62,15 @@ fs.mkdirSync(uploadDir, { recursive: true });
 const openclawMediaDir = path.join(process.env.HOME || '.', '.openclaw', 'media');
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const config = configManager.getConfig();
-    const sessionId = _req.body?.sessionId || '';
-    const sessionInfo = sessionManager.getSession(sessionId);
-    const agentId = sessionInfo?.agentId || 'main';
-    const workspacePath = agentProvisioner.getWorkspacePath(agentId);
-    
-    const finalUploadDir = path.join(workspacePath, 'uploads');
-    console.log(`[Upload] Session: ${sessionId}, Agent: ${agentId}, Path: ${finalUploadDir}`);
+  destination: (req, _file, cb) => {
     try {
-      fs.mkdirSync(finalUploadDir, { recursive: true });
+      const target = resolveUploadTargetFromBody((req.body || {}) as Record<string, unknown>);
+      fs.mkdirSync(target.uploadsPath, { recursive: true });
+      console.log(`[Upload] Context: ${target.contextType}, SessionKey: ${target.sessionKey}, Path: ${target.uploadsPath}`);
+      cb(null, target.uploadsPath);
     } catch (err) {
-      console.error(`[Upload] Failed to use workspace for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`);
+      cb(err as Error, uploadDir);
     }
-    
-    cb(null, finalUploadDir);
   },
   filename: (_req, file, cb) => {
     const decodedName = Buffer.from(file.originalname, 'latin1').toString('utf8');
@@ -68,11 +90,712 @@ const db = new DB();
 const configManager = new ConfigManager();
 const sessionManager = new SessionManager(db);
 const agentProvisioner = new AgentProvisioner();
+type StructuredMessageParams = Record<string, string | number | boolean | null>;
+const CHAT_RUN_ERROR_CODE = 'chat.runError';
+const CHAT_GATEWAY_DISCONNECTED_CODE = 'chat.gatewayDisconnected';
+const CHAT_GATEWAY_DISCONNECTED_DETAIL = 'Connection to gateway lost. The process might have restarted.';
+const CHAT_RUN_ERROR_PREFIX = '❌ Error: ';
+const GATEWAY_TEST_FAILED_ERROR_CODE = 'gateway.testFailed';
+const GATEWAY_RESTART_FAILED_ERROR_CODE = 'gateway.restartFailed';
+const GATEWAY_DETECT_FAILED_ERROR_CODE = 'gateway.detectFailed';
+const BROWSER_HEALTH_FAILED_ERROR_CODE = 'gateway.browserHealthFailed';
+const BROWSER_SELF_HEAL_FAILED_ERROR_CODE = 'gateway.browserSelfHealFailed';
+const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
+const AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'agents.idContainsWhitespace';
+const AGENT_ID_ALREADY_EXISTS_ERROR_CODE = 'agents.idAlreadyExists';
+const GROUP_ID_REQUIRED_ERROR_CODE = 'groups.idRequired';
+const GROUP_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'groups.idContainsWhitespace';
+const GROUP_ID_INVALID_ERROR_CODE = 'groups.idInvalid';
+const GROUP_ID_ALREADY_EXISTS_ERROR_CODE = 'groups.idAlreadyExists';
+const GROUP_NOT_FOUND_ERROR_CODE = 'groups.notFound';
+const GROUP_RUN_IN_PROGRESS_ERROR_CODE = 'groups.runInProgress';
+const MODEL_CREATE_FAILED_ERROR_CODE = 'models.createFailed';
+const MODEL_UPDATE_FAILED_ERROR_CODE = 'models.updateFailed';
+const MODEL_DELETE_FAILED_ERROR_CODE = 'models.deleteFailed';
+const MODEL_TEST_FAILED_ERROR_CODE = 'models.testFailed';
+const MODEL_DISCOVER_FAILED_ERROR_CODE = 'models.discoverFailed';
+const ENDPOINT_CREATE_FAILED_ERROR_CODE = 'endpoints.createFailed';
+const ENDPOINT_DELETE_FAILED_ERROR_CODE = 'endpoints.deleteFailed';
+const ENDPOINT_TEST_FAILED_ERROR_CODE = 'endpoints.testFailed';
+const VERSION_INFO_UNAVAILABLE_ERROR_CODE = 'version.infoUnavailable';
+const VERSION_LOOKUP_FAILED_ERROR_CODE = 'version.lookupFailed';
+const DEFAULT_HISTORY_PAGE_LIMIT = 200;
+const MAX_HISTORY_PAGE_LIMIT = 200;
+const CHAT_STREAM_COMPLETION_PROBE_DELAY_MS = 400;
+const CHAT_STREAM_COMPLETION_WAIT_TIMEOUT_MS = 1500;
+const CHAT_HISTORY_COMPLETION_PROBE_LIMIT = 60;
+const CHAT_REGENERATE_LOOKBACK_LIMIT = 60;
+const CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS = 30000;
+const CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS = 500;
+const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const GROUP_SSE_KEEPALIVE_MS = 15000;
+const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
+const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
+const BROWSER_GATEWAY_PROBE_TIMEOUT_MS = 15000;
+const BROWSER_GATEWAY_RPC_TIMEOUT_MS = 20000;
+const BROWSER_HEALTH_PROBE_URL = 'about:blank';
+const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
+const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
+const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
+
+type BrowserHealthIssue = 'permissions' | 'disabled' | 'stopped' | 'detect-error' | 'timeout' | 'unknown';
+
+type BrowserHealthSnapshot = {
+  healthy: boolean;
+  issue: BrowserHealthIssue | null;
+  checkedAt: number;
+  maxPermissionsEnabled: boolean | null;
+  profile: string | null;
+  enabled: boolean | null;
+  running: boolean | null;
+  transport: string | null;
+  chosenBrowser: string | null;
+  detectedBrowser: string | null;
+  headless: boolean | null;
+  detectError: string | null;
+  rawDetail: string | null;
+  gatewayProbeSucceeded: boolean | null;
+  gatewayProbeDetail: string | null;
+};
+
+type BrowserConfigState = {
+  enabled: boolean | null;
+  headless: boolean | null;
+  profile: string | null;
+};
+
+type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'gatewayProbeSucceeded' | 'gatewayProbeDetail'>;
+
+function buildStructuredApiError(
+  errorCode: string,
+  errorDetail?: string | null,
+  errorParams?: StructuredMessageParams | null
+) {
+  return {
+    success: false as const,
+    errorCode,
+    errorParams: errorParams || null,
+    errorDetail: typeof errorDetail === 'string' && errorDetail.trim() ? errorDetail.trim() : null,
+  };
+}
+
+class StructuredRequestError extends Error {
+  status: number;
+  payload: ReturnType<typeof buildStructuredApiError>;
+
+  constructor(
+    status: number,
+    errorCode: string,
+    errorDetail?: string | null,
+    errorParams?: StructuredMessageParams | null
+  ) {
+    super(errorDetail || errorCode);
+    this.status = status;
+    this.payload = buildStructuredApiError(errorCode, errorDetail, errorParams);
+  }
+}
+
+function isStructuredRequestError(error: unknown): error is StructuredRequestError {
+  return error instanceof StructuredRequestError;
+}
+
+function normalizeCliText(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function readCliErrorDetail(error: any): string {
+  return [
+    normalizeCliText(error?.stderr),
+    normalizeCliText(error?.stdout),
+    normalizeCliText(error?.message),
+  ].find(Boolean) || '';
+}
+
+function normalizeFallbackMode(value: unknown): 'inherit' | 'custom' | 'disabled' | undefined {
+  return value === 'inherit' || value === 'custom' || value === 'disabled' ? value : undefined;
+}
+
+function normalizeFallbackList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    normalized.push(trimmed);
+  }
+  return normalized;
+}
+
+function getOpenClawConfigPath() {
+  return path.join(os.homedir(), '.openclaw', 'openclaw.json');
+}
+
+function getExecApprovalsPath() {
+  return path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
+}
+
+function readOpenClawConfig(): any | null {
+  try {
+    const configPath = getOpenClawConfigPath();
+    if (!fs.existsSync(configPath)) {
+      return null;
+    }
+    return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  } catch (error) {
+    return null;
+  }
+}
+
+function shouldPreferHeadlessBrowser() {
+  return !normalizeCliText(process.env.DISPLAY)
+    && !normalizeCliText(process.env.WAYLAND_DISPLAY)
+    && !normalizeCliText(process.env.MIR_SOCKET);
+}
+
+function isMaxPermissionsConfigEnabled(config: any): boolean {
+  return !config?.tools?.profile && config?.tools?.exec?.security === 'full';
+}
+
+function readMaxPermissionsEnabled(): boolean | null {
+  try {
+    const config = readOpenClawConfig();
+    if (!config) {
+      return null;
+    }
+    return isMaxPermissionsConfigEnabled(config);
+  } catch (error) {
+    return null;
+  }
+}
+
+function readBrowserConfigState(): BrowserConfigState {
+  const config = readOpenClawConfig();
+  return {
+    enabled: typeof config?.browser?.enabled === 'boolean' ? config.browser.enabled : null,
+    headless: typeof config?.browser?.headless === 'boolean' ? config.browser.headless : null,
+    profile: normalizeCliText(config?.browser?.profile) || null,
+  };
+}
+
+function buildFallbackBrowserHealthDiagnostics(
+  checkedAt = Date.now(),
+  rawDetail?: string | null
+): BrowserHealthDiagnostics {
+  const browserConfig = readBrowserConfigState();
+
+  return {
+    checkedAt,
+    maxPermissionsEnabled: readMaxPermissionsEnabled(),
+    profile: browserConfig.profile,
+    enabled: browserConfig.enabled,
+    running: null,
+    transport: null,
+    chosenBrowser: null,
+    detectedBrowser: null,
+    headless: browserConfig.headless,
+    detectError: null,
+    rawDetail: normalizeCliText(rawDetail) || null,
+  };
+}
+
+function resolveBrowserProbeFailureIssue(detail: string, diagnostics: BrowserHealthDiagnostics): BrowserHealthIssue {
+  if (diagnostics.enabled === false || /browser control is disabled/i.test(detail)) {
+    return 'disabled';
+  }
+  if (diagnostics.detectError) {
+    return 'detect-error';
+  }
+  if (diagnostics.running === false) {
+    return 'stopped';
+  }
+  if (/timed out|timeout/i.test(detail)) {
+    return 'timeout';
+  }
+  return 'unknown';
+}
+
+function finalizeBrowserHealthSnapshot(
+  snapshot: BrowserHealthDiagnostics & {
+    issue?: BrowserHealthIssue | null;
+    gatewayProbeSucceeded?: boolean | null;
+    gatewayProbeDetail?: string | null;
+  }
+): BrowserHealthSnapshot {
+  let issue = snapshot.issue ?? null;
+  const gatewayProbeSucceeded = typeof snapshot.gatewayProbeSucceeded === 'boolean'
+    ? snapshot.gatewayProbeSucceeded
+    : null;
+  const gatewayProbeDetail = normalizeCliText(snapshot.gatewayProbeDetail) || null;
+
+  if (!issue) {
+    if (snapshot.maxPermissionsEnabled === false) {
+      issue = 'permissions';
+    } else if (snapshot.enabled === false) {
+      issue = 'disabled';
+    } else if (gatewayProbeSucceeded === false) {
+      issue = resolveBrowserProbeFailureIssue(gatewayProbeDetail || snapshot.rawDetail || '', snapshot);
+    } else if (gatewayProbeSucceeded !== true) {
+      if (snapshot.running === false) issue = 'stopped';
+      else if (snapshot.detectError) issue = 'detect-error';
+      else issue = 'unknown';
+    }
+  }
+
+  const fallbackDetail = normalizeCliText(snapshot.rawDetail) || null;
+  const rawDetail = gatewayProbeSucceeded === false
+    ? gatewayProbeDetail
+    : issue === null
+      ? null
+      : fallbackDetail;
+
+  return {
+    ...snapshot,
+    healthy: issue === null && gatewayProbeSucceeded === true,
+    issue,
+    rawDetail,
+    gatewayProbeSucceeded,
+    gatewayProbeDetail,
+  };
+}
+
+function buildBrowserHealthDiagnosticsFromCli(
+  raw: any,
+  checkedAt = Date.now(),
+  rawDetail?: string | null
+): BrowserHealthDiagnostics {
+  const maxPermissionsEnabled = readMaxPermissionsEnabled();
+  const browserConfig = readBrowserConfigState();
+  const enabled = typeof raw?.enabled === 'boolean' ? raw.enabled : browserConfig.enabled;
+  const running = typeof raw?.running === 'boolean' ? raw.running : null;
+  const headless = typeof raw?.headless === 'boolean' ? raw.headless : browserConfig.headless;
+  const detectError = normalizeCliText(raw?.detectError) || null;
+
+  return {
+    checkedAt,
+    maxPermissionsEnabled,
+    profile: normalizeCliText(raw?.profile) || browserConfig.profile,
+    enabled,
+    running,
+    transport: normalizeCliText(raw?.transport) || null,
+    chosenBrowser: normalizeCliText(raw?.chosenBrowser) || null,
+    detectedBrowser: normalizeCliText(raw?.detectedBrowser) || null,
+    headless,
+    detectError,
+    rawDetail: normalizeCliText(rawDetail) || null,
+  };
+}
+
+function patchExecApprovals(enabled: boolean) {
+  const execApprovalsPath = getExecApprovalsPath();
+  if (!fs.existsSync(execApprovalsPath)) {
+    return;
+  }
+
+  const approvals = JSON.parse(fs.readFileSync(execApprovalsPath, 'utf-8'));
+  if (!approvals.defaults) approvals.defaults = {};
+
+  if (enabled) {
+    approvals.defaults.ask = 'off';
+    approvals.defaults.security = 'full';
+    approvals.agents = { '*': { allowlist: [{ pattern: '*' }] } };
+  } else {
+    delete approvals.defaults.ask;
+    delete approvals.defaults.security;
+    delete approvals.agents;
+  }
+
+  fs.writeFileSync(execApprovalsPath, JSON.stringify(approvals, null, 2));
+}
+
+function setMaxPermissionsEnabled(enabled: boolean) {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+
+  if (enabled) {
+    config.tools = MAX_PERMISSIONS_TOOLS;
+
+    if (!config.commands) config.commands = {};
+    config.commands.bash = true;
+    config.commands.restart = true;
+    config.commands.native = 'auto';
+    config.commands.nativeSkills = 'auto';
+
+    if (!config.browser) config.browser = {};
+    config.browser.enabled = true;
+    if (typeof config.browser.headless !== 'boolean' || shouldPreferHeadlessBrowser()) {
+      config.browser.headless = shouldPreferHeadlessBrowser();
+    }
+    delete config.browser.ssrfPolicy;
+  } else {
+    config.tools = { profile: 'coding' };
+  }
+
+  if (!config.agents) config.agents = {};
+  if (!config.agents.defaults) config.agents.defaults = {};
+  if (!config.agents.defaults.sandbox) config.agents.defaults.sandbox = {};
+  config.agents.defaults.sandbox.mode = 'off';
+
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  patchExecApprovals(enabled);
+
+  return { enabled };
+}
+
+function setBrowserHeadlessMode(enabled: boolean) {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  if (!config.browser) config.browser = {};
+  config.browser.enabled = true;
+  config.browser.headless = enabled;
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+}
+
+async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
+  return execFilePromise('openclaw', ['browser', ...args], {
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+function startOpenClawBrowserDetached(args: string[] = []) {
+  return new Promise<number | null>((resolve, reject) => {
+    const child = spawn('openclaw', ['browser', ...args, 'start'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve(child.pid ?? null);
+    });
+  });
+}
+
+async function stopOpenClawBrowserBestEffort() {
+  try {
+    await runOpenClawBrowserCommand(['--timeout', String(BROWSER_SELF_HEAL_STOP_TIMEOUT_MS), 'stop'], BROWSER_SELF_HEAL_STOP_TIMEOUT_MS + 3000);
+  } catch (error) {
+    // Browser may already be stopped or the CLI may time out; self-heal should continue.
+  }
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForBrowserHealth(timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSnapshot: BrowserHealthSnapshot | null = null;
+
+  while (Date.now() < deadline) {
+    lastSnapshot = await runBrowserHealthCheck({ skipGatewayProbeWhenStopped: true });
+    if (lastSnapshot.healthy) {
+      return lastSnapshot;
+    }
+    await sleep(BROWSER_SELF_HEAL_POLL_INTERVAL_MS);
+  }
+
+  return lastSnapshot || runBrowserHealthCheck();
+}
+
+async function readBrowserHealthDiagnostics(checkedAt = Date.now()): Promise<BrowserHealthDiagnostics> {
+  try {
+    const { stdout } = await runOpenClawBrowserCommand(
+      ['--json', '--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS), 'status'],
+      BROWSER_HEALTH_EXEC_TIMEOUT_MS
+    );
+    const parsed = JSON.parse(normalizeCliText(stdout) || '{}');
+    return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt);
+  } catch (error: any) {
+    const stdout = normalizeCliText(error?.stdout);
+    if (stdout) {
+      try {
+        return buildBrowserHealthDiagnosticsFromCli(JSON.parse(stdout), checkedAt, readCliErrorDetail(error));
+      } catch {}
+    }
+
+    return buildFallbackBrowserHealthDiagnostics(checkedAt, readCliErrorDetail(error));
+  }
+}
+
+async function runGatewayBrowserProbe(): Promise<{ succeeded: boolean; detail: string | null }> {
+  const config = configManager.getConfig();
+  const gatewayUrl = normalizeCliText(config.gatewayUrl);
+
+  if (!gatewayUrl) {
+    return {
+      succeeded: false,
+      detail: 'Gateway URL is required',
+    };
+  }
+
+  const client = new OpenClawClient({
+    gatewayUrl,
+    token: config.token,
+    password: config.password,
+  });
+  client.on('error', (err) => {
+    console.error('[BrowserHealth] Gateway probe client error:', err.message);
+  });
+
+  let targetId: string | null = null;
+
+  try {
+    const opened = await client.call('browser.request', {
+      method: 'POST',
+      path: '/tabs/open',
+      body: {
+        url: BROWSER_HEALTH_PROBE_URL,
+      },
+      timeoutMs: BROWSER_GATEWAY_PROBE_TIMEOUT_MS,
+    }, BROWSER_GATEWAY_RPC_TIMEOUT_MS);
+
+    targetId = normalizeCliText(opened?.targetId) || null;
+    const wsUrl = normalizeCliText(opened?.wsUrl) || null;
+
+    if (!targetId && !wsUrl) {
+      throw new Error('Gateway browser probe did not return targetId or wsUrl');
+    }
+
+    return {
+      succeeded: true,
+      detail: null,
+    };
+  } catch (error: any) {
+    return {
+      succeeded: false,
+      detail: normalizeCliText(error?.message) || 'Gateway browser probe failed',
+    };
+  } finally {
+    if (targetId) {
+      try {
+        await client.call('browser.request', {
+          method: 'DELETE',
+          path: `/tabs/${encodeURIComponent(targetId)}`,
+          timeoutMs: BROWSER_GATEWAY_PROBE_TIMEOUT_MS,
+        }, BROWSER_GATEWAY_RPC_TIMEOUT_MS);
+      } catch (cleanupError: any) {
+        console.warn('[BrowserHealth] Failed to close probe tab:', normalizeCliText(cleanupError?.message) || cleanupError);
+      }
+    }
+
+    client.disconnect();
+  }
+}
+
+async function runBrowserHealthCheck(options?: { skipGatewayProbeWhenStopped?: boolean }): Promise<BrowserHealthSnapshot> {
+  const checkedAt = Date.now();
+  const diagnostics = await readBrowserHealthDiagnostics(checkedAt);
+
+  if (options?.skipGatewayProbeWhenStopped && diagnostics.running === false) {
+    return finalizeBrowserHealthSnapshot({
+      ...diagnostics,
+      gatewayProbeSucceeded: null,
+      gatewayProbeDetail: null,
+    });
+  }
+
+  const probe = await runGatewayBrowserProbe();
+
+  return finalizeBrowserHealthSnapshot({
+    ...diagnostics,
+    gatewayProbeSucceeded: probe.succeeded,
+    gatewayProbeDetail: probe.detail,
+  });
+}
+
+async function restartGatewayService() {
+  for (const [sessionId, client] of connections.entries()) {
+    try {
+      client.disconnect();
+    } catch (err) {
+      console.error(`Error disconnecting client ${sessionId}:`, err);
+    }
+  }
+  connections.clear();
+  await execPromise('openclaw gateway restart');
+}
+
+function createStructuredChatError(rawDetail?: string | null, forcedCode?: string) {
+  const detail = typeof rawDetail === 'string' && rawDetail.trim() ? rawDetail.trim() : 'Unknown error';
+  const messageCode = forcedCode || (detail === CHAT_GATEWAY_DISCONNECTED_DETAIL ? CHAT_GATEWAY_DISCONNECTED_CODE : CHAT_RUN_ERROR_CODE);
+
+  return {
+    content: `${CHAT_RUN_ERROR_PREFIX}${detail}`,
+    messageCode,
+    messageParams: undefined as StructuredMessageParams | undefined,
+    rawDetail: detail,
+    role: 'system' as const,
+    agent_id: 'system',
+    agent_name: 'System',
+  };
+}
+
+function buildStructuredChatHttpError(rawDetail?: string | null, forcedCode?: string) {
+  const structured = createStructuredChatError(rawDetail, forcedCode);
+  return {
+    success: false as const,
+    message: structured.content,
+    error: structured.content,
+    messageCode: structured.messageCode,
+    messageParams: structured.messageParams || null,
+    rawDetail: structured.rawDetail,
+    role: structured.role,
+  };
+}
+
+function getStructuredChatMessage(content?: string | null) {
+  if (!content || !content.startsWith(CHAT_RUN_ERROR_PREFIX)) return {};
+
+  const detail = content.slice(CHAT_RUN_ERROR_PREFIX.length).trim();
+  if (!detail) return {};
+
+  return {
+    messageCode: detail === CHAT_GATEWAY_DISCONNECTED_DETAIL ? CHAT_GATEWAY_DISCONNECTED_CODE : CHAT_RUN_ERROR_CODE,
+    messageParams: undefined as StructuredMessageParams | undefined,
+    rawDetail: detail,
+    role: 'system' as const,
+    agent_id: 'system',
+    agent_name: 'System',
+  };
+}
+
+function withStructuredGroupMessage<T extends { content?: string | null; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; sender_id?: string | null; sender_name?: string | null }>(
+  message: T,
+  options?: { groupId?: string | null }
+): T & { messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; sender_id?: string | null; sender_name?: string | null } {
+  const content = typeof message.content === 'string'
+    ? rewriteOpenClawMediaPaths(message.content, options?.groupId ? getGroupWorkspacePath(options.groupId) : undefined)
+    : message.content;
+  const structured = getStructuredGroupMessage(content);
+  return {
+    ...message,
+    content,
+    messageCode: message.messageCode ?? structured.messageCode,
+    messageParams: message.messageParams ?? structured.messageParams,
+    rawDetail: message.rawDetail ?? structured.rawDetail,
+    sender_id: structured.forceSystemMessage ? 'system' : (message.sender_id ?? null),
+    sender_name: structured.forceSystemMessage ? '系统' : (message.sender_name ?? null),
+  };
+}
+
+function withStructuredChatMessage<T extends { content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null }>(
+  message: T,
+  options?: { sessionId?: string | null }
+): T & { role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null } {
+  const content = typeof message.content === 'string'
+    ? rewriteOpenClawMediaPaths(message.content, options?.sessionId ? getSessionWorkspacePath(options.sessionId) : undefined)
+    : message.content;
+  const structured = getStructuredChatMessage(content);
+  return {
+    ...message,
+    content,
+    role: structured.role ?? message.role,
+    messageCode: message.messageCode ?? structured.messageCode,
+    messageParams: message.messageParams ?? structured.messageParams,
+    rawDetail: message.rawDetail ?? structured.rawDetail,
+    agent_id: structured.agent_id ?? (message.agent_id ?? null),
+    agent_name: structured.agent_name ?? (message.agent_name ?? null),
+  };
+}
+
+function resolveGroupMemberDisplayName(member: { agent_id: string; display_name: string }): string {
+  const linkedSession = db.getSessionByAgentId(member.agent_id) || db.getSession(member.agent_id);
+  const latestName = linkedSession?.name?.trim();
+  return latestName || member.display_name;
+}
+
+function withResolvedGroupMemberDisplayName<T extends { agent_id: string; display_name: string }>(member: T): T {
+  const latestName = resolveGroupMemberDisplayName(member);
+  return latestName === member.display_name ? member : { ...member, display_name: latestName };
+}
+
+function parsePositiveIntegerQueryParam(value: unknown): number | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function getHistoryPageQueryParams(query: Record<string, unknown>) {
+  const beforeId = parsePositiveIntegerQueryParam(query.beforeId);
+  const requestedLimit = parsePositiveIntegerQueryParam(query.limit);
+  const limit = Math.min(requestedLimit ?? DEFAULT_HISTORY_PAGE_LIMIT, MAX_HISTORY_PAGE_LIMIT);
+  return { beforeId, limit };
+}
+
+function buildHistoryPageResponse<T>(rows: T[], pageInfo: MessagePageInfo) {
+  return {
+    success: true as const,
+    messages: rows,
+    pageInfo,
+  };
+}
+
+function buildHistorySearchResponse(matches: MessageSearchMatch[]) {
+  return {
+    success: true as const,
+    matches: matches.map((match) => ({
+      messageId: String(match.id),
+      anchorBeforeId: match.anchorBeforeId ?? null,
+    })),
+  };
+}
+
+function repairLegacyGroupMessageRoots() {
+  for (const group of db.getGroupChats()) {
+    const rootIds = db.getGroupRootMessageIds(group.id);
+    if (rootIds.length <= 1) continue;
+
+    for (const rootId of rootIds.slice(1)) {
+      const previousMessageId = db.getLatestGroupMessageId(group.id, rootId);
+      if (!previousMessageId) continue;
+
+      db.updateGroupMessageParent(rootId, previousMessageId);
+      console.log(`[Startup] Repaired extra group root ${group.id}:${rootId} -> parent ${previousMessageId}`);
+    }
+  }
+}
+
+// Auto-heal legacy group members that stored session IDs instead of OpenClaw agent IDs.
+// This mainly affects the default "main" session whose session ID is random but agentId is "main".
+for (const group of db.getGroupChats()) {
+  for (const member of db.getGroupMembers(group.id)) {
+    const linkedSession = db.getSession(member.agent_id);
+    if (linkedSession && linkedSession.agentId && linkedSession.agentId !== member.agent_id) {
+      db.updateGroupMemberAgentId(member.id, linkedSession.agentId);
+      console.log(`[Startup] Repaired group member ${member.id}: ${member.agent_id} -> ${linkedSession.agentId}`);
+    }
+  }
+}
+
+repairLegacyGroupMessageRoots();
 
 // Ensure main agent workspace is registered in openclaw.json at startup
 const mainRegistered = agentProvisioner.ensureMainAgent();
 if (mainRegistered) {
   console.log('[Startup] Main agent workspace registered in openclaw.json');
+}
+
+for (const group of db.getGroupChats()) {
+  try {
+    cleanupLegacyGroupRuntimeArtifacts(group.id);
+  } catch (error) {
+    console.error(`[Startup] Failed to cleanup legacy runtime artifacts for group ${group.id}:`, error);
+  }
 }
 
 // LibreOffice detection
@@ -111,47 +834,681 @@ app.use((req, res, next) => {
   next();
 });
 
-// Store active OpenClaw connections
-// Helper to rewrite outgoing messages: expand /uploads/ markdown links to absolute paths
-function rewriteOutgoingMessage(message: string, agentId: string): string {
+// Helper to rewrite outgoing messages: extract /uploads/ images as attachments for the Vision API,
+// and keep non-image file references as absolute paths in the message text.
+function rewriteOutgoingMessage(
+  message: string,
+  agentId: string
+): { text: string; attachments: { type: string; mimeType: string; content: string }[] } {
   const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
-
-  // Regex to find markdown links like [name](/uploads/filename) or ![name](/uploads/filename)
-  // or naked /uploads/filename if not in markdown
-  return message.replace(/(\(?\/uploads\/)([^\s)]+)(\)?)/g, (match, prefix, filename, suffix) => {
-    const absolutePath = path.join(absoluteUploadsDir, filename);
-    return `${prefix.startsWith('(') ? '(' : ''}${absolutePath}${suffix.endsWith(')') ? ')' : ''}`;
-  });
+  return rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
 }
 
 const connections = new Map<string, OpenClawClient>();
+const GROUP_RUNTIME_WORKSPACE_RESERVED_ROOT_ENTRIES = new Set([
+  '.git',
+  '.openclaw',
+  'AGENTS.md',
+  'BOOTSTRAP.md',
+  'HEARTBEAT.md',
+  'IDENTITY.md',
+  'SOUL.md',
+  'TOOLS.md',
+  'USER.md',
+]);
+
+function disconnectConnection(sessionId: string): void {
+  const client = connections.get(sessionId);
+  if (!client) return;
+  connections.delete(sessionId);
+  client.disconnect();
+}
+
+function createMigratedConflictPath(targetPath: string): string {
+  const parsed = path.parse(targetPath);
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+    const candidate = path.join(parsed.dir, `${parsed.name}.migrated-${attempt}${parsed.ext}`);
+    if (!fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+function migrateGroupRuntimeWorkspaceContents(sourceDir: string, targetDir: string, rootLevel = true): void {
+  if (!fs.existsSync(sourceDir) || sourceDir === targetDir) return;
+
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+    if (rootLevel && GROUP_RUNTIME_WORKSPACE_RESERVED_ROOT_ENTRIES.has(entry.name)) {
+      continue;
+    }
+
+    const sourcePath = path.join(sourceDir, entry.name);
+    const targetPath = path.join(targetDir, entry.name);
+
+    if (entry.isDirectory()) {
+      if (!fs.existsSync(targetPath)) {
+        fs.renameSync(sourcePath, targetPath);
+        continue;
+      }
+
+      if (!fs.statSync(targetPath).isDirectory()) {
+        fs.renameSync(sourcePath, createMigratedConflictPath(targetPath));
+        continue;
+      }
+
+      migrateGroupRuntimeWorkspaceContents(sourcePath, targetPath, false);
+      if (fs.existsSync(sourcePath) && fs.readdirSync(sourcePath).length === 0) {
+        fs.rmdirSync(sourcePath);
+      }
+      continue;
+    }
+
+    if (entry.isFile()) {
+      if (!fs.existsSync(targetPath)) {
+        fs.renameSync(sourcePath, targetPath);
+      } else {
+        fs.renameSync(sourcePath, createMigratedConflictPath(targetPath));
+      }
+      continue;
+    }
+
+    if (!fs.existsSync(targetPath)) {
+      fs.renameSync(sourcePath, targetPath);
+    } else {
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+    }
+  }
+}
+
+function readRuntimeSessionCwd(sessionFilePath: string): string | null {
+  if (!fs.existsSync(sessionFilePath)) return null;
+
+  try {
+    const firstLine = fs.readFileSync(sessionFilePath, 'utf-8').split('\n')[0]?.trim();
+    if (!firstLine) return null;
+    const payload = JSON.parse(firstLine);
+    return typeof payload?.cwd === 'string' ? payload.cwd : null;
+  } catch {
+    return null;
+  }
+}
+
+function runtimeAgentSessionsNeedWorkspaceReset(agentId: string, workspacePath: string): boolean {
+  const sessionsDir = path.join(getAgentStatePath(agentId), 'sessions');
+  if (!fs.existsSync(sessionsDir)) return false;
+
+  const expectedWorkspace = path.resolve(workspacePath);
+  const sessionsJsonPath = path.join(sessionsDir, 'sessions.json');
+
+  if (fs.existsSync(sessionsJsonPath)) {
+    try {
+      const payload = JSON.parse(fs.readFileSync(sessionsJsonPath, 'utf-8'));
+      for (const record of Object.values(payload || {})) {
+        if (!record || typeof record !== 'object') continue;
+
+        const workspaceDir = typeof (record as { workspaceDir?: unknown }).workspaceDir === 'string'
+          ? path.resolve((record as { workspaceDir: string }).workspaceDir)
+          : null;
+        if (workspaceDir && workspaceDir !== expectedWorkspace) {
+          return true;
+        }
+
+        const sessionFile = typeof (record as { sessionFile?: unknown }).sessionFile === 'string'
+          ? (record as { sessionFile: string }).sessionFile
+          : null;
+        const cwd = sessionFile ? readRuntimeSessionCwd(sessionFile) : null;
+        if (cwd && path.resolve(cwd) !== expectedWorkspace) {
+          return true;
+        }
+      }
+    } catch {
+      return true;
+    }
+  }
+
+  for (const entry of fs.readdirSync(sessionsDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+    const cwd = readRuntimeSessionCwd(path.join(sessionsDir, entry.name));
+    if (cwd && path.resolve(cwd) !== expectedWorkspace) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function resetRuntimeAgentSessions(agentId: string): void {
+  disconnectConnection(agentId);
+
+  const sessionsDir = path.join(getAgentStatePath(agentId), 'sessions');
+  if (fs.existsSync(sessionsDir)) {
+    fs.rmSync(sessionsDir, { recursive: true, force: true });
+  }
+}
 
 // Rewrite absolute local file paths in AI responses to HTTP-accessible download URLs
-function rewriteOpenClawMediaPaths(text: string): string {
-  // Match absolute Unix paths, stopping at whitespace, Markdown punct, or Chinese brackets/parens
-  // \uff08\uff09 = （） \u3010\u3011 = 【】 \u300a\u300b = 《》
-  const regex = /(\/(?:[^\s\)\]\u0022\u0027\u0060|<>\uff08\uff09\u3010\u3011\u300a\u300b\u300c\u300d]+))/g;
-  
-  return text.replace(regex, (match, _p1, offset) => {
-    // Must have at least 2 path segments (e.g. /home/something) to avoid matching things like /api
-    if (match.split('/').length < 3) return match;
-    // Must have a file extension to be considered a downloadable file
-    const ext = path.extname(match);
-    if (!ext) return match;
-    // Skip URLs: check both the match content and surrounding context
-    if (match.includes('://')) return match;
-    // Skip if this is part of a URL (preceded by ":" from a scheme like https: or http:)
-    if (offset > 0 && text[offset - 1] === ':') return match;
-    
-    try {
-      const encodedPath = Buffer.from(match).toString('base64');
-      const filename = path.basename(match);
-      return `\n\n[${filename}](/api/files/download?path=${encodeURIComponent(encodedPath)})\n\n`;
-    } catch {
-      return match;
+function getSessionWorkspacePath(sessionId: string): string {
+  const sessionInfo = sessionManager.getSession(sessionId);
+  const agentId = sessionInfo?.agentId || 'main';
+  return agentProvisioner.getWorkspacePath(agentId);
+}
+
+function rewriteOpenClawMediaPaths(text: string, workspacePath?: string): string {
+  return rewriteVisibleFileLinks(text, { workspacePath });
+}
+
+function getGroupWorkspaceForDisplay(groupId: string): string {
+  return getGroupWorkspacePath(groupId);
+}
+
+type UploadTarget = {
+  contextType: 'session' | 'group';
+  sessionKey: string;
+  workspacePath: string;
+  uploadsPath: string;
+  agentId?: string;
+  groupId?: string;
+};
+
+function createGroupIdValidationError(rawId: unknown): StructuredRequestError {
+  const validation = validateGroupId(rawId);
+  switch (validation.issue) {
+    case 'required':
+      return new StructuredRequestError(400, GROUP_ID_REQUIRED_ERROR_CODE);
+    case 'whitespace':
+      return new StructuredRequestError(400, GROUP_ID_CONTAINS_WHITESPACE_ERROR_CODE);
+    default:
+      return new StructuredRequestError(400, GROUP_ID_INVALID_ERROR_CODE, null, {
+        groupId: validation.normalizedId || String(rawId || ''),
+      });
+  }
+}
+
+function resolveUploadTargetFromBody(body: Record<string, unknown> | undefined): UploadTarget {
+  const contextType = typeof body?.contextType === 'string' ? body.contextType.trim() : '';
+  const rawGroupId = typeof body?.groupId === 'string' ? body.groupId : '';
+
+  if (contextType === 'group' || rawGroupId) {
+    const validation = validateGroupId(rawGroupId);
+    if (validation.issue) {
+      throw createGroupIdValidationError(rawGroupId);
     }
+
+    const groupId = validation.normalizedId;
+    const group = db.getGroupChat(groupId);
+    if (!group) {
+      throw new StructuredRequestError(404, GROUP_NOT_FOUND_ERROR_CODE, null, { groupId });
+    }
+
+    const { workspacePath, uploadsPath } = ensureGroupWorkspace(groupId);
+    return {
+      contextType: 'group',
+      sessionKey: groupId,
+      workspacePath,
+      uploadsPath,
+      groupId,
+    };
+  }
+
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const sessionInfo = sessionManager.getSession(sessionId);
+  const agentId = sessionInfo?.agentId || 'main';
+  const workspacePath = agentProvisioner.getWorkspacePath(agentId);
+
+  return {
+    contextType: 'session',
+    sessionKey: sessionId,
+    workspacePath,
+    uploadsPath: path.join(workspacePath, 'uploads'),
+    agentId,
+  };
+}
+
+function removeStoredFilesFromDisk(files: StoredFileRow[]): void {
+  for (const file of files) {
+    if (!file.stored_path) continue;
+    try {
+      if (fs.existsSync(file.stored_path)) {
+        fs.rmSync(file.stored_path, { force: true });
+      }
+    } catch (error) {
+      console.error(`[Files] Failed to remove stored file ${file.stored_path}:`, error);
+    }
+  }
+}
+
+function clearStoredFilesBySessionKey(sessionKey: string): void {
+  const files = db.getFilesBySession(sessionKey);
+  removeStoredFilesFromDisk(files);
+  db.deleteFilesBySession(sessionKey);
+}
+
+type GroupReconciliationAction =
+  | { type: 'delete'; id: number; parent_id: number | null }
+  | {
+      type: 'edit';
+      data: {
+        groupId: string;
+        id: number;
+        parent_id: number | null;
+        sender_type: 'agent';
+        sender_id: string;
+        sender_name: string;
+        content: string;
+        model_used?: string;
+        messageCode?: string;
+        messageParams?: StructuredMessageParams;
+        rawDetail?: string;
+        created_at: string;
+      };
+    };
+
+const DEFAULT_PROCESS_START_TAG = '[执行工作_Start]';
+const DEFAULT_PROCESS_END_TAG = '[执行工作_End]';
+
+function escapeRegExpForPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getGroupProcessTagPairs(groupId: string, agentId?: string): Array<{ startTag: string; endTag: string }> {
+  const pairs: Array<{ startTag: string; endTag: string }> = [];
+  const appendPair = (startTag?: string | null, endTag?: string | null) => {
+    const normalizedStart = typeof startTag === 'string' ? startTag.trim() : '';
+    const normalizedEnd = typeof endTag === 'string' ? endTag.trim() : '';
+    if (!normalizedStart || !normalizedEnd) return;
+    if (pairs.some((pair) => pair.startTag === normalizedStart && pair.endTag === normalizedEnd)) return;
+    pairs.push({ startTag: normalizedStart, endTag: normalizedEnd });
+  };
+
+  const group = db.getGroupChat(groupId);
+  appendPair(group?.process_start_tag, group?.process_end_tag);
+
+  if (agentId) {
+    const session = db.getSessionByAgentId(agentId) || db.getSession(agentId);
+    appendPair(session?.process_start_tag, session?.process_end_tag);
+  }
+
+  appendPair(DEFAULT_PROCESS_START_TAG, DEFAULT_PROCESS_END_TAG);
+  return pairs;
+}
+
+function stripProcessBlocks(content: string, pairs: Array<{ startTag: string; endTag: string }>): string {
+  let cleaned = content;
+
+  for (const pair of pairs) {
+    const startPattern = escapeRegExpForPattern(pair.startTag);
+    const endPattern = escapeRegExpForPattern(pair.endTag);
+    const blockRegex = new RegExp(`${startPattern}[\\s\\S]*?(?:${endPattern}|$)`, 'g');
+    cleaned = cleaned.replace(blockRegex, '\n\n');
+    cleaned = cleaned.replace(new RegExp(`(?:${startPattern}|${endPattern})`, 'g'), '\n\n');
+  }
+
+  return cleaned.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function hasUnclosedProcessBlock(content: string, pairs: Array<{ startTag: string; endTag: string }>): boolean {
+  return pairs.some((pair) => {
+    const lastStartIndex = content.lastIndexOf(pair.startTag);
+    if (lastStartIndex === -1) return false;
+    const lastEndIndex = content.lastIndexOf(pair.endTag);
+    return lastEndIndex < lastStartIndex;
   });
+}
+
+function isLikelyStaleInactiveGroupMessage(content: string, pairs: Array<{ startTag: string; endTag: string }>): boolean {
+  const normalized = content.trim();
+  if (!normalized) return true;
+  if (hasUnclosedProcessBlock(normalized, pairs)) return true;
+
+  const containsProcessBlock = pairs.some((pair) => normalized.includes(pair.startTag));
+  if (!containsProcessBlock) return false;
+
+  return stripProcessBlocks(normalized, pairs).length === 0;
+}
+
+async function reconcileInactiveGroupLatestMessage(groupId: string): Promise<GroupReconciliationAction[]> {
+  const runState = groupChatEngine.getGroupRunState(groupId);
+  if (runState.active) {
+    return [];
+  }
+
+  const recentMessages = db.getRecentGroupMessages(groupId, 100);
+  const actions: GroupReconciliationAction[] = [];
+  const staleMessageIds = recentMessages
+    .filter((message) => (
+      message.sender_type === 'agent'
+      && typeof message.content === 'string'
+      && message.content.trim() === ''
+      && typeof message.id === 'number'
+    ))
+    .map((message) => message.id as number);
+
+  for (const messageId of staleMessageIds) {
+    const staleMessage = recentMessages.find((message) => message.id === messageId);
+    db.deleteGroupMessage(messageId);
+    actions.push({
+      type: 'delete',
+      id: messageId,
+      parent_id: typeof staleMessage?.parent_id === 'number' ? staleMessage.parent_id : null,
+    });
+  }
+
+  const latestAgentLikeMessage = [...recentMessages].reverse().find((message) => (
+    message.sender_type === 'agent'
+    && typeof message.id === 'number'
+  ));
+
+  if (!latestAgentLikeMessage?.id) {
+    return actions;
+  }
+
+  const latestNonSystemAgentMessage = [...recentMessages].reverse().find((message) => (
+    message.sender_type === 'agent'
+    && typeof message.id === 'number'
+    && !!message.sender_id
+    && message.sender_id !== 'system'
+  ));
+  const latestStoredMessage = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null;
+  const latestStoredMessageIsAgent = !!latestStoredMessage
+    && typeof latestStoredMessage.id === 'number'
+    && latestStoredMessage.id === latestAgentLikeMessage.id
+    && latestStoredMessage.sender_type === 'agent';
+  const currentContent = typeof latestAgentLikeMessage.content === 'string' ? latestAgentLikeMessage.content : '';
+  const currentStructured = getStructuredGroupMessage(currentContent);
+  const isLatestSystemFailureMessage = latestAgentLikeMessage.sender_id === 'system'
+    && currentStructured.messageCode === 'group.agentResponseFailed';
+  const sourceAgentName = typeof currentStructured.messageParams?.agentName === 'string'
+    ? currentStructured.messageParams.agentName.trim()
+    : '';
+  const groupMembers = db.getGroupMembers(groupId);
+  const matchedMember = sourceAgentName
+    ? groupMembers.find((member) => {
+      const session = db.getSessionByAgentId(member.agent_id) || db.getSession(member.agent_id);
+      const latestDisplayName = session?.name?.trim();
+      return member.display_name === sourceAgentName || latestDisplayName === sourceAgentName;
+    })
+    : undefined;
+  const sourceAgentId = latestAgentLikeMessage.sender_id && latestAgentLikeMessage.sender_id !== 'system'
+    ? latestAgentLikeMessage.sender_id
+    : (matchedMember?.agent_id || latestNonSystemAgentMessage?.sender_id || '');
+
+  if (!sourceAgentId) {
+    return actions;
+  }
+
+  const sourceAgentDisplayName = latestAgentLikeMessage.sender_id && latestAgentLikeMessage.sender_id !== 'system'
+    ? (latestAgentLikeMessage.sender_name || sourceAgentId)
+    : (matchedMember?.display_name || sourceAgentName || latestNonSystemAgentMessage?.sender_name || sourceAgentId);
+  const processTagPairs = getGroupProcessTagPairs(groupId, sourceAgentId);
+  const shouldAttemptHistoryReconciliation = latestStoredMessageIsAgent
+    || actions.length > 0
+    || isLikelyStaleInactiveGroupMessage(currentContent, processTagPairs);
+  const shouldAttemptFailureRecovery = isLatestSystemFailureMessage;
+
+  if (!shouldAttemptHistoryReconciliation && !shouldAttemptFailureRecovery) {
+    return actions;
+  }
+
+  try {
+    const runtimeContext = await prepareGroupRuntimeAgent(groupId, sourceAgentId);
+    const client = await getConnection(runtimeContext.runtimeAgentId);
+    const finalSessionKey = `agent:${runtimeContext.runtimeAgentId}:chat:${getGroupRuntimeSessionKey(groupId)}`;
+    const history = await client.getChatHistory(finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+    const latestOutcomeRecord = extractLatestAssistantOutcomeRecord(history);
+    const latestOutcome = latestOutcomeRecord.kind === 'text'
+      ? { kind: 'text' as const, text: latestOutcomeRecord.text }
+      : latestOutcomeRecord.kind === 'error'
+        ? { kind: 'error' as const, error: latestOutcomeRecord.error }
+        : { kind: 'none' as const };
+    const latestMessageCreatedAtMs = Date.parse(latestAgentLikeMessage.created_at || '');
+    const historyIsNewerThanCurrentMessage = latestOutcomeRecord.timestampMs !== null
+      && Number.isFinite(latestMessageCreatedAtMs)
+      && latestOutcomeRecord.timestampMs > latestMessageCreatedAtMs;
+
+    if (latestOutcome.kind === 'none') {
+      return actions;
+    }
+
+    if (latestOutcome.kind === 'error') {
+      const { content, messageCode, messageParams, rawDetail } = createAgentResponseFailedMessage(
+        sourceAgentDisplayName,
+        latestOutcome.error,
+      );
+
+      if (
+        latestAgentLikeMessage.content.trim() !== content.trim()
+        || latestAgentLikeMessage.sender_id !== 'system'
+        || latestAgentLikeMessage.sender_name !== '系统'
+      ) {
+        const modelUsed = latestAgentLikeMessage.model_used || agentProvisioner.readAgentModel(sourceAgentId) || undefined;
+        db.updateGroupMessage(latestAgentLikeMessage.id, content, modelUsed, null);
+        db.updateGroupMessageSender(latestAgentLikeMessage.id, 'system', '系统');
+        actions.push({
+          type: 'edit',
+          data: {
+            groupId,
+            id: latestAgentLikeMessage.id,
+            parent_id: typeof latestAgentLikeMessage.parent_id === 'number' ? latestAgentLikeMessage.parent_id : null,
+            sender_type: 'agent',
+            sender_id: 'system',
+            sender_name: '系统',
+            content,
+            model_used: modelUsed,
+            messageCode,
+            messageParams,
+            rawDetail,
+            created_at: latestAgentLikeMessage.created_at || new Date().toISOString(),
+          },
+        });
+      }
+
+      return actions;
+    }
+
+    const allowShorterHistoryReplacement = isLatestSystemFailureMessage && historyIsNewerThanCurrentMessage;
+    const preferredLatestText = selectPreferredTextSnapshot(currentContent, latestOutcome.text, {
+      allowShorterReplacement: allowShorterHistoryReplacement,
+    });
+    const shouldReplaceWithHistoryText = preferredLatestText === latestOutcome.text && (
+      shouldPreferSettledAssistantText(currentContent, latestOutcome.text)
+      || (
+        isLikelyStaleInactiveGroupMessage(currentContent, processTagPairs)
+        && latestOutcome.text.trim() !== currentContent.trim()
+      )
+      || allowShorterHistoryReplacement
+    );
+
+    if (shouldReplaceWithHistoryText) {
+      const modelUsed = latestAgentLikeMessage.model_used || agentProvisioner.readAgentModel(sourceAgentId) || undefined;
+      db.updateGroupMessage(latestAgentLikeMessage.id, preferredLatestText, modelUsed, latestAgentLikeMessage.mentions || null);
+      db.updateGroupMessageSender(latestAgentLikeMessage.id, sourceAgentId, sourceAgentDisplayName);
+      actions.push({
+        type: 'edit',
+        data: {
+          groupId,
+          id: latestAgentLikeMessage.id,
+          parent_id: typeof latestAgentLikeMessage.parent_id === 'number' ? latestAgentLikeMessage.parent_id : null,
+          sender_type: 'agent',
+          sender_id: sourceAgentId,
+          sender_name: sourceAgentDisplayName,
+          content: preferredLatestText,
+          model_used: modelUsed,
+          created_at: latestAgentLikeMessage.created_at || new Date().toISOString(),
+        },
+      });
+    }
+  } catch (error) {
+    console.warn(`[GroupReconcile] Failed to reconcile latest inactive message for group ${groupId}:`, error);
+  }
+
+  return actions;
+}
+
+function broadcastGroupReconciliationActions(groupId: string, actions: GroupReconciliationAction[], targetClients?: Iterable<express.Response>) {
+  if (actions.length === 0) return;
+
+  const clients = targetClients ? Array.from(targetClients) : Array.from(groupSSEClients.get(groupId) || []);
+  for (const action of actions) {
+    const payload = action.type === 'delete'
+      ? { type: 'delete', id: action.id, parent_id: action.parent_id }
+      : { type: 'edit', ...withStructuredGroupMessage(action.data, { groupId }) };
+    const data = JSON.stringify(payload);
+
+    for (const client of clients) {
+      try {
+        client.write(`data: ${data}\n\n`);
+      } catch {}
+    }
+  }
+}
+
+function removeAgentRuntimeState(agentId: string): void {
+  const agentStatePath = getAgentStatePath(agentId);
+  if (fs.existsSync(agentStatePath)) {
+    fs.rmSync(agentStatePath, { recursive: true, force: true });
+  }
+
+  const memoryDbPath = getAgentMemoryDbPath(agentId);
+  if (fs.existsSync(memoryDbPath)) {
+    fs.rmSync(memoryDbPath, { force: true });
+  }
+}
+
+function cleanupLegacyGroupRuntimeArtifacts(groupId: string): void {
+  const groupWorkspacePath = getGroupWorkspacePath(groupId);
+  const legacyRuntimeAgentIds = [
+    getLegacyGroupRuntimeAgentId(groupId),
+    getSharedGroupRuntimeAgentId(groupId),
+  ];
+
+  for (const legacyRuntimeAgentId of legacyRuntimeAgentIds) {
+    removeAgentRuntimeState(legacyRuntimeAgentId);
+    agentProvisioner.removeConfigEntry(legacyRuntimeAgentId);
+
+    const legacyWorkspacePath = agentProvisioner.getWorkspacePath(legacyRuntimeAgentId);
+    if (legacyWorkspacePath !== groupWorkspacePath && fs.existsSync(legacyWorkspacePath)) {
+      fs.rmSync(legacyWorkspacePath, { recursive: true, force: true });
+    }
+  }
+}
+
+function collectGroupRuntimeAgentIds(groupId: string): string[] {
+  const collected = new Set<string>([
+    getLegacyGroupRuntimeAgentId(groupId),
+    getSharedGroupRuntimeAgentId(groupId),
+  ]);
+
+  const runtimeAgentPrefix = getGroupRuntimeAgentPrefix(groupId);
+  const openClawRoot = path.join(os.homedir(), '.openclaw');
+  const agentStateRoot = path.join(openClawRoot, 'agents');
+  if (fs.existsSync(agentStateRoot)) {
+    for (const entry of fs.readdirSync(agentStateRoot, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith(runtimeAgentPrefix)) {
+        collected.add(entry.name);
+      }
+    }
+  }
+
+  const memoryRoot = path.join(openClawRoot, 'memory');
+  if (fs.existsSync(memoryRoot)) {
+    for (const entry of fs.readdirSync(memoryRoot, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith('.sqlite')) continue;
+      const agentId = entry.name.slice(0, -'.sqlite'.length);
+      if (agentId.startsWith(runtimeAgentPrefix)) {
+        collected.add(agentId);
+      }
+    }
+  }
+
+  const configPath = path.join(openClawRoot, 'openclaw.json');
+  if (fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      const agentList = Array.isArray(config?.agents?.list) ? config.agents.list : [];
+      for (const entry of agentList) {
+        if (typeof entry?.id === 'string' && entry.id.startsWith(runtimeAgentPrefix)) {
+          collected.add(entry.id);
+        }
+      }
+    } catch (error) {
+      console.warn(`[GroupRuntime] Failed to read openclaw.json while collecting runtime agents for group ${groupId}:`, error);
+    }
+  }
+
+  return Array.from(collected);
+}
+
+function cleanupGroupRuntimeAgent(groupId: string, options: { removeConfig?: boolean } = {}): void {
+  for (const runtimeAgentId of collectGroupRuntimeAgentIds(groupId)) {
+    removeAgentRuntimeState(runtimeAgentId);
+    if (options.removeConfig) {
+      agentProvisioner.removeConfigEntry(runtimeAgentId);
+    }
+
+    const runtimeWorkspacePath = agentProvisioner.getWorkspacePath(runtimeAgentId);
+    if (fs.existsSync(runtimeWorkspacePath)) {
+      fs.rmSync(runtimeWorkspacePath, { recursive: true, force: true });
+    }
+  }
+}
+
+async function prepareGroupRuntimeAgent(groupId: string, sourceAgentId: string): Promise<{
+  runtimeAgentId: string;
+  workspacePath: string;
+  uploadsPath: string;
+  outputPath: string;
+}> {
+  const { workspacePath, uploadsPath, outputPath } = ensureGroupWorkspace(groupId);
+  const runtimeAgentId = getGroupRuntimeAgentId(groupId, sourceAgentId);
+  const runtimeDefaultWorkspacePath = agentProvisioner.getWorkspacePath(runtimeAgentId);
+  const sourceModelConfig = agentProvisioner.readAgentModelConfig(sourceAgentId);
+
+  cleanupLegacyGroupRuntimeArtifacts(groupId);
+
+  const hasLegacyRuntimeWorkspace = (
+    runtimeDefaultWorkspacePath !== workspacePath
+    && fs.existsSync(runtimeDefaultWorkspacePath)
+  );
+
+  if (hasLegacyRuntimeWorkspace) {
+    migrateGroupRuntimeWorkspaceContents(runtimeDefaultWorkspacePath, workspacePath);
+    fs.rmSync(runtimeDefaultWorkspacePath, { recursive: true, force: true });
+  }
+
+  if (hasLegacyRuntimeWorkspace || runtimeAgentSessionsNeedWorkspaceReset(runtimeAgentId, workspacePath)) {
+    resetRuntimeAgentSessions(runtimeAgentId);
+  }
+
+  await agentProvisioner.provision({
+    agentId: runtimeAgentId,
+    workspaceDir: workspacePath,
+    soulContent: agentProvisioner.readSoul(sourceAgentId) || undefined,
+    userContent: agentProvisioner.readAgentFile(sourceAgentId, 'USER.md', ''),
+    agentsContent: agentProvisioner.readAgentFile(sourceAgentId, 'AGENTS.md', ''),
+    toolsContent: agentProvisioner.readAgentFile(sourceAgentId, 'TOOLS.md', ''),
+    heartbeatContent: agentProvisioner.readAgentFile(sourceAgentId, 'HEARTBEAT.md', ''),
+    identityContent: agentProvisioner.readAgentFile(sourceAgentId, 'IDENTITY.md', ''),
+    model: sourceModelConfig.modelOverride || undefined,
+    fallbackMode: sourceModelConfig.fallbackMode,
+    fallbacks: sourceModelConfig.fallbacks,
+  });
+
+  if (runtimeDefaultWorkspacePath !== workspacePath && fs.existsSync(runtimeDefaultWorkspacePath)) {
+    fs.rmSync(runtimeDefaultWorkspacePath, { recursive: true, force: true });
+  }
+
+  return {
+    runtimeAgentId,
+    workspacePath,
+    uploadsPath,
+    outputPath,
+  };
 }
 
 // Helper to get or create connection
@@ -190,19 +1547,26 @@ app.get('/health', (_req, res) => {
 });
 
 // API Routes
-app.get('/api/system/check-update', async (_req, res) => {
+app.get('/api/version', (_req, res) => {
   try {
-    const response = await axios.get('https://api.github.com/repos/liandu2024/OpenClaw-Chat-Gateway/releases/latest', {
-      timeout: 10000,
-      headers: {
-        'Accept': 'application/vnd.github.v3+json',
-        'User-Agent': 'OpenClaw-Chat-Gateway-ClawUI'
-      }
-    });
-    res.json(response.data);
-  } catch (error) {
-    console.error('[UpdateCheck] Failed to fetch latest release:', error instanceof Error ? error.message : String(error));
-    res.status(500).json({ error: 'Failed to fetch update info from GitHub' });
+    res.json(getCurrentAppVersionInfo());
+  } catch (error: any) {
+    res.status(500).json(buildStructuredApiError(
+      VERSION_INFO_UNAVAILABLE_ERROR_CODE,
+      error instanceof Error ? error.message : String(error),
+    ));
+  }
+});
+
+app.get('/api/version/latest', async (_req, res) => {
+  try {
+    res.json(await getLatestVersionInfo());
+  } catch (error: any) {
+    console.error('[VersionCheck] Failed to fetch latest release:', error instanceof Error ? error.message : String(error));
+    res.status(502).json(buildStructuredApiError(
+      VERSION_LOOKUP_FAILED_ERROR_CODE,
+      error instanceof Error ? error.message : String(error),
+    ));
   }
 });
 
@@ -220,12 +1584,40 @@ app.get('/api/config', (_req, res) => {
     loginPassword: config.loginPassword || '123456',
     allowedHosts: config.allowedHosts || [],
     openclawWorkspace: config.openclawWorkspace || '',
+    historyPageRounds: config.historyPageRounds || 30,
   });
 });
 
 app.post('/api/config', (req, res) => {
   configManager.setConfig(req.body);
   res.json({ success: true });
+});
+
+app.get('/api/sidebar/favorites', (_req, res) => {
+  const config = configManager.getConfig();
+  res.json({
+    success: true,
+    favorites: config.sidebarFavorites || {
+      agents: [],
+      groups: [],
+      order: [],
+    },
+  });
+});
+
+app.post('/api/sidebar/favorites', (req, res) => {
+  configManager.setConfig({
+    sidebarFavorites: req.body?.favorites ?? req.body,
+  });
+  const config = configManager.getConfig();
+  res.json({
+    success: true,
+    favorites: config.sidebarFavorites || {
+      agents: [],
+      groups: [],
+      order: [],
+    },
+  });
 });
 
 import crypto from 'crypto';
@@ -265,7 +1657,12 @@ app.post('/api/auth/login', (req, res) => {
   if (password === correctPassword) {
     res.json({ success: true, token: generateAuthToken(correctPassword) });
   } else {
-    res.status(401).json({ success: false, message: '密码错误' });
+    res.status(401).json({
+      success: false,
+      errorCode: 'auth.invalidPassword',
+      errorParams: null,
+      errorDetail: null,
+    });
   }
 });
 
@@ -294,7 +1691,7 @@ app.post('/api/config/test', async (req, res) => {
   const { gatewayUrl, token, password } = req.body;
 
   if (!gatewayUrl) {
-    return res.status(400).json({ success: false, message: 'Gateway URL is required' });
+    return res.status(400).json(buildStructuredApiError(GATEWAY_TEST_FAILED_ERROR_CODE, 'Gateway URL is required'));
   }
 
   try {
@@ -312,7 +1709,7 @@ app.post('/api/config/test', async (req, res) => {
     res.json({ success: true, message: 'Connection successful' });
   } catch (error: any) {
     console.error('[API] /api/config/test - Connection failed:', error);
-    res.json({ success: false, message: error?.message || 'Connection failed' });
+    res.json(buildStructuredApiError(GATEWAY_TEST_FAILED_ERROR_CODE, error?.message || 'Connection failed'));
   }
 });
 
@@ -339,7 +1736,7 @@ app.get('/api/config/detect-all', (req, res) => {
     }
 
     if (!gatewayUrl && !workspacePath) {
-      return res.json({ success: false, message: 'Could not detect gateway config or workspace' });
+      return res.json(buildStructuredApiError(GATEWAY_DETECT_FAILED_ERROR_CODE, 'Could not detect gateway config or workspace'));
     }
 
     res.json({
@@ -352,7 +1749,7 @@ app.get('/api/config/detect-all', (req, res) => {
       }
     });
   } catch (error: any) {
-    res.json({ success: false, message: 'Error detecting config: ' + error.message });
+    res.json(buildStructuredApiError(GATEWAY_DETECT_FAILED_ERROR_CODE, error?.message || 'Error detecting config'));
   }
 });
 
@@ -371,75 +1768,71 @@ const MAX_PERMISSIONS_TOOLS = {
   }
 };
 
+app.get('/api/config/browser-health', async (_req, res) => {
+  try {
+    const health = await runBrowserHealthCheck();
+    res.json({ success: true, health });
+  } catch (error: any) {
+    res.json(buildStructuredApiError(
+      BROWSER_HEALTH_FAILED_ERROR_CODE,
+      readCliErrorDetail(error) || error?.message || 'Browser health check failed'
+    ));
+  }
+});
+
+app.post('/api/config/browser-health/self-heal', async (_req, res) => {
+  try {
+    const before = await runBrowserHealthCheck();
+
+    setMaxPermissionsEnabled(true);
+    await restartGatewayService();
+    await stopOpenClawBrowserBestEffort();
+    await startOpenClawBrowserDetached(['--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS)]);
+
+    let after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
+    let usedHeadlessFallback = false;
+
+    if (!after.healthy && readBrowserConfigState().headless !== true) {
+      usedHeadlessFallback = true;
+      setBrowserHeadlessMode(true);
+      await stopOpenClawBrowserBestEffort();
+      await startOpenClawBrowserDetached(['--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS)]);
+      after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
+    }
+
+    res.json({
+      success: true,
+      before,
+      after,
+      gatewayRestarted: true,
+      usedHeadlessFallback,
+    });
+  } catch (error: any) {
+    res.json(buildStructuredApiError(
+      BROWSER_SELF_HEAL_FAILED_ERROR_CODE,
+      readCliErrorDetail(error) || error?.message || 'Browser self-heal failed'
+    ));
+  }
+});
+
 app.get('/api/config/max-permissions', (_req, res) => {
   try {
-    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-    if (!fs.existsSync(configPath)) {
-      return res.json({ enabled: false });
-    }
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-    // If tools has a "profile" key, it's using the simplified preset (not max permissions)
-    const enabled = !config.tools?.profile && config.tools?.exec?.security === 'full';
-    res.json({ enabled });
+    res.json({ enabled: readMaxPermissionsEnabled() === true });
   } catch (error: any) {
     res.json({ enabled: false });
   }
 });
 
 app.post('/api/config/max-permissions', (req, res) => {
-  try {
+  (async () => {
     const { enabled } = req.body;
-    const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-    if (!fs.existsSync(configPath)) {
-      return res.status(404).json({ success: false, message: 'openclaw.json not found' });
-    }
-    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    setMaxPermissionsEnabled(Boolean(enabled));
+    await restartGatewayService();
 
-    if (enabled) {
-      config.tools = MAX_PERMISSIONS_TOOLS;
-      // Ensure commands are fully enabled
-      if (!config.commands) config.commands = {};
-      config.commands.bash = true;
-      config.commands.restart = true;
-      config.commands.native = 'auto';
-      config.commands.nativeSkills = 'auto';
-    } else {
-      config.tools = { profile: 'coding' };
-    }
-
-    // Ensure sandbox is off for local self-hosted setups
-    if (!config.agents) config.agents = {};
-    if (!config.agents.defaults) config.agents.defaults = {};
-    if (!config.agents.defaults.sandbox) config.agents.defaults.sandbox = {};
-    config.agents.defaults.sandbox.mode = 'off';
-
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-
-    // Also patch exec-approvals.json (the actual file OpenClaw reads for approval policy)
-    const execApprovalsPath = path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
-    if (fs.existsSync(execApprovalsPath)) {
-      try {
-        const approvals = JSON.parse(fs.readFileSync(execApprovalsPath, 'utf-8'));
-        if (!approvals.defaults) approvals.defaults = {};
-        if (enabled) {
-          approvals.defaults.ask = 'off';
-          approvals.defaults.security = 'full';
-          approvals.agents = { '*': { allowlist: [{ pattern: '*' }] } };
-        } else {
-          delete approvals.defaults.ask;
-          delete approvals.defaults.security;
-          delete approvals.agents;
-        }
-        fs.writeFileSync(execApprovalsPath, JSON.stringify(approvals, null, 2));
-      } catch (e) {
-        console.error('Failed to patch exec-approvals.json:', e);
-      }
-    }
-
-    res.json({ success: true, enabled });
-  } catch (error: any) {
+    res.json({ success: true, enabled: Boolean(enabled) });
+  })().catch((error: any) => {
     res.status(500).json({ success: false, message: error.message });
-  }
+  });
 });
 
 app.post('/api/config/restart', async (_req, res) => {
@@ -460,7 +1853,7 @@ app.post('/api/config/restart', async (_req, res) => {
     res.json({ success: true, message: 'Gateway connections reset and service restarted' });
   } catch (error: any) {
     console.error('Failed to restart gateway:', error);
-    res.status(500).json({ success: false, error: '执行重启命令失败: ' + error.message });
+    res.status(500).json(buildStructuredApiError(GATEWAY_RESTART_FAILED_ERROR_CODE, error?.message));
   }
 });
 
@@ -469,17 +1862,46 @@ app.get('/api/models', (_req, res) => {
   res.json({ success: true, models });
 });
 
+app.get('/api/models/fallbacks', (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      config: agentProvisioner.readGlobalModelConfig(),
+    });
+  } catch (err: any) {
+    res.status(500).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, err?.message));
+  }
+});
+
+app.put('/api/models/fallbacks', async (req, res) => {
+  try {
+    if (!Array.isArray(req.body?.fallbacks)) {
+      return res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, 'fallbacks must be an array'));
+    }
+
+    const success = await agentProvisioner.updateGlobalFallbacks(normalizeFallbackList(req.body.fallbacks));
+    res.json({
+      success: true,
+      changed: success,
+      config: agentProvisioner.readGlobalModelConfig(),
+    });
+  } catch (err: any) {
+    const detail = typeof err?.message === 'string' ? err.message : '';
+    res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, detail || 'Failed to update fallback models'));
+  }
+});
+
 app.post('/api/models/test', async (req, res) => {
   try {
     const { endpoint, modelName } = req.body;
     if (!endpoint || !modelName) {
-      return res.status(400).json({ success: false, error: 'endpoint and modelName required' });
+      return res.status(400).json(buildStructuredApiError(MODEL_TEST_FAILED_ERROR_CODE, 'endpoint and modelName required'));
     }
 
     const endpoints = agentProvisioner.getEndpoints();
     const config = endpoints.find((e: any) => e.id === endpoint);
     if (!config) {
-      return res.status(404).json({ success: false, error: 'Endpoint not found' });
+      return res.status(404).json(buildStructuredApiError(MODEL_TEST_FAILED_ERROR_CODE, 'Endpoint not found'));
     }
 
     let baseUrl = config.baseUrl;
@@ -529,6 +1951,7 @@ app.post('/api/models/test', async (req, res) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
 
+    const startTime = Date.now();
     try {
       const resp = await fetch(testUrl, {
         method: 'POST',
@@ -538,8 +1961,9 @@ app.post('/api/models/test', async (req, res) => {
       });
       clearTimeout(timeoutId);
 
+      const latency = Date.now() - startTime;
       if (resp.ok) {
-        return res.json({ success: true, message: '模型有效连通' });
+        return res.json({ success: true, message: '模型有效连通', latency });
       } else {
         const errorText = await (await resp.blob()).text();
         let errMsg = `HTTP ${resp.status} ${resp.statusText}`;
@@ -551,14 +1975,14 @@ app.post('/api/models/test', async (req, res) => {
         } catch {
           if (errorText.length > 0) errMsg += ` - ${errorText.substring(0, 100)}`;
         }
-        return res.json({ success: false, error: errMsg });
+        return res.json(buildStructuredApiError(MODEL_TEST_FAILED_ERROR_CODE, errMsg));
       }
     } catch (e: any) {
       clearTimeout(timeoutId);
-      return res.json({ success: false, error: e.message || '网络连接失败' });
+      return res.json(buildStructuredApiError(MODEL_TEST_FAILED_ERROR_CODE, e?.message || 'Network connection failed'));
     }
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(MODEL_TEST_FAILED_ERROR_CODE, err?.message));
   }
 });
 
@@ -566,13 +1990,13 @@ app.get('/api/models/discover', async (req, res) => {
   try {
     const endpoint = req.query.endpoint as string;
     if (!endpoint) {
-      return res.status(400).json({ success: false, error: 'endpoint required' });
+      return res.status(400).json(buildStructuredApiError(MODEL_DISCOVER_FAILED_ERROR_CODE, 'endpoint required'));
     }
 
     const endpoints = agentProvisioner.getEndpoints();
     const config = endpoints.find((e: any) => e.id === endpoint);
     if (!config) {
-      return res.status(404).json({ success: false, error: 'Endpoint not found' });
+      return res.status(404).json(buildStructuredApiError(MODEL_DISCOVER_FAILED_ERROR_CODE, 'Endpoint not found'));
     }
 
     const baseUrl = config.baseUrl.replace(/\/$/, '');
@@ -610,7 +2034,7 @@ app.get('/api/models/discover', async (req, res) => {
 
     if (!resp.ok) {
       const errorText = await resp.text();
-      return res.status(resp.status).json({ success: false, error: `Failed to discover models: HTTP ${resp.status} - ${errorText.substring(0, 100)}` });
+      return res.status(resp.status).json(buildStructuredApiError(MODEL_DISCOVER_FAILED_ERROR_CODE, `Failed to discover models: HTTP ${resp.status} - ${errorText.substring(0, 100)}`));
     }
 
     const data: any = await resp.json();
@@ -635,40 +2059,40 @@ app.get('/api/models/discover', async (req, res) => {
 
     return res.json({ success: true, models: models.filter(Boolean) });
   } catch (err: any) {
-    return res.status(500).json({ success: false, error: err.message || 'Network error during discovery' });
+    return res.status(500).json(buildStructuredApiError(MODEL_DISCOVER_FAILED_ERROR_CODE, err?.message || 'Network error during discovery'));
   }
 });
 
 app.post('/api/models/manage', async (req, res) => {
   try {
-    const { endpoint, modelName, alias } = req.body;
+    const { endpoint, modelName, alias, input } = req.body;
     if (!endpoint || !modelName) {
-      return res.status(400).json({ success: false, error: 'endpoint and modelName required' });
+      return res.status(400).json(buildStructuredApiError(MODEL_CREATE_FAILED_ERROR_CODE, 'endpoint and modelName required'));
     }
-    const success = await agentProvisioner.addModelConfig(endpoint, modelName, alias);
+    const success = await agentProvisioner.addModelConfig(endpoint, modelName, alias, Array.isArray(input) ? input : undefined);
     if (success) {
       // Gateway auto-reloads config files on change
       return res.json({ success: true });
     }
-    return res.status(400).json({ success: false, error: 'Model may already exist or config invalid' });
+    return res.status(400).json(buildStructuredApiError(MODEL_CREATE_FAILED_ERROR_CODE, 'Model may already exist or config invalid'));
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(MODEL_CREATE_FAILED_ERROR_CODE, err?.message));
   }
 });
 
 app.delete('/api/models/manage', async (req, res) => {
   try {
     const { id } = req.body;
-    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+    if (!id) return res.status(400).json(buildStructuredApiError(MODEL_DELETE_FAILED_ERROR_CODE, 'id required'));
     
     const success = await agentProvisioner.deleteModelConfig(id);
     if (success) {
       // Gateway auto-reloads config files on change
       return res.json({ success: true });
     }
-    return res.status(404).json({ success: false, error: 'Model not found' });
+    return res.status(404).json(buildStructuredApiError(MODEL_DELETE_FAILED_ERROR_CODE, 'Model not found'));
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(MODEL_DELETE_FAILED_ERROR_CODE, err?.message));
   }
 });
 
@@ -690,35 +2114,34 @@ app.put('/api/models/manage/default', async (req, res) => {
 
 app.put('/api/models/manage', async (req, res) => {
   try {
-    const { id, alias } = req.body;
-    if (!id) return res.status(400).json({ success: false, error: 'id required' });
+    const { id, alias, input } = req.body;
+    if (!id) return res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, 'id required'));
 
-    const success = await agentProvisioner.updateModelConfig(id, alias);
+    const success = await agentProvisioner.updateModelConfig(id, alias, Array.isArray(input) ? input : undefined);
     if (success) {
       return res.json({ success: true });
     }
-    return res.status(404).json({ success: false, error: 'Model not found' });
+    return res.status(404).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, 'Model not found'));
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, err?.message));
   }
 });
 
 app.delete('/api/endpoints/manage', async (req, res) => {
   try {
     const { endpoint } = req.body;
-    if (!endpoint) return res.status(400).json({ success: false, error: 'endpoint required' });
+    if (!endpoint) return res.status(400).json(buildStructuredApiError(ENDPOINT_DELETE_FAILED_ERROR_CODE, 'endpoint required'));
 
     const count = await agentProvisioner.deleteEndpointConfig(endpoint);
     if (count > 0) {
       // Gateway auto-reloads config files on change
       return res.json({ success: true, deleted: count });
     }
-    return res.status(404).json({ success: false, error: 'Endpoint not found or no models under it' });
+    return res.status(404).json(buildStructuredApiError(ENDPOINT_DELETE_FAILED_ERROR_CODE, 'Endpoint not found or no models under it'));
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(ENDPOINT_DELETE_FAILED_ERROR_CODE, err?.message));
   }
 });
-
 app.get('/api/endpoints', (_req, res) => {
   try {
     const endpoints = agentProvisioner.getEndpoints();
@@ -728,11 +2151,62 @@ app.get('/api/endpoints', (_req, res) => {
   }
 });
 
+app.post('/api/endpoints/test', async (req, res) => {
+  try {
+    const { baseUrl, apiKey, api } = req.body;
+    if (!baseUrl || !api) {
+      return res.status(400).json(buildStructuredApiError(ENDPOINT_TEST_FAILED_ERROR_CODE, 'baseUrl and api are required'));
+    }
+
+    const cleanBaseUrl = baseUrl.replace(/\/$/, '');
+    const apiType = api.toLowerCase();
+
+    let discoverUrl = '';
+    const headers: any = {
+      'Content-Type': 'application/json'
+    };
+
+    if (apiType.includes('anthropic')) {
+      discoverUrl = `${cleanBaseUrl}/models`;
+      headers['x-api-key'] = apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+    } else if (apiType.includes('gemini') || apiType.includes('google')) {
+      discoverUrl = `${cleanBaseUrl}/models?key=${apiKey}`;
+    } else if (apiType.includes('ollama')) {
+      discoverUrl = `${cleanBaseUrl}/api/tags`;
+    } else {
+      discoverUrl = `${cleanBaseUrl}/models`;
+      if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      }
+    }
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    const resp = await fetch(discoverUrl, {
+      method: 'GET',
+      headers,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (resp.ok) {
+        return res.json({ success: true });
+    } else {
+        const errText = await resp.text();
+        return res.json(buildStructuredApiError(ENDPOINT_TEST_FAILED_ERROR_CODE, `Status ${resp.status}: ${errText.substring(0, 100)}`));
+    }
+  } catch (err: any) {
+    return res.json(buildStructuredApiError(ENDPOINT_TEST_FAILED_ERROR_CODE, err?.message || 'Connection failed'));
+  }
+});
+
 app.post('/api/endpoints', async (req, res) => {
   try {
     const { id, baseUrl, apiKey, api } = req.body;
     if (!id || !baseUrl || !api) {
-      return res.status(400).json({ success: false, error: 'id, baseUrl, and api are required' });
+      return res.status(400).json(buildStructuredApiError(ENDPOINT_CREATE_FAILED_ERROR_CODE, 'id, baseUrl, and api are required'));
     }
 
     const success = await agentProvisioner.saveEndpoint(id, { baseUrl, apiKey, api });
@@ -740,9 +2214,9 @@ app.post('/api/endpoints', async (req, res) => {
       // Gateway auto-reloads config files on change
       return res.json({ success: true });
     }
-    return res.status(400).json({ success: false, error: 'Failed to save endpoint' });
+    return res.status(400).json(buildStructuredApiError(ENDPOINT_CREATE_FAILED_ERROR_CODE, 'Failed to save endpoint'));
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(buildStructuredApiError(ENDPOINT_CREATE_FAILED_ERROR_CODE, err?.message));
   }
 });
 
@@ -763,48 +2237,52 @@ app.get('/api/characters', (_req, res) => {
 });
 
 app.post('/api/characters', async (req, res) => {
-  const char = req.body;
-  if (!char.id) char.id = 'char_' + Date.now();
+  try {
+    const char = req.body;
+    if (!char.id) char.id = 'char_' + Date.now();
 
-  // Validate agentId
-  if (!char.agentId) {
-    return res.status(400).json({ success: false, error: '智能体 ID 不能为空' });
-  }
-  if (/\s/.test(char.agentId)) {
-    return res.status(400).json({ success: false, error: '智能体 ID 不允许包含空格' });
-  }
-  
-  // Check for duplicate agentId (excluding the current character being edited)
-  const existingChars = db.getCharacters();
-  const isDuplicate = existingChars.some(c => c.agentId === char.agentId && c.id !== char.id);
-  if (isDuplicate) {
-    return res.status(400).json({ success: false, error: `智能体 ID "${char.agentId}" 已存在，请使用其他 ID` });
-  }
-
-  // Provision full isolated environment in OpenClaw (workspace, SOUL.md, USER.md, etc.)
-  const configChanged = await agentProvisioner.provision({
-    agentId: char.agentId,
-    soulContent: char.systemPrompt,
-    model: char.model,
-  });
-  
-  // Also update SOUL.md if this is an existing character being re-saved
-  if (!configChanged) {
-    await agentProvisioner.updateSoul(char.agentId, char.systemPrompt);
-    // Update model in config if changed
-    const modelChanged = await agentProvisioner.updateModel(char.agentId, char.model);
-    if (modelChanged) {
-      // Gateway auto-reloads config
+    // Validate agentId
+    if (!char.agentId) {
+      return res.status(400).json({ success: false, error: '智能体 ID 不能为空' });
     }
-  }
-  
-  db.saveCharacter(char);
+    if (/\s/.test(char.agentId)) {
+      return res.status(400).json({ success: false, error: '智能体 ID 不允许包含空格' });
+    }
+    
+    // Check for duplicate agentId (excluding the current character being edited)
+    const existingChars = db.getCharacters();
+    const isDuplicate = existingChars.some(c => c.agentId === char.agentId && c.id !== char.id);
+    if (isDuplicate) {
+      return res.status(400).json({ success: false, error: `智能体 ID "${char.agentId}" 已存在，请使用其他 ID` });
+    }
 
-  if (configChanged) {
-      console.log('OpenClaw config changed for new agent, auto-reloading...');
-  }
+    // Provision full isolated environment in OpenClaw (workspace, SOUL.md, USER.md, etc.)
+    const configChanged = await agentProvisioner.provision({
+      agentId: char.agentId,
+      soulContent: char.systemPrompt,
+      model: char.model,
+    });
+    
+    // Also update SOUL.md if this is an existing character being re-saved
+    if (!configChanged) {
+      await agentProvisioner.updateSoul(char.agentId, char.systemPrompt);
+      // Update model in config if changed
+      const modelChanged = await agentProvisioner.updateModel(char.agentId, char.model);
+      if (modelChanged) {
+        // Gateway auto-reloads config
+      }
+    }
+    
+    db.saveCharacter(char);
 
-  res.json({ success: true, character: char });
+    if (configChanged) {
+        console.log('OpenClaw config changed for new agent, auto-reloading...');
+    }
+
+    res.json({ success: true, character: char });
+  } catch (err: any) {
+    res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, err?.message));
+  }
 });
 
 app.delete('/api/characters/:id', async (req, res) => {
@@ -858,38 +2336,59 @@ app.get('/api/sessions', (_req, res) => {
 });
 
 app.post('/api/sessions', async (req, res) => {
-  const { id, name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model } = req.body;
+  const { id, name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model, process_start_tag, process_end_tag } = req.body;
+  const fallbackMode = normalizeFallbackMode(req.body?.fallbackMode) ?? 'inherit';
+  const fallbacks = normalizeFallbackList(req.body?.fallbacks);
   const prompt = soulContent;
-  
-  if (id && sessionManager.getSession(id)) {
-    return res.status(400).json({ success: false, error: 'Agent ID already exists' });
+
+  const rawId = typeof id === 'string' ? id : '';
+  const normalizedId = rawId.trim();
+
+  if (!normalizedId) {
+    return res.status(400).json(buildStructuredApiError(AGENT_ID_REQUIRED_ERROR_CODE));
   }
 
-  // Provide basic default for first session if it doesn't exist
-  const newSession = sessionManager.createSession({ id, name, prompt });
-  const agentId = newSession.id;
+  if (/\s/.test(rawId)) {
+    return res.status(400).json(buildStructuredApiError(AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE));
+  }
 
-  // Provision agent workspace
-  await agentProvisioner.provision({ 
-    agentId, 
-    soulContent: prompt,
-    userContent,
-    agentsContent,
-    toolsContent,
-    heartbeatContent,
-    identityContent,
-    model 
-  });
-  
-  // Update session record with the auto-generated agentId
-  sessionManager.updateSession(newSession.id, { agentId });
-  const finalSession = sessionManager.getSession(newSession.id);
+  if (sessionManager.getSession(normalizedId)) {
+    return res.status(400).json(buildStructuredApiError(AGENT_ID_ALREADY_EXISTS_ERROR_CODE, null, { agentId: normalizedId }));
+  }
 
-  res.json({ success: true, session: finalSession });
+  try {
+    // Provide basic default for first session if it doesn't exist
+    const newSession = sessionManager.createSession({ id: normalizedId, name, prompt, process_start_tag, process_end_tag });
+    const agentId = newSession.id;
+
+    // Provision agent workspace
+    await agentProvisioner.provision({ 
+      agentId, 
+      soulContent: prompt,
+      userContent,
+      agentsContent,
+      toolsContent,
+      heartbeatContent,
+      identityContent,
+      model,
+      fallbackMode,
+      fallbacks,
+    });
+    
+    // Update session record with the auto-generated agentId
+    sessionManager.updateSession(newSession.id, { agentId });
+    const finalSession = sessionManager.getSession(newSession.id);
+
+    res.json({ success: true, session: finalSession });
+  } catch (err: any) {
+    res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, err?.message));
+  }
 });
 
 app.put('/api/sessions/:id', async (req, res) => {
-  const { name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model } = req.body;
+  const { name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model, process_start_tag, process_end_tag } = req.body;
+  const fallbackMode = normalizeFallbackMode(req.body?.fallbackMode) ?? 'inherit';
+  const fallbacks = normalizeFallbackList(req.body?.fallbacks);
   const prompt = soulContent;
   const session = sessionManager.getSession(req.params.id);
   
@@ -897,24 +2396,28 @@ app.put('/api/sessions/:id', async (req, res) => {
     return res.status(404).json({ success: false, error: 'Session not found' });
   }
 
-  const updated = sessionManager.updateSession(req.params.id, { name, prompt });
-  
-  if (session.agentId) {
-    await agentProvisioner.updateSoul(session.agentId, prompt || '');
-    if (userContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'USER.md', userContent);
-    if (agentsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'AGENTS.md', agentsContent);
-    if (toolsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'TOOLS.md', toolsContent);
-    if (heartbeatContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'HEARTBEAT.md', heartbeatContent);
-    if (identityContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'IDENTITY.md', identityContent);
+  try {
+    const updated = sessionManager.updateSession(req.params.id, { name, prompt, process_start_tag, process_end_tag });
     
-    // Model update might require gateway restart
-    const modelChanged = await agentProvisioner.updateModel(session.agentId, model);
-    if (modelChanged) {
-      // Gateway auto-reloads config
+    if (session.agentId) {
+      await agentProvisioner.updateSoul(session.agentId, prompt || '');
+      if (userContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'USER.md', userContent);
+      if (agentsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'AGENTS.md', agentsContent);
+      if (toolsContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'TOOLS.md', toolsContent);
+      if (heartbeatContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'HEARTBEAT.md', heartbeatContent);
+      if (identityContent !== undefined) agentProvisioner.writeAgentFile(session.agentId, 'IDENTITY.md', identityContent);
+      
+      // Model update might require gateway restart
+      const modelChanged = await agentProvisioner.updateModel(session.agentId, model, { mode: fallbackMode, fallbacks });
+      if (modelChanged) {
+        // Gateway auto-reloads config
+      }
     }
-  }
 
-  res.json({ success: true, session: updated });
+    res.json({ success: true, session: updated });
+  } catch (err: any) {
+    res.status(400).json(buildStructuredApiError(MODEL_UPDATE_FAILED_ERROR_CODE, err?.message));
+  }
 });
 
 app.delete('/api/sessions/:id', async (req, res) => {
@@ -943,6 +2446,49 @@ app.delete('/api/sessions/:id', async (req, res) => {
   }
 });
 
+// Reset session (clear history, files, context but keep session entity)
+app.post('/api/sessions/:id/reset', async (req, res) => {
+  const session = sessionManager.getSession(req.params.id);
+  if (!session) {
+    return res.status(404).json({ success: false, error: 'Session not found' });
+  }
+
+  try {
+    const agentId = session.agentId;
+
+    // Clear database records
+    db.deleteMessagesBySession(req.params.id);
+    db.deleteFilesBySession(req.params.id);
+
+    // Clear agent workspace uploads directory
+    if (agentId) {
+      const workspacePath = agentProvisioner.getWorkspacePath(agentId);
+      const uploadsPath = path.join(workspacePath, 'uploads');
+      if (fs.existsSync(uploadsPath)) {
+        fs.rmSync(uploadsPath, { recursive: true, force: true });
+        fs.mkdirSync(uploadsPath, { recursive: true });
+      }
+
+      // Clear agent state directory
+      const agentStatePath = path.join(process.env.HOME || '.', '.openclaw', 'agents', agentId);
+      if (fs.existsSync(agentStatePath)) {
+        fs.rmSync(agentStatePath, { recursive: true, force: true });
+      }
+
+      // Clear agent memory database
+      const memoryDbPath = path.join(process.env.HOME || '.', '.openclaw', 'memory', `${agentId}.sqlite`);
+      if (fs.existsSync(memoryDbPath)) {
+        fs.rmSync(memoryDbPath, { force: true });
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to reset session:', err);
+    res.status(500).json({ success: false, error: 'Failed to reset session' });
+  }
+});
+
 // Endpoint to fetch all configuring MD files for a given session's agent
 app.get('/api/sessions/:id/configs', (req, res) => {
   const session = sessionManager.getSession(req.params.id);
@@ -951,6 +2497,7 @@ app.get('/api/sessions/:id/configs', (req, res) => {
   }
   
   const agentId = session.agentId;
+  const modelConfig = agentProvisioner.readAgentModelConfig(agentId);
   res.json({
     success: true,
     configs: {
@@ -960,7 +2507,11 @@ app.get('/api/sessions/:id/configs', (req, res) => {
       toolsContent: agentProvisioner.readAgentFile(agentId, 'TOOLS.md', ''),
       heartbeatContent: agentProvisioner.readAgentFile(agentId, 'HEARTBEAT.md', ''),
       identityContent: agentProvisioner.readAgentFile(agentId, 'IDENTITY.md', ''),
-      model: agentProvisioner.readAgentModel(agentId)
+      model: modelConfig.model,
+      modelOverride: modelConfig.modelOverride,
+      resolvedModel: modelConfig.resolvedModel,
+      fallbackMode: modelConfig.fallbackMode,
+      fallbacks: modelConfig.fallbacks,
     }
   });
 });
@@ -975,8 +2526,33 @@ app.post('/api/sessions/reorder', (req, res) => {
 });
 
 app.get('/api/history/:sessionId', (req, res) => {
-  const rows = db.getMessages(req.params.sessionId, 200).reverse();
-  res.json({ success: true, messages: rows });
+  const { beforeId, limit } = getHistoryPageQueryParams(req.query as Record<string, unknown>);
+  const result = db.getMessagesPage(req.params.sessionId, { beforeId, limit });
+  res.json(buildHistoryPageResponse(
+    result.rows.map((row) => withStructuredChatMessage(row, { sessionId: req.params.sessionId })),
+    result.pageInfo,
+  ));
+});
+
+app.get('/api/history/:sessionId/search', (req, res) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    res.json(buildHistorySearchResponse(db.searchMessages(req.params.sessionId, query)));
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/messages/:id', (req, res) => {
+  const { id } = req.params;
+  const { content } = req.body;
+  if (!content) return res.status(400).json({ success: false, error: 'Content is required' });
+  try {
+    db.updateMessageContent(Number(id), content);
+    res.json({ success: true });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.delete('/api/messages/:id', (req, res) => {
@@ -989,139 +2565,807 @@ app.delete('/api/messages/:id', (req, res) => {
   }
 });
 
+interface ActiveRun {
+  sessionId: string;
+  runId: string;
+  agentId: string;
+  agentName: string;
+  modelUsed: string;
+  messageId: number;
+  workspacePath: string;
+  finalSessionKey: string;
+  historySnapshot: ChatHistorySnapshot;
+  text: string;           // Accumulated text so far
+  clients: express.Response[]; // Active SSE clients listening to this run
+  idleTimeout?: NodeJS.Timeout;
+  completionProbeTimer?: NodeJS.Timeout;
+  completionProbeInFlight?: boolean;
+  completionProbePending?: boolean;
+  firstCompletionWaitResolvedAt?: number;
+  visibleFinalText?: string;
+  finalEventText?: string;
+  finalEventGeneration: number;
+  settledCalibrationGeneration: number;
+  clientRef?: OpenClawClient;
+}
+
+function resolveChatFinalTextSnapshot(text: string, message: any): string {
+  return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
+}
+
+class ActiveRunManager {
+  private runs = new Map<string, ActiveRun>();
+  private db: DB;
+
+  constructor(db: DB) {
+    this.db = db;
+  }
+
+  getRun(sessionId: string): ActiveRun | undefined {
+    return this.runs.get(sessionId);
+  }
+
+  async abortRun(sessionId: string): Promise<{ aborted: boolean }> {
+    const run = this.runs.get(sessionId);
+    if (!run || !run.clientRef) {
+      return { aborted: false };
+    }
+
+    const result = await run.clientRef.abortChat({
+      sessionKey: run.finalSessionKey,
+      runId: run.runId,
+    });
+
+    const rewritten = rewriteOpenClawMediaPaths(run.text || '', run.workspacePath);
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
+
+    run.clients.forEach((res) => {
+      res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
+      res.end();
+    });
+
+    this.cleanupRun(sessionId);
+    return { aborted: result.aborted };
+  }
+
+  private emitVisibleFinal(run: ActiveRun, finalText: string, options?: { end?: boolean }) {
+    const protectedFinalText = selectPreferredTextSnapshot(run.text, finalText);
+    if (protectedFinalText) {
+      run.text = protectedFinalText;
+    }
+    const rewritten = rewriteOpenClawMediaPaths(protectedFinalText || run.text, run.workspacePath);
+    const nextVisibleFinalText = selectPreferredTextSnapshot(run.visibleFinalText, rewritten);
+    if (!nextVisibleFinalText.trim()) {
+      if (options?.end) {
+        run.clients.forEach((res) => {
+          res.end();
+        });
+      }
+      return '';
+    }
+
+    const shouldSendFinalEvent = run.visibleFinalText !== nextVisibleFinalText;
+    if (shouldSendFinalEvent) {
+      run.visibleFinalText = nextVisibleFinalText;
+      run.clients.forEach((res) => {
+        res.write(`data: ${JSON.stringify({ type: 'final', text: nextVisibleFinalText })}\n\n`);
+        if (options?.end) {
+          res.end();
+        }
+      });
+      return nextVisibleFinalText;
+    }
+
+    if (options?.end) {
+      run.clients.forEach((res) => {
+        res.end();
+      });
+    }
+
+    return nextVisibleFinalText;
+  }
+
+  startRun(
+    sessionId: string,
+    runId: string,
+    agentId: string,
+    agentName: string,
+    modelUsed: string,
+    messageId: number,
+    workspacePath: string,
+    clientRef: OpenClawClient,
+    finalSessionKey: string,
+    historySnapshot: ChatHistorySnapshot
+  ): ActiveRun {
+    const run: ActiveRun = {
+      sessionId,
+      runId,
+      agentId,
+      agentName,
+      modelUsed,
+      messageId,
+      workspacePath,
+      finalSessionKey,
+      historySnapshot,
+      text: '',
+      clients: [],
+      completionProbePending: false,
+      firstCompletionWaitResolvedAt: undefined,
+      finalEventGeneration: 0,
+      settledCalibrationGeneration: 0,
+      clientRef
+    };
+    this.runs.set(sessionId, run);
+    this.resetIdleTimeout(run);
+
+    const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
+      if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
+        this.resetIdleTimeout(run);
+        const nextText = selectPreferredTextSnapshot(run.text, data.text);
+        const didTextChange = nextText !== run.text;
+        run.text = nextText;
+        if (!didTextChange) {
+          return;
+        }
+        const rewritten = rewriteOpenClawMediaPaths(run.text, run.workspacePath);
+        run.clients.forEach(res => {
+          res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
+        });
+      }
+    };
+
+    const onFinal = (data: { sessionKey: string; runId: string; text: string; message: any }) => {
+      if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
+        const terminalFinalText = resolveChatFinalTextSnapshot(data.text, data.message);
+        if (terminalFinalText) {
+          run.finalEventText = selectPreferredTextSnapshot(run.finalEventText, terminalFinalText);
+          run.text = selectPreferredTextSnapshot(run.text, terminalFinalText);
+        } else if (data.text) {
+          run.text = selectPreferredTextSnapshot(run.text, data.text);
+        }
+        run.finalEventGeneration += 1;
+        this.resetIdleTimeout(run);
+        this.emitVisibleFinal(run, run.finalEventText || run.text);
+        this.scheduleCompletionProbe(run, 0);
+      }
+    };
+
+    const onAborted = (data: { sessionKey: string; runId: string; text: string }) => {
+      if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
+        if (data.text) {
+          run.text = selectPreferredTextSnapshot(run.text, data.text);
+        }
+        this.scheduleCompletionProbe(run, 0);
+      }
+    };
+
+    const onError = (data: { sessionKey: string; runId: string; error: string }) => {
+      if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
+        this.failRun(run, data.error);
+      }
+    };
+
+    const onDisconnect = () => {
+      onError({ sessionKey: sessionId, runId, error: CHAT_GATEWAY_DISCONNECTED_DETAIL });
+    };
+
+    clientRef.on('chat.delta', onDelta);
+    clientRef.on('chat.final', onFinal);
+    clientRef.on('chat.aborted', onAborted);
+    clientRef.on('chat.error', onError);
+    clientRef.on('disconnected', onDisconnect);
+
+    // Attach listeners to run for easy cleanup
+    (run as any)._onDelta = onDelta;
+    (run as any)._onFinal = onFinal;
+    (run as any)._onAborted = onAborted;
+    (run as any)._onError = onError;
+    (run as any)._onDisconnect = onDisconnect;
+
+    this.scheduleCompletionProbe(run);
+
+    return run;
+  }
+
+  attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean }) {
+    const run = this.runs.get(sessionId);
+    if (run) {
+      run.clients.push(res);
+      if (options?.announceAttach) {
+        res.write(`data: ${JSON.stringify({
+          type: 'attached',
+          messageId: run.messageId,
+          agentId: run.agentId,
+          agentName: run.agentName,
+          modelUsed: run.modelUsed,
+        })}\n\n`);
+      }
+      if (run.visibleFinalText) {
+        res.write(`data: ${JSON.stringify({ type: 'final', text: run.visibleFinalText })}\n\n`);
+      } else if (run.text) {
+        // Immediately send current accumulated text
+        const rewritten = rewriteOpenClawMediaPaths(run.text, run.workspacePath);
+        res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
+      }
+      res.on('close', () => {
+        run.clients = run.clients.filter(c => c !== res);
+      });
+      return true;
+    }
+    return false;
+  }
+
+  private resetIdleTimeout(run: ActiveRun) {
+    if (run.idleTimeout) clearTimeout(run.idleTimeout);
+    run.idleTimeout = setTimeout(() => {
+      const errorMsg = run.text ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
+      const finalText = run.text || errorMsg;
+      const rewritten = rewriteOpenClawMediaPaths(finalText, run.workspacePath);
+      
+      this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
+      this.emitVisibleFinal(run, finalText, { end: true });
+      this.cleanupRun(run.sessionId);
+    }, 600000); // 10 minutes
+  }
+
+  private matchesRunEvent(run: ActiveRun, sessionKey: string, runId?: string | null) {
+    if (runId && runId !== run.runId) {
+      return false;
+    }
+    return sessionKey === run.finalSessionKey
+      || sessionKey === run.sessionId
+      || sessionKey.endsWith(`:${run.sessionId}`)
+      || sessionKey.includes(`:chat:${run.sessionId}`);
+  }
+
+  private scheduleCompletionProbe(run: ActiveRun, delay = CHAT_STREAM_COMPLETION_PROBE_DELAY_MS) {
+    if (!this.runs.has(run.sessionId)) return;
+    run.completionProbePending = true;
+    if (run.completionProbeTimer) {
+      clearTimeout(run.completionProbeTimer);
+    }
+    run.completionProbeTimer = setTimeout(() => {
+      run.completionProbeTimer = undefined;
+      if (run.completionProbeInFlight) {
+        return;
+      }
+      run.completionProbePending = false;
+      void this.probeCompletion(run);
+    }, delay);
+  }
+
+  private async probeCompletion(run: ActiveRun) {
+    if (!this.runs.has(run.sessionId) || run.completionProbeInFlight || !run.clientRef) {
+      return;
+    }
+
+    run.completionProbeInFlight = true;
+    const probeFinalGeneration = run.finalEventGeneration;
+
+    try {
+      await run.clientRef.waitForRun(run.runId, CHAT_STREAM_COMPLETION_WAIT_TIMEOUT_MS);
+      if (run.firstCompletionWaitResolvedAt === undefined) {
+        run.firstCompletionWaitResolvedAt = Date.now();
+      }
+      if (!this.runs.has(run.sessionId)) return;
+
+      let completedOutput = selectPreferredTextSnapshot(run.text, run.finalEventText);
+      let settledErrorDetail = '';
+      let shouldRetryForEmptyCompletion = false;
+      let sawSettledAssistantText = false;
+      let bestSettledAssistantText = '';
+      try {
+        const historyProbeStartedAt = Date.now();
+        while ((Date.now() - historyProbeStartedAt) < CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS) {
+          const history = await run.clientRef.getChatHistory(run.finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+          const settledAssistantOutcome = extractSettledAssistantOutcome(history, run.historySnapshot);
+          if (settledAssistantOutcome.kind === 'error') {
+            settledErrorDetail = settledAssistantOutcome.error;
+            break;
+          }
+          if (settledAssistantOutcome.kind === 'text') {
+            sawSettledAssistantText = true;
+            bestSettledAssistantText = settledAssistantOutcome.text;
+            const settledMatchesCurrent = settledAssistantOutcome.text.trim() === completedOutput.trim();
+            if (shouldPreferSettledAssistantText(completedOutput, settledAssistantOutcome.text)) {
+              completedOutput = selectPreferredTextSnapshot(completedOutput, settledAssistantOutcome.text);
+              break;
+            }
+            if (settledMatchesCurrent) {
+              break;
+            }
+          }
+          await new Promise((resolve) => setTimeout(resolve, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS));
+        }
+
+        if (settledErrorDetail) {
+          this.failRun(run, settledErrorDetail);
+          return;
+        }
+
+        if (shouldPreferSettledAssistantText(completedOutput, bestSettledAssistantText)) {
+          completedOutput = selectPreferredTextSnapshot(completedOutput, bestSettledAssistantText);
+        }
+      } catch (historyError) {
+        console.warn(`[ActiveRunManager] Failed to read final history for session ${run.sessionId}, run ${run.runId}:`, historyError);
+        shouldRetryForEmptyCompletion = true;
+      }
+
+      if (!completedOutput.trim()) {
+        shouldRetryForEmptyCompletion = true;
+      }
+
+      completedOutput = selectPreferredTextSnapshot(completedOutput, run.finalEventText);
+
+      const hasSettledAssistantText = bestSettledAssistantText.trim().length > 0;
+
+      if (
+        probeFinalGeneration > 0
+        && probeFinalGeneration === run.finalEventGeneration
+        && hasSettledAssistantText
+      ) {
+        run.settledCalibrationGeneration = Math.max(run.settledCalibrationGeneration, probeFinalGeneration);
+      }
+
+      const isAwaitingInitialTerminalEvidence = run.finalEventGeneration === 0 && !hasSettledAssistantText;
+      const isAwaitingSettledFinalCalibration = run.finalEventGeneration > run.settledCalibrationGeneration;
+
+      if (
+        shouldRetryForEmptyCompletion
+        && run.firstCompletionWaitResolvedAt !== undefined
+        && (Date.now() - run.firstCompletionWaitResolvedAt) < CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS
+      ) {
+        this.scheduleCompletionProbe(run, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS);
+        return;
+      }
+
+      if (
+        (isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration)
+        && run.firstCompletionWaitResolvedAt !== undefined
+        && (Date.now() - run.firstCompletionWaitResolvedAt) < CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS
+      ) {
+        this.scheduleCompletionProbe(run, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS);
+        return;
+      }
+
+      if (isAwaitingInitialTerminalEvidence) {
+        this.failRun(run, 'Run completed without a terminal assistant response.');
+        return;
+      }
+
+      if (isAwaitingSettledFinalCalibration) {
+        this.failRun(run, 'Run completed but the final assistant response never settled.');
+        return;
+      }
+
+      this.finalizeRun(run, completedOutput);
+    } catch (error: any) {
+      if (!this.runs.has(run.sessionId)) return;
+      const detail = typeof error?.message === 'string' ? error.message : '';
+      if (/timeout/i.test(detail)) {
+        this.scheduleCompletionProbe(run);
+        return;
+      }
+      this.failRun(run, detail || 'Failed waiting for run completion.');
+    } finally {
+      run.completionProbeInFlight = false;
+      if (this.runs.has(run.sessionId) && run.completionProbePending && !run.completionProbeTimer) {
+        this.scheduleCompletionProbe(run, 0);
+      }
+    }
+  }
+
+  private finalizeRun(run: ActiveRun, finalText: string) {
+    if (!this.runs.has(run.sessionId)) return;
+
+    let protectedFinalText = selectPreferredTextSnapshot(run.text, finalText);
+    protectedFinalText = selectPreferredTextSnapshot(protectedFinalText, run.finalEventText);
+    if (protectedFinalText) {
+      run.text = protectedFinalText;
+    }
+    const rewritten = rewriteOpenClawMediaPaths(protectedFinalText || run.text, run.workspacePath);
+    if (!rewritten.trim()) {
+      this.failRun(run, 'No text output returned from the run.');
+      return;
+    }
+
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
+    this.emitVisibleFinal(run, protectedFinalText || run.text, { end: true });
+    this.cleanupRun(run.sessionId);
+  }
+
+  private failRun(run: ActiveRun, detail: string) {
+    if (!this.runs.has(run.sessionId)) return;
+
+    const structuredError = createStructuredChatError(detail);
+
+    this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed);
+    this.db.updateMessageEnvelope(run.messageId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
+
+    run.clients.forEach(res => {
+      res.write(`data: ${JSON.stringify({
+        type: 'error',
+        text: structuredError.content,
+        messageCode: structuredError.messageCode,
+        messageParams: structuredError.messageParams,
+        rawDetail: structuredError.rawDetail,
+        role: structuredError.role,
+      })}\n\n`);
+      res.end();
+    });
+    this.cleanupRun(run.sessionId);
+  }
+
+  private cleanupRun(sessionId: string) {
+    const run = this.runs.get(sessionId);
+    if (run) {
+      if (run.idleTimeout) clearTimeout(run.idleTimeout);
+      if (run.completionProbeTimer) clearTimeout(run.completionProbeTimer);
+      if (run.clientRef) {
+        if ((run as any)._onDelta) run.clientRef.off('chat.delta', (run as any)._onDelta);
+        if ((run as any)._onFinal) run.clientRef.off('chat.final', (run as any)._onFinal);
+        if ((run as any)._onAborted) run.clientRef.off('chat.aborted', (run as any)._onAborted);
+        if ((run as any)._onError) run.clientRef.off('chat.error', (run as any)._onError);
+        if ((run as any)._onDisconnect) run.clientRef.off('disconnected', (run as any)._onDisconnect);
+      }
+      this.runs.delete(sessionId);
+    }
+  }
+}
+
+const activeRunManager = new ActiveRunManager(db);
+
+function getLatestChatRegenerateTarget(sessionId: string): {
+  latestUserMessage: ChatRow | null;
+  latestReplyMessage: ChatRow | null;
+} {
+  const recentHistory = db.getMessages(sessionId, CHAT_REGENERATE_LOOKBACK_LIMIT);
+  let latestReplyMessage: ChatRow | null = null;
+
+  for (let index = recentHistory.length - 1; index >= 0; index -= 1) {
+    const message = recentHistory[index];
+    if (message.role === 'assistant' || message.role === 'system') {
+      if (!latestReplyMessage) latestReplyMessage = message;
+      continue;
+    }
+
+    return {
+      latestUserMessage: message,
+      latestReplyMessage,
+    };
+  }
+
+  return {
+    latestUserMessage: null,
+    latestReplyMessage,
+  };
+}
+
 app.post('/api/chat', async (req, res) => {
-  const { sessionId, message } = req.body;
+  const { sessionId, message, parentId } = req.body;
 
   if (!sessionId || !message) {
-    return res.status(400).json({ error: 'Missing sessionId or message' });
+    return res.status(400).json(buildStructuredChatHttpError('Missing sessionId or message'));
   }
+
+  let userMsgId: number | undefined;
+  let assistantMsgId: number | undefined;
 
   try {
     const sessionInfo = sessionManager.getSession(sessionId);
     let finalMessage = String(message);
 
-    if (sessionInfo && sessionInfo.prompt) {
+    if (sessionInfo) {
       const history = db.getMessages(sessionId, 1);
-      if (history.length === 0) {
-        finalMessage = `[System Instructions: ${sessionInfo.prompt}]\n\nUser: ${finalMessage}`;
+      let injectedInstructions = '';
+      if (history.length === 0 && sessionInfo.prompt) {
+        injectedInstructions += `${sessionInfo.prompt}\n\n`;
+      }
+      if (sessionInfo.process_start_tag && sessionInfo.process_end_tag) {
+        injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
+      }
+      
+      if (injectedInstructions) {
+        finalMessage = `${injectedInstructions}${finalMessage}`;
       }
     }
 
-    db.saveMessage({ session_key: sessionId, role: 'user', content: String(message) });
+    let finalParentId = parentId ? Number(parentId) : undefined;
+    if (finalParentId === undefined) {
+      const history = db.getMessages(sessionId, 1);
+      finalParentId = history.length > 0 ? history[history.length - 1].id : undefined;
+    }
+
+    userMsgId = Number(db.saveMessage({ session_key: sessionId, parent_id: finalParentId, role: 'user', content: String(message) }));
     const client = await getConnection(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
 
-    // Resolve agent name and model for per-message snapshot
     const allCharacters = db.getCharacters();
     const character = allCharacters.find(c => c.agentId === agentId);
-    // Session name is the user-visible name; character.name is just a DB default
     const agentName = sessionInfo?.name || character?.name || agentId;
     const modelUsed = agentProvisioner.readAgentModel(agentId) ||
       agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
 
     const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
 
-    // Set up SSE streaming
+    assistantMsgId = Number(db.saveMessage({
+      session_key: sessionId,
+      parent_id: userMsgId,
+      role: 'assistant',
+      content: '', // empty initially
+      model_used: modelUsed,
+      agent_id: agentId,
+      agent_name: agentName
+    }));
+
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
-    let lastText = '';
-    let streamEnded = false;
-    let idleTimeout: NodeJS.Timeout;
+    // Notify frontend of the real DB IDs immediately
+    res.write(':' + Array(2048).fill(' ').join('') + '\n\n');
+    res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId, assistantMsgId })}\n\n`);
 
-    const cleanup = () => {
-      clearTimeout(idleTimeout);
-      client.off('chat.delta', onDelta);
-      client.off('chat.final', onFinal);
-      client.off('chat.error', onError);
-    };
+    const expectedSessionKey = sessionId.startsWith('agent:')
+      ? sessionId
+      : `agent:${agentId}:chat:${sessionId}`;
+    const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
+      .then((history) => getHistorySnapshot(history))
+      .catch(() => ({ length: 0, latestSignature: '' }));
 
-    const resetIdleTimeout = () => {
-      clearTimeout(idleTimeout);
-      // 10-minute idle timeout between tokens or before first token to allow for complex tasks
-      idleTimeout = setTimeout(() => {
-        if (!streamEnded) {
-          streamEnded = true;
-          cleanup();
-          const errorMsg = lastText ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
-          const rewritten = rewriteOpenClawMediaPaths(lastText || errorMsg);
-          db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
-          res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
-          res.end();
-        }
-      }, 600000); 
-    };
-
-    const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
-      if (streamEnded) return;
-      resetIdleTimeout();
-      lastText = data.text;
-      const rewritten = rewriteOpenClawMediaPaths(data.text);
-      res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
-    };
-
-    const onFinal = (data: { sessionKey: string; runId: string; text: string }) => {
-      if (streamEnded) return;
-      streamEnded = true;
-      cleanup();
-      const finalText = data.text || lastText;
-      const rewritten = rewriteOpenClawMediaPaths(finalText);
-
-      // Save final response to DB
-      db.saveMessage({ session_key: sessionId, role: 'assistant', content: rewritten, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
-
-      res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
-      res.end();
-    };
-
-    const onError = (data: { sessionKey: string; runId: string; error: string }) => {
-      if (streamEnded) return;
-      streamEnded = true;
-      cleanup();
-      const errorMsg = `❌ Error: ${data.error}`;
-      db.saveMessage({ session_key: sessionId, role: 'assistant', content: errorMsg, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
-      res.write(`data: ${JSON.stringify({ type: 'final', text: errorMsg })}\n\n`);
-      res.end();
-    };
-
-    // Listen for streaming events
-    client.on('chat.delta', onDelta);
-    client.on('chat.final', onFinal);
-    client.on('chat.error', onError);
-
-    resetIdleTimeout();
-
-    // Send the message (non-blocking)
-    const { runId } = await client.sendChatMessageStreaming({
+    const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
       sessionKey: sessionId,
-      message: outgoingMessage,
-      agentId: agentId
+      message: outgoingMessage.text,
+      agentId: agentId,
+      attachments: outgoingMessage.attachments,
     });
 
-    // Clean up on client disconnect
-    req.on('close', () => {
-      streamEnded = true;
-      cleanup();
-    });
+    const run = activeRunManager.startRun(
+      sessionId,
+      runId,
+      agentId,
+      agentName,
+      modelUsed,
+      assistantMsgId,
+      getSessionWorkspacePath(sessionId),
+      client,
+      finalSessionKey,
+      preRunHistorySnapshot
+    );
+    
+    activeRunManager.attachClient(sessionId, res);
 
   } catch (error: any) {
+    const structuredError = createStructuredChatError(error?.message);
+    const sessionInfo = db.getSession(sessionId);
+    const agentId = sessionInfo?.agentId || 'main';
+    const character = db.getCharacters().find(c => c.agentId === agentId);
+    const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+
+    if (typeof assistantMsgId === 'number') {
+      try {
+        db.updateMessage(assistantMsgId, structuredError.content, modelUsed);
+        db.updateMessageEnvelope(assistantMsgId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
+      } catch {}
+    } else if (typeof userMsgId === 'number') {
+      try {
+        assistantMsgId = Number(db.saveMessage({
+          session_key: sessionId,
+          parent_id: userMsgId,
+          role: structuredError.role,
+          content: structuredError.content,
+          model_used: modelUsed,
+          agent_id: structuredError.agent_id,
+          agent_name: structuredError.agent_name,
+        }));
+      } catch {}
+    }
+
     if (!res.headersSent) {
-      res.status(500).json({ error: error.message });
+      res.status(500).json(buildStructuredChatHttpError(error?.message));
     } else {
-      const errorMsg = `❌ Error: ${error.message}`;
-      const sessionInfo = db.getSession(sessionId);
-      const agentId = sessionInfo?.agentId || 'main';
-      const character = db.getCharacters().find(c => c.agentId === agentId);
-      const agentName = sessionInfo?.name || character?.name || agentId;
-      const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
-      
-      db.saveMessage({ session_key: sessionId, role: 'assistant', content: errorMsg, model_used: modelUsed, agent_id: agentId, agent_name: agentName });
-      res.write(`data: ${JSON.stringify({ type: 'final', text: errorMsg })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        type: 'error',
+        text: structuredError.content,
+        messageCode: structuredError.messageCode,
+        messageParams: structuredError.messageParams,
+        rawDetail: structuredError.rawDetail,
+        role: structuredError.role,
+      })}\n\n`);
       res.end();
     }
+  }
+});
+
+app.post('/api/chat/regenerate', async (req, res) => {
+  const { sessionId, message, parentId } = req.body;
+
+  if (!sessionId || !message || !parentId) {
+    return res.status(400).json(buildStructuredChatHttpError('Missing sessionId, message, or parentId'));
+  }
+
+  let assistantMsgId: number | undefined;
+
+  try {
+    const numericParentId = Number(parentId);
+    const { latestUserMessage, latestReplyMessage } = getLatestChatRegenerateTarget(sessionId);
+    const latestUserId = Number(latestUserMessage?.id);
+    const latestReplyParentId = Number(latestReplyMessage?.parent_id);
+    const hasConflictingLatestReply =
+      !!latestReplyMessage
+      && Number.isFinite(latestUserId)
+      && Number.isFinite(latestReplyParentId)
+      && latestReplyParentId !== numericParentId;
+
+    if (
+      !Number.isFinite(numericParentId)
+      || !latestUserMessage
+      || latestUserId !== numericParentId
+      || hasConflictingLatestReply
+    ) {
+      return res.status(409).json(buildStructuredChatHttpError('Regenerate is only allowed for the latest assistant reply.'));
+    }
+
+    if (
+      latestReplyMessage
+      && (latestReplyMessage.role === 'assistant' || latestReplyMessage.role === 'system')
+      && latestReplyParentId === numericParentId
+      && typeof latestReplyMessage.id === 'number'
+    ) {
+      db.deleteMessage(Number(latestReplyMessage.id));
+    }
+
+    const sessionInfo = sessionManager.getSession(sessionId);
+    let finalMessage = String(message);
+
+    if (sessionInfo) {
+      const history = db.getMessages(sessionId, 1);
+      let injectedInstructions = '';
+      if (history.length === 0 && sessionInfo.prompt) {
+        injectedInstructions += `${sessionInfo.prompt}\n\n`;
+      }
+      if (sessionInfo.process_start_tag && sessionInfo.process_end_tag) {
+        injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
+      }
+      
+      if (injectedInstructions) {
+        finalMessage = `${injectedInstructions}${finalMessage}`;
+      }
+    }
+
+    const client = await getConnection(sessionId);
+    const agentId = sessionInfo?.agentId || 'main';
+
+    const allCharacters = db.getCharacters();
+    const character = allCharacters.find(c => c.agentId === agentId);
+    const agentName = sessionInfo?.name || character?.name || agentId;
+    const modelUsed = agentProvisioner.readAgentModel(agentId) ||
+      agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+
+    const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
+
+    assistantMsgId = Number(db.saveMessage({
+      session_key: sessionId,
+      parent_id: numericParentId,
+      role: 'assistant',
+      content: '', 
+      model_used: modelUsed,
+      agent_id: agentId,
+      agent_name: agentName
+    }));
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+    
+    // Notify frontend immediately of the new assistant msg ID
+    res.write(':' + Array(2048).fill(' ').join('') + '\n\n');
+    res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId: numericParentId, assistantMsgId })}\n\n`);
+
+    const expectedSessionKey = sessionId.startsWith('agent:')
+      ? sessionId
+      : `agent:${agentId}:chat:${sessionId}`;
+    const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
+      .then((history) => getHistorySnapshot(history))
+      .catch(() => ({ length: 0, latestSignature: '' }));
+
+    const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
+      sessionKey: sessionId,
+      message: outgoingMessage.text,
+      agentId: agentId,
+      attachments: outgoingMessage.attachments,
+    });
+
+    const run = activeRunManager.startRun(
+      sessionId,
+      runId,
+      agentId,
+      agentName,
+      modelUsed,
+      assistantMsgId,
+      getSessionWorkspacePath(sessionId),
+      client,
+      finalSessionKey,
+      preRunHistorySnapshot
+    );
+    
+    activeRunManager.attachClient(sessionId, res);
+
+  } catch (error: any) {
+    const structuredError = createStructuredChatError(error?.message);
+    const sessionInfo = db.getSession(sessionId);
+    const agentId = sessionInfo?.agentId || 'main';
+    const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+
+    if (typeof assistantMsgId === 'number') {
+      try {
+        db.updateMessage(assistantMsgId, structuredError.content, modelUsed);
+        db.updateMessageEnvelope(assistantMsgId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
+      } catch {}
+    } else {
+      try {
+        assistantMsgId = Number(db.saveMessage({
+          session_key: sessionId,
+          parent_id: Number(parentId),
+          role: structuredError.role,
+          content: structuredError.content,
+          model_used: modelUsed,
+          agent_id: structuredError.agent_id,
+          agent_name: structuredError.agent_name,
+        }));
+      } catch {}
+    }
+
+    if (!res.headersSent) {
+      res.status(500).json(buildStructuredChatHttpError(error?.message));
+    } else {
+      res.write(`data: ${JSON.stringify({
+        type: 'error',
+        text: structuredError.content,
+        messageCode: structuredError.messageCode,
+        messageParams: structuredError.messageParams,
+        rawDetail: structuredError.rawDetail,
+        role: structuredError.role,
+      })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+app.get('/api/chat/attach/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  
+  const run = activeRunManager.getRun(sessionId);
+  if (!run) {
+    // Return empty payload to indicate no active run
+    return res.status(200).json({ active: false });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  activeRunManager.attachClient(sessionId, res, { announceAttach: true });
+});
+
+app.post('/api/chat/stop', async (req, res) => {
+  const { sessionId } = req.body || {};
+
+  if (!sessionId) {
+    return res.status(400).json(buildStructuredChatHttpError('Missing sessionId'));
+  }
+
+  try {
+    const result = await activeRunManager.abortRun(String(sessionId));
+    res.json({ success: true, ...result });
+  } catch (error: any) {
+    res.status(500).json(buildStructuredChatHttpError(error?.message || 'Failed to stop chat run.'));
   }
 });
 
@@ -1136,7 +3380,7 @@ app.post('/api/chat/silent', async (req, res) => {
     const client = await getConnection(sessionId);
     const rawResponse = await client.sendChatMessage({ sessionKey: sessionId, message });
     // Rewrite absolute OpenClaw media paths to HTTP-accessible URLs
-    const response = rewriteOpenClawMediaPaths(rawResponse);
+    const response = rewriteOpenClawMediaPaths(rawResponse, getSessionWorkspacePath(sessionId));
     // Note: We intentionally DO NOT save to DB here
     res.json({ success: true, response });
   } catch (error: any) {
@@ -1145,31 +3389,86 @@ app.post('/api/chat/silent', async (req, res) => {
 });
 
 // file upload (doc/image/video/audio), supports multiple files
-app.post('/api/files/upload', upload.array('files', 20), (req, res) => {
-  const files = (req.files as Express.Multer.File[]) || [];
-  if (!files.length) return res.status(400).json({ success: false, error: 'No files uploaded' });
+app.post('/api/files/upload', (req, res) => {
+  upload.array('files', 20)(req, res, async (error) => {
+    if (error) {
+      if (isStructuredRequestError(error)) {
+        return res.status(error.status).json(error.payload);
+      }
+      if (error instanceof multer.MulterError) {
+        return res.status(400).json({ success: false, error: error.message });
+      }
+      return res.status(500).json({ success: false, error: error instanceof Error ? error.message : 'Upload failed' });
+    }
 
-  const sessionId = (req.body?.sessionId as string) || '';
-  const saved = files.map((f) => {
-    db.saveFile({
-      sessionKey: sessionId,
-      originalName: f.originalname,
-      mimeType: f.mimetype,
-      size: f.size,
-      storedPath: f.path,
+    const files = (req.files as Express.Multer.File[]) || [];
+    if (!files.length) return res.status(400).json({ success: false, error: 'No files uploaded' });
+
+    const uploadTarget = resolveUploadTargetFromBody((req.body || {}) as Record<string, unknown>);
+    const IMAGE_TARGET_SIZE = 4_500_000; // 4.5MB target for images (OpenClaw has 5MB limit)
+
+    const saved = await Promise.all(files.map(async (f) => {
+      let finalSize = f.size;
+
+      if (f.mimetype.startsWith('image/')) {
+        try {
+          const originalBuffer = fs.readFileSync(f.path);
+          const metadata = await sharp(originalBuffer).metadata();
+          let width = metadata.width || 2048;
+          let height = metadata.height || 2048;
+          const maxDimension = 2048;
+
+          if (width > maxDimension || height > maxDimension) {
+            if (width > height) {
+              height = Math.round((height / width) * maxDimension);
+              width = maxDimension;
+            } else {
+              width = Math.round((width / height) * maxDimension);
+              height = maxDimension;
+            }
+          }
+
+          let quality = 80;
+
+          while (quality >= 10) {
+            const nextBuffer = await sharp(originalBuffer)
+              .resize(width, height, { fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality, mozjpeg: true })
+              .toBuffer();
+
+            if (nextBuffer.length <= IMAGE_TARGET_SIZE || quality <= 10) {
+              fs.writeFileSync(f.path, nextBuffer);
+              finalSize = nextBuffer.length;
+              break;
+            }
+
+            quality -= 10;
+          }
+        } catch (err) {
+          console.error('[Upload] Image compression failed:', err);
+        }
+      }
+
+      db.saveFile({
+        sessionKey: uploadTarget.sessionKey,
+        originalName: f.originalname,
+        mimeType: f.mimetype,
+        size: finalSize,
+        storedPath: f.path,
+      });
+
+      return {
+        name: f.originalname,
+        mimeType: f.mimetype,
+        size: finalSize,
+        url: `/uploads/${path.basename(f.path)}`,
+      };
+    }));
+
+    res.json({
+      success: true,
+      files: saved,
     });
-
-    return {
-      name: f.originalname,
-      mimeType: f.mimetype,
-      size: f.size,
-      url: `/uploads/${path.basename(f.path)}`,
-    };
-  });
-
-  res.json({
-    success: true,
-    files: saved,
   });
 });
 
@@ -1240,6 +3539,7 @@ app.use('/openclaw', express.static(path.join(process.env.HOME || '', '.openclaw
 // Securely serve arbitrary local files via base64 encoded paths
 app.get('/api/files/download', (req, res) => {
   const b64Path = req.query.path as string;
+  const disposition = req.query.disposition === 'inline' ? 'inline' : 'attachment';
   if (!b64Path) {
     return res.status(400).send('Missing path parameter');
   }
@@ -1257,8 +3557,8 @@ app.get('/api/files/download', (req, res) => {
     }
 
     const filename = path.basename(absolutePath);
-    // Set proper Content-Disposition with UTF-8 filename for correct downloads
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    // Allow inline responses for preview while keeping attachment as the default download behavior.
+    res.setHeader('Content-Disposition', `${disposition}; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.sendFile(absolutePath);
   } catch (error: any) {
     console.error(`[Download Error] ${error.message}`);
@@ -1271,76 +3571,133 @@ app.get('/api/files/capabilities', (_req, res) => {
   res.json({ libreoffice: hasLibreOffice });
 });
 
+function resolvePreviewAbsolutePath(req: express.Request): string {
+  let absolutePath = '';
+  const b64Path = req.query.path as string | undefined;
+  const filenameParam = req.query.filename as string | undefined;
+
+  if (b64Path) {
+    absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
+    if (!path.isAbsolute(absolutePath)) {
+      throw new Error('Only absolute paths are allowed');
+    }
+    return absolutePath;
+  }
+
+  if (filenameParam) {
+    const decodedFilename = decodeURIComponent(filenameParam);
+    const fileInfo = db.getFileByStoredName(decodedFilename);
+    if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
+      return fileInfo.stored_path;
+    }
+
+    const globalPath = path.join(uploadDir, decodedFilename);
+    if (fs.existsSync(globalPath)) {
+      return globalPath;
+    }
+  }
+
+  return '';
+}
+
+async function ensureConvertedPreviewPdf(absolutePath: string): Promise<string> {
+  if (!hasLibreOffice) {
+    throw new Error('LibreOffice not available');
+  }
+
+  const crypto = require('crypto');
+  const stat = fs.statSync(absolutePath);
+  const cacheKey = crypto.createHash('md5').update(`${absolutePath}:${stat.mtimeMs}`).digest('hex');
+  const cachedPdf = path.join(previewCacheDir, `${cacheKey}.pdf`);
+
+  if (fs.existsSync(cachedPdf)) {
+    return cachedPdf;
+  }
+
+  const tmpDir = path.join(previewCacheDir, cacheKey);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  await execPromise(
+    `libreoffice --headless --convert-to pdf --outdir "${tmpDir}" "${absolutePath}"`,
+    { timeout: 30000 }
+  );
+
+  const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.pdf'));
+  if (files.length === 0) {
+    throw new Error('LibreOffice conversion produced no PDF output');
+  }
+
+  const outputPdf = path.join(tmpDir, files[0]);
+  fs.renameSync(outputPdf, cachedPdf);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  return cachedPdf;
+}
+
+app.get('/api/files/preview-data', async (req, res) => {
+  try {
+    const mode = req.query.mode === 'converted' ? 'converted' : 'source';
+    const absolutePath = resolvePreviewAbsolutePath(req);
+
+    if (!absolutePath || !fs.existsSync(absolutePath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const servedPath = mode === 'converted'
+      ? await ensureConvertedPreviewPdf(absolutePath)
+      : absolutePath;
+
+    const buffer = fs.readFileSync(servedPath);
+    res.json({
+      filename: path.basename(servedPath),
+      data: buffer.toString('base64'),
+      mimeType: mode === 'converted' ? 'application/pdf' : undefined,
+    });
+  } catch (error: any) {
+    console.error(`[Preview Data Error] ${error.message}`);
+    if (error.message === 'Only absolute paths are allowed') {
+      return res.status(403).json({ error: error.message });
+    }
+    if (error.message === 'LibreOffice not available') {
+      return res.status(501).json({ error: error.message, fallback: true });
+    }
+    res.status(500).json({ error: 'Preview data failed', message: error.message });
+  }
+});
+
 app.get('/api/files/preview', async (req, res) => {
   try {
+    const mode = req.query.mode === 'source' ? 'source' : 'converted';
+    const absolutePath = resolvePreviewAbsolutePath(req);
+
+    if (!absolutePath) {
+      return res.status(404).send('File not found');
+    }
+
+    if (!fs.existsSync(absolutePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    const filename = path.basename(absolutePath);
+
+    if (mode === 'source') {
+      res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(filename)}`);
+      return res.sendFile(absolutePath);
+    }
+
     if (!hasLibreOffice) {
       return res.status(501).json({ error: 'LibreOffice not available', fallback: true });
     }
 
-    let absolutePath = '';
-    const b64Path = req.query.path as string;
-    const filenameParam = req.query.filename as string;
-
-    if (b64Path) {
-      absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
-      if (!path.isAbsolute(absolutePath)) {
-        return res.status(403).send('Only absolute paths are allowed');
-      }
-    } else if (filenameParam) {
-      // Resolve uploaded file path
-      const decodedFilename = decodeURIComponent(filenameParam);
-      const fileInfo = db.getFileByStoredName(decodedFilename);
-      if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
-        absolutePath = fileInfo.stored_path;
-      } else {
-        const globalPath = path.join(uploadDir, decodedFilename);
-        if (fs.existsSync(globalPath)) {
-          absolutePath = globalPath;
-        }
-      }
-    }
-
-    if (!absolutePath || !fs.existsSync(absolutePath)) {
-      return res.status(404).send('File not found');
-    }
-
-    // Create a hash-based cache key
-    const crypto = require('crypto');
-    const stat = fs.statSync(absolutePath);
-    const cacheKey = crypto.createHash('md5').update(`${absolutePath}:${stat.mtimeMs}`).digest('hex');
-    const cachedPdf = path.join(previewCacheDir, `${cacheKey}.pdf`);
-
-    // Serve from cache if available
-    if (fs.existsSync(cachedPdf)) {
-      res.setHeader('Content-Type', 'application/pdf');
-      return res.sendFile(cachedPdf);
-    }
-
-    // Convert using LibreOffice
-    const tmpDir = path.join(previewCacheDir, cacheKey);
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    await execPromise(
-      `libreoffice --headless --convert-to pdf --outdir "${tmpDir}" "${absolutePath}"`,
-      { timeout: 30000 }
-    );
-
-    // Find the output PDF
-    const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.pdf'));
-    if (files.length === 0) {
-      throw new Error('LibreOffice conversion produced no PDF output');
-    }
-
-    const outputPdf = path.join(tmpDir, files[0]);
-    // Move to cache location
-    fs.renameSync(outputPdf, cachedPdf);
-    // Clean up tmp dir
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-
+    const cachedPdf = await ensureConvertedPreviewPdf(absolutePath);
     res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(path.basename(cachedPdf))}`);
     res.sendFile(cachedPdf);
   } catch (error: any) {
     console.error(`[Preview Error] ${error.message}`);
+    if (error.message === 'Only absolute paths are allowed') {
+      return res.status(403).send(error.message);
+    }
     res.status(500).json({ error: 'Preview conversion failed', message: error.message });
   }
 });
@@ -1363,6 +3720,555 @@ app.use(express.static(path.join(__dirname, '../../frontend/dist'), {
     }
   },
 }));
+
+// ========== Group Chat Engine ==========
+const groupChatEngine = new GroupChatEngine(db, getConnection, (agentId) => {
+  // First, check if there's a custom session for this agent
+  const sessions = sessionManager.getAllSessions();
+  const session = sessions.find((s: any) => s.agentId === agentId);
+  if (session) {
+    const customModel = agentProvisioner.readAgentModel(agentId);
+    if (customModel) return customModel;
+  }
+  
+  // Fallback to characters table for hardcoded system agents
+  const chars = db.getCharacters();
+  const c = chars.find(x => x.agentId === agentId);
+  return c?.model || '';
+}, prepareGroupRuntimeAgent);
+
+// SSE clients per group
+const groupSSEClients = new Map<string, Set<express.Response>>();
+
+groupChatEngine.on('message', (msg: any) => {
+  const clients = groupSSEClients.get(msg.groupId);
+  if (clients) {
+    const data = JSON.stringify({
+      type: 'message',
+      data: withStructuredGroupMessage(msg, { groupId: msg.groupId }),
+    });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('delete', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({ type: 'delete', id: info.id, parent_id: info.parent_id ?? null });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('delta', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({
+      type: 'delta',
+      ...info,
+      content: typeof info.content === 'string'
+        ? rewriteOpenClawMediaPaths(info.content, getGroupWorkspaceForDisplay(info.groupId))
+        : info.content,
+    });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('edit', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({
+      type: 'edit',
+      ...info,
+      content: typeof info.content === 'string'
+        ? rewriteOpenClawMediaPaths(info.content, getGroupWorkspaceForDisplay(info.groupId))
+        : info.content,
+    });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('typing', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({ type: 'typing', data: info });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('typing_done', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({ type: 'typing_done', data: info });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+groupChatEngine.on('run_state', (info: any) => {
+  const clients = groupSSEClients.get(info.groupId);
+  if (clients) {
+    const data = JSON.stringify({ type: 'run_state', data: info });
+    for (const client of clients) {
+      try { client.write(`data: ${data}\n\n`); } catch {}
+    }
+  }
+});
+
+// --- Group Chat CRUD ---
+app.get('/api/groups', (_req, res) => {
+  try {
+    const groups = db.getGroupChats();
+    // Attach members to each group
+    const result = groups.map(g => ({
+      ...g,
+      members: db.getGroupMembers(g.id).map(withResolvedGroupMemberDisplayName),
+    }));
+    res.json({ success: true, groups: result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/groups', (req, res) => {
+  let persistedGroupId: string | null = null;
+  try {
+    const { id: rawId, name, description, system_prompt, process_start_tag, process_end_tag, max_chain_depth, members } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: 'name is required' });
+
+    const validation = validateGroupId(rawId);
+    if (validation.issue === 'required') {
+      return res.status(400).json(buildStructuredApiError(GROUP_ID_REQUIRED_ERROR_CODE));
+    }
+    if (validation.issue === 'whitespace') {
+      return res.status(400).json(buildStructuredApiError(GROUP_ID_CONTAINS_WHITESPACE_ERROR_CODE));
+    }
+    if (validation.issue) {
+      return res.status(400).json(buildStructuredApiError(GROUP_ID_INVALID_ERROR_CODE, null, {
+        groupId: validation.normalizedId || String(rawId || ''),
+      }));
+    }
+
+    const id = validation.normalizedId;
+    if (db.getGroupChat(id)) {
+      return res.status(400).json(buildStructuredApiError(GROUP_ID_ALREADY_EXISTS_ERROR_CODE, null, { groupId: id }));
+    }
+
+    const now = new Date().toISOString();
+    const allGroups = db.getGroupChats();
+    const maxPosition = allGroups.length > 0 ? Math.max(...allGroups.map((group) => group.position || 0)) : -1;
+    db.saveGroupChat({
+      id,
+      name,
+      description: description || '',
+      system_prompt: system_prompt || '',
+      process_start_tag: process_start_tag || '',
+      process_end_tag: process_end_tag || '',
+      max_chain_depth: max_chain_depth !== undefined ? max_chain_depth : 6,
+      position: maxPosition + 1,
+      created_at: now,
+      updated_at: now,
+    });
+    persistedGroupId = id;
+
+    // Save members
+    if (Array.isArray(members)) {
+      members.forEach((m: any, idx: number) => {
+        db.saveGroupMember({
+          id: `gm_${id}_${m.agentId}`,
+          group_id: id,
+          agent_id: m.agentId,
+          display_name: m.displayName || m.agentId,
+          role_description: m.roleDescription || '',
+          position: idx,
+        });
+      });
+    }
+
+    ensureGroupWorkspace(id);
+    res.json({ success: true, id });
+  } catch (err: any) {
+    if (/UNIQUE constraint failed: group_chats\.id|PRIMARY KEY/i.test(String(err?.message || ''))) {
+      return res.status(400).json(buildStructuredApiError(GROUP_ID_ALREADY_EXISTS_ERROR_CODE, null, {
+        groupId: typeof req.body?.id === 'string' ? req.body.id.trim() : '',
+      }));
+    }
+    if (persistedGroupId) {
+      try {
+        db.deleteGroupChat(persistedGroupId);
+        deleteGroupWorkspace(persistedGroupId);
+      } catch {}
+    }
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/groups/:id', (req, res) => {
+  try {
+    const existing = db.getGroupChat(req.params.id);
+    if (!existing) return res.status(404).json({ success: false, error: 'Group not found' });
+
+    const { name, description, system_prompt, process_start_tag, process_end_tag, max_chain_depth, members } = req.body;
+    db.saveGroupChat({
+      ...existing,
+      name: name ?? existing.name,
+      description: description ?? existing.description,
+      system_prompt: system_prompt ?? existing.system_prompt,
+      process_start_tag: process_start_tag ?? existing.process_start_tag,
+      process_end_tag: process_end_tag ?? existing.process_end_tag,
+      max_chain_depth: max_chain_depth ?? existing.max_chain_depth ?? 6,
+      position: existing.position ?? 0,
+      updated_at: new Date().toISOString(),
+    });
+
+    // Replace members if provided
+    if (Array.isArray(members)) {
+      db.deleteGroupMembers(req.params.id);
+      members.forEach((m: any, idx: number) => {
+        db.saveGroupMember({
+          id: `gm_${req.params.id}_${m.agentId}`,
+          group_id: req.params.id,
+          agent_id: m.agentId,
+          display_name: m.displayName || m.agentId,
+          role_description: m.roleDescription || '',
+          position: idx,
+        });
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/groups/reorder', (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids)) {
+    return res.status(400).json({ success: false, error: 'Invalid ids format' });
+  }
+
+  try {
+    db.updateGroupChatPositions(ids.map((id: string, index: number) => ({ id, position: index })));
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/groups/:id', async (req, res) => {
+  try {
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+
+    try {
+      await groupChatEngine.abortGroupRun(req.params.id);
+    } catch {}
+    clearStoredFilesBySessionKey(req.params.id);
+    cleanupGroupRuntimeAgent(req.params.id, { removeConfig: true });
+    deleteGroupWorkspace(req.params.id);
+    db.deleteGroupChat(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Reset group (clear history but keep group entity and members)
+app.post('/api/groups/:id/reset', async (req, res) => {
+  try {
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+
+    try {
+      await groupChatEngine.abortGroupRun(req.params.id);
+    } catch {}
+
+    // Clear group messages
+    db.deleteGroupMessagesByGroup(req.params.id);
+    clearStoredFilesBySessionKey(req.params.id);
+    cleanupGroupRuntimeAgent(req.params.id);
+    resetGroupWorkspace(req.params.id);
+    // Keep source agents intact; resetting a group should only clear group runtime clones.
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error('Failed to reset group:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// --- Group Messages ---
+app.get('/api/groups/:id/messages', async (req, res) => {
+  try {
+    await reconcileInactiveGroupLatestMessage(req.params.id);
+    const { beforeId, limit } = getHistoryPageQueryParams(req.query as Record<string, unknown>);
+    const result = db.getGroupMessagesPage(req.params.id, { beforeId, limit });
+    res.json(buildHistoryPageResponse(
+      result.rows.map((row) => withStructuredGroupMessage(row, { groupId: req.params.id })),
+      result.pageInfo,
+    ));
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/groups/:id/active-run', async (req, res) => {
+  try {
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+
+    const activeMessage = groupChatEngine.getGroupActiveRunMessage(req.params.id);
+    if (!activeMessage) {
+      const actions = await reconcileInactiveGroupLatestMessage(req.params.id);
+      if (actions.length > 0) {
+        broadcastGroupReconciliationActions(req.params.id, actions);
+      }
+
+      const latestMessage = db.getRecentGroupMessages(req.params.id, 1)[0];
+      return res.json({
+        success: true,
+        active: false,
+        message: latestMessage ? withStructuredGroupMessage(latestMessage, { groupId: req.params.id }) : null,
+      });
+    }
+
+    res.json({
+      success: true,
+      active: true,
+      message: withStructuredGroupMessage(activeMessage, { groupId: req.params.id }),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/groups/:id/messages/search', (req, res) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    res.json(buildHistorySearchResponse(db.searchGroupMessages(req.params.id, query)));
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/groups/:id/messages', async (req, res) => {
+  try {
+    const { content, parentId: rawParentId } = req.body;
+    if (!content?.trim()) return res.status(400).json({ success: false, error: 'content is required' });
+
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+
+    if (groupChatEngine.isGroupProcessing(req.params.id)) {
+      return res.status(409).json({
+        ...buildStructuredApiError(GROUP_RUN_IN_PROGRESS_ERROR_CODE),
+        runState: groupChatEngine.getGroupRunState(req.params.id),
+      });
+    }
+
+    const parsedParentId = (
+      typeof rawParentId === 'number' && Number.isFinite(rawParentId) && rawParentId > 0
+        ? Math.floor(rawParentId)
+        : typeof rawParentId === 'string' && rawParentId.trim()
+          ? Number.parseInt(rawParentId, 10)
+          : undefined
+    );
+    const parentId = Number.isFinite(parsedParentId as number) && (parsedParentId as number) > 0
+      ? Number(parsedParentId)
+      : undefined;
+
+    // Respond immediately, processing happens async
+    res.json({ success: true });
+
+    // Process message in background
+    (groupChatEngine as any).sendUserMessage(req.params.id, content, parentId).catch((err: any) => {
+      console.error('[GroupChat] Error processing message:', err);
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/groups/:id/stop', async (req, res) => {
+  try {
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+
+    const result = await groupChatEngine.abortGroupRun(req.params.id);
+    const cleanedMessageIds: number[] = [];
+
+    if (!result.aborted) {
+      const recentMessages = db.getRecentGroupMessages(req.params.id, 20);
+      const staleMessages = recentMessages.filter((message) => (
+        message.sender_type === 'agent'
+        && typeof message.content === 'string'
+        && message.content.trim() === ''
+      ));
+
+      if (staleMessages.length > 0) {
+        const clients = groupSSEClients.get(req.params.id);
+        for (const staleMessage of staleMessages) {
+          if (typeof staleMessage.id !== 'number') continue;
+          db.deleteGroupMessage(staleMessage.id);
+          cleanedMessageIds.push(staleMessage.id);
+          if (clients) {
+            const data = JSON.stringify({ type: 'delete', id: staleMessage.id, parent_id: staleMessage.parent_id ?? null });
+            for (const client of clients) {
+              try { client.write(`data: ${data}\n\n`); } catch {}
+            }
+          }
+        }
+      }
+    }
+
+    res.json({ success: true, aborted: result.aborted, cleanedMessageIds });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.put('/api/groups/:id/messages/:msgId', (req, res) => {
+  try {
+    const { content } = req.body;
+    db.updateGroupMessage(Number(req.params.msgId), content);
+    res.json({ success: true });
+    
+    // Broadcast edit event
+    const clients = groupSSEClients.get(req.params.id);
+    if (clients) {
+      clients.forEach(client => {
+        client.write(`data: ${JSON.stringify({ type: 'edit', id: Number(req.params.msgId), content })}\n\n`);
+      });
+    }
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete('/api/groups/:id/messages/:msgId', (req, res) => {
+  try {
+    db.deleteGroupMessage(Number(req.params.msgId));
+    res.json({ success: true });
+
+    // Broadcast delete event
+    const clients = groupSSEClients.get(req.params.id);
+    if (clients) {
+      clients.forEach(client => {
+        client.write(`data: ${JSON.stringify({ type: 'delete', id: Number(req.params.msgId) })}\n\n`);
+      });
+    }
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/groups/:id/messages/regenerate', async (req, res) => {
+  try {
+    const { msgId } = req.body; // The message we want to regenerate
+    if (!msgId) return res.status(400).json({ success: false, error: 'msgId required' });
+    
+    const targetMsg = db.getGroupMessageById(Number(msgId), req.params.id) as any;
+    
+    if (!targetMsg || targetMsg.sender_type !== 'agent' || !targetMsg.sender_id) {
+       return res.status(400).json({ success: false, error: 'Cannot regenerate this message' });
+    }
+
+    // In linear group history, regenerate reuses the parent trigger message.
+    let promptContext = "继续";
+    let validParentId = targetMsg.parent_id || null;
+    if (validParentId) {
+       const triggerMsg = db.getGroupMessageById(validParentId) as any;
+       if (triggerMsg) {
+         promptContext = triggerMsg.content;
+       } else {
+         validParentId = null; // SAFEGUARD: Prevent FOREIGN KEY constraint fail if parent is orphaned
+       }
+    }
+
+    db.deleteGroupMessage(Number(msgId));
+    const clients = groupSSEClients.get(req.params.id);
+    if (clients) {
+      clients.forEach(client => {
+        client.write(`data: ${JSON.stringify({ type: 'delete', id: Number(msgId), parent_id: validParentId })}\n\n`);
+      });
+    }
+
+    res.json({ success: true });
+
+    // Inform engine to resend request as a sibling response
+    const groupName = db.getGroupChat(req.params.id)?.name || '团队';
+    // Emulate a new trigger directly targeting that agent without advancing depth too quickly, using promptContext
+    (groupChatEngine as any).sendToAgent(req.params.id, groupName, targetMsg.sender_id, promptContext, targetMsg.sender_name || 'Agent', 0, validParentId || undefined).catch((err: any) => {
+      console.error('[GroupChat] Error regenerating message:', err);
+    });
+
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// SSE endpoint for real-time updates
+app.get('/api/groups/:id/events', async (req, res) => {
+  const groupId = req.params.id;
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  res.write('retry: 1000\n\n');
+  // Send initial ping
+  res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+  res.write(`data: ${JSON.stringify({ type: 'run_state', data: groupChatEngine.getGroupRunState(groupId) })}\n\n`);
+
+  const keepaliveTimer = setInterval(() => {
+    try {
+      res.write(': keepalive\n\n');
+    } catch {}
+  }, GROUP_SSE_KEEPALIVE_MS);
+
+  if (!groupSSEClients.has(groupId)) {
+    groupSSEClients.set(groupId, new Set());
+  }
+  groupSSEClients.get(groupId)!.add(res);
+
+  try {
+    const actions = await reconcileInactiveGroupLatestMessage(groupId);
+    broadcastGroupReconciliationActions(groupId, actions);
+  } catch (error) {
+    console.warn(`[GroupEvents] Failed to reconcile group ${groupId} on SSE connect:`, error);
+  }
+
+  req.on('close', () => {
+    clearInterval(keepaliveTimer);
+    groupSSEClients.get(groupId)?.delete(res);
+    if (groupSSEClients.get(groupId)?.size === 0) {
+      groupSSEClients.delete(groupId);
+    }
+  });
+});
 
 // Fallback for SPA — also no-cache
 app.get('*', (_req, res) => {

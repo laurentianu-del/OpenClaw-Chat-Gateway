@@ -6,6 +6,8 @@ interface CreateSessionOptions {
   prompt?: string;
   agentId?: string;
   id?: string;
+  process_start_tag?: string;
+  process_end_tag?: string;
 }
 
 export class SessionManager extends EventEmitter {
@@ -55,6 +57,8 @@ export class SessionManager extends EventEmitter {
       position,
       created_at: now,
       updated_at: now,
+      process_start_tag: options.process_start_tag || '',
+      process_end_tag: options.process_end_tag || '',
     };
     
     this.db.saveSession(session);

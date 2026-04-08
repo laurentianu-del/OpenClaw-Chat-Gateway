@@ -14,6 +14,214 @@ type Pending = {
   timer: NodeJS.Timeout;
 };
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+export function normalizeOpenClawMessageRecord(message: any): any {
+  let current = message;
+  const seen = new Set<object>();
+
+  while (current && typeof current === 'object' && !Array.isArray(current)) {
+    if (seen.has(current)) {
+      break;
+    }
+    seen.add(current);
+
+    const nested = current.message;
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) {
+      break;
+    }
+
+    const currentHasRole = typeof current.role === 'string';
+    const currentHasContent = current.content !== undefined;
+    const nestedLooksLikeMessage = (
+      typeof nested.role === 'string'
+      || nested.content !== undefined
+      || typeof nested.stopReason === 'string'
+      || typeof nested.stop_reason === 'string'
+      || nested.error !== undefined
+      || nested.errorMessage !== undefined
+    );
+
+    if (!nestedLooksLikeMessage) {
+      break;
+    }
+
+    if (current.type === 'message' || (!currentHasRole && !currentHasContent)) {
+      current = {
+        ...nested,
+        timestamp: nested.timestamp ?? current.timestamp,
+        createdAt: nested.createdAt ?? current.createdAt,
+        created_at: nested.created_at ?? current.created_at,
+      };
+      continue;
+    }
+
+    break;
+  }
+
+  return current;
+}
+
+function extractContentTextParts(content: unknown, seen = new Set<object>()): string[] {
+  if (!content) return [];
+  if (typeof content === 'string') {
+    return content.trim() ? [content] : [];
+  }
+
+  if (Array.isArray(content)) {
+    return content.flatMap((item) => extractContentTextParts(item, seen));
+  }
+
+  if (typeof content !== 'object') {
+    return [];
+  }
+
+  if (seen.has(content)) {
+    return [];
+  }
+  seen.add(content);
+
+  const record = content as Record<string, unknown>;
+  const directText = [record.text, record.content].find(isNonEmptyString);
+  if (directText) {
+    return [directText];
+  }
+
+  if (record.message) {
+    return extractContentTextParts(record.message, seen);
+  }
+
+  return [];
+}
+
+export function extractOpenClawMessageText(message: any): string {
+  if (!message) return '';
+  const normalizedMessage = normalizeOpenClawMessageRecord(message);
+
+  const contentText = extractContentTextParts(normalizedMessage?.content);
+  if (contentText.length > 0) {
+    return contentText.join('\n');
+  }
+
+  const directText = [
+    normalizedMessage?.text,
+    normalizedMessage?.content,
+  ].find(isNonEmptyString);
+
+  return directText || '';
+}
+
+export function extractOpenClawMessageError(message: any): string {
+  if (!message) return '';
+  const normalizedMessage = normalizeOpenClawMessageRecord(message);
+
+  const candidates = [
+    normalizedMessage?.errorMessage,
+    normalizedMessage?.error_message,
+    normalizedMessage?.error,
+    normalizedMessage?.detail,
+    normalizedMessage?.reason,
+    normalizedMessage?.description,
+    normalizedMessage?.stderr,
+    normalizedMessage?.stdout,
+    normalizedMessage?.message?.errorMessage,
+    normalizedMessage?.message?.error,
+    normalizedMessage?.message?.detail,
+    normalizedMessage?.message?.reason,
+    normalizedMessage?.metadata?.errorMessage,
+    normalizedMessage?.metadata?.error,
+    normalizedMessage?.metadata?.detail,
+    normalizedMessage?.metadata?.reason,
+  ];
+
+  for (const candidate of candidates) {
+    const detail = extractErrorDetail(candidate);
+    if (detail) return detail;
+  }
+
+  return '';
+}
+
+function extractChatEventText(payload: any): string {
+  const messageText = extractOpenClawMessageText(payload?.message);
+  if (messageText) return messageText;
+
+  const directText = [
+    payload?.text,
+    payload?.delta?.text,
+  ].find(isNonEmptyString);
+
+  return directText || '';
+}
+
+function safeSerializeDetail(value: unknown): string {
+  try {
+    const serialized = JSON.stringify(value);
+    if (!serialized || serialized === '{}' || serialized === '[]') {
+      return '';
+    }
+    return serialized.length > 2000 ? `${serialized.slice(0, 2000)}...` : serialized;
+  } catch {
+    return '';
+  }
+}
+
+function extractErrorDetail(value: unknown, seen = new Set<object>()): string {
+  if (!value) return '';
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+  if (value instanceof Error) {
+    return value.message.trim();
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const detail = extractErrorDetail(item, seen);
+      if (detail) return detail;
+    }
+    return '';
+  }
+  if (typeof value !== 'object') {
+    return '';
+  }
+
+  if (seen.has(value)) {
+    return '';
+  }
+  seen.add(value);
+
+  const record = value as Record<string, unknown>;
+  const preferredKeys = ['message', 'detail', 'error', 'reason', 'text', 'description', 'stderr', 'stdout'];
+  for (const key of preferredKeys) {
+    const detail = extractErrorDetail(record[key], seen);
+    if (detail) return detail;
+  }
+
+  return safeSerializeDetail(record);
+}
+
+function extractChatEventError(payload: any, frameError?: unknown): string {
+  const candidates = [
+    payload?.error,
+    payload?.detail,
+    payload?.reason,
+    payload?.message?.error,
+    payload?.message?.detail,
+    payload?.message?.reason,
+    frameError,
+    extractChatEventText(payload),
+  ];
+
+  for (const candidate of candidates) {
+    const detail = extractErrorDetail(candidate);
+    if (detail) return detail;
+  }
+
+  return 'Unknown stream error';
+}
+
 export class OpenClawClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private config: OpenClawConfig;
@@ -100,21 +308,24 @@ export class OpenClawClient extends EventEmitter {
             const payload = msg.payload || msg.data;
             if (!payload) return;
 
-            const state = payload.state; // 'delta' | 'final'
+            const state = payload.state; // 'delta' | 'final' | 'aborted' | 'error'
             const sessionKey = payload.sessionKey;
-            const text = payload.message?.content?.[0]?.text || '';
+            const text = extractChatEventText(payload);
             const runId = payload.runId;
 
             if (state === 'delta') {
               this.emit('chat.delta', { sessionKey, runId, text });
             } else if (state === 'final') {
               this.emit('chat.final', { sessionKey, runId, text, message: payload.message });
+            } else if (state === 'aborted') {
+              this.emit('chat.aborted', { sessionKey, runId, text, message: payload.message });
             } else if (state === 'error') {
               // The gateway may send an error state if the LLM request fails dynamically
-              this.emit('chat.error', { sessionKey, runId, error: payload.error || text || 'Unknown stream error' });
+              this.emit('chat.error', { sessionKey, runId, error: extractChatEventError(payload, msg.error) });
             }
             return;
           }
+
         } catch (err: any) {
           this.emit('error', new Error(err?.message || 'Failed to parse message'));
         }
@@ -152,16 +363,45 @@ export class OpenClawClient extends EventEmitter {
     });
   }
 
+  async call(method: string, params?: any, timeoutMs = 60000): Promise<any> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    return this.request(method, params, timeoutMs);
+  }
+
+  async waitForRun(runId: string, timeoutMs = 90000): Promise<void> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    await this.request('agent.wait', { runId, timeoutMs }, timeoutMs + 5000);
+  }
+
+  async getLatestAssistantText(sessionKey: string, limit = 20): Promise<string> {
+    const history = await this.getChatHistory(sessionKey, limit);
+    return this.extractLatestAssistantText(history);
+  }
+
+  async getChatHistory(sessionKey: string, limit = 20): Promise<any> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    return this.request('chat.history', {
+      sessionKey,
+      limit,
+    }, 30000);
+  }
+
   private extractLatestAssistantText(historyPayload: any): string {
     const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
     for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
+      const m = normalizeOpenClawMessageRecord(messages[i]);
       if (m?.role !== 'assistant') continue;
-      const content = Array.isArray(m?.content) ? m.content : [];
-      const textParts = content
-        .filter((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-        .map((c: any) => c.text);
-      if (textParts.length > 0) return textParts.join('\n');
+      const text = extractOpenClawMessageText(m);
+      if (text) return text;
     }
     return '';
   }
@@ -172,6 +412,7 @@ export class OpenClawClient extends EventEmitter {
     sessionKey: string;
     message: string;
     agentId?: string;
+    attachments?: { type: string; mimeType: string; content: string }[];
   }): Promise<{ runId: string; sessionKey: string }> {
     if (!this.connected) {
       await this.connect();
@@ -185,6 +426,7 @@ export class OpenClawClient extends EventEmitter {
     const started = await this.request('chat.send', {
       sessionKey: finalSessionKey,
       message: params.message,
+      attachments: params.attachments && params.attachments.length > 0 ? params.attachments : undefined,
       idempotencyKey: crypto.randomUUID(),
     }, 30000);
 
@@ -227,6 +469,27 @@ export class OpenClawClient extends EventEmitter {
 
     const text = this.extractLatestAssistantText(history);
     return text || 'No assistant text found in response.';
+  }
+
+  async abortChat(params: {
+    sessionKey: string;
+    runId?: string;
+  }): Promise<{ aborted: boolean; runIds?: string[] }> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    const response = await this.request('chat.abort', {
+      sessionKey: params.sessionKey,
+      ...(params.runId ? { runId: params.runId } : {}),
+    }, 10000);
+
+    return {
+      aborted: response?.aborted !== false,
+      runIds: Array.isArray(response?.runIds)
+        ? response.runIds.filter((runId: unknown): runId is string => typeof runId === 'string')
+        : undefined,
+    };
   }
 
   async testConnection(): Promise<boolean> {

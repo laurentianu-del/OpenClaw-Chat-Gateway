@@ -1,16 +1,29 @@
 {
   "name": "clawui",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "appName": "OpenClaw Chat Gateway",
   "description": "OpenClaw Web Client",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liandu2024/OpenClaw-Chat-Gateway.git"
+  },
+  "homepage": "https://github.com/liandu2024/OpenClaw-Chat-Gateway",
   "scripts": {
     "dev": "export BACKEND_PORT=3100 FRONTEND_PORT=3105 CLAWUI_DATA_DIR=.clawui_dev && concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "release": "export BACKEND_PORT=3110 FRONTEND_PORT=3115 CLAWUI_DATA_DIR=.clawui_release && npm run build && concurrently \"npm run start:backend\" \"npm run start:frontend\"",
     "dev:frontend": "cd frontend && npm run dev",
     "dev:backend": "cd backend && npm run dev",
-    "build": "npm run build:backend && npm run build:frontend",
+    "version:meta": "node scripts/write-build-meta.mjs",
+    "build": "npm run version:meta && npm run build:backend && npm run build:frontend",
     "build:backend": "cd backend && npm run build",
     "build:frontend": "cd frontend && npm run build",
+    "test": "npm run test:backend && npm run test:frontend",
+    "test:backend": "cd backend && npm run test",
+    "test:frontend": "cd frontend && npm run test",
+    "release:tag": "node scripts/github-release-sync.mjs --create-tag",
+    "release:publish": "node scripts/github-release-sync.mjs --create-tag --push",
+    "release:sync": "node scripts/github-release-sync.mjs --create-tag --push --github-release",
     "start:backend": "cd backend && PORT=3110 CLAWUI_DATA_DIR=.clawui_release npm start",
     "start:frontend": "cd frontend && npx vite preview --port 3115 --host"
   },

@@ -1,11 +1,11 @@
 {
   "name": "clawui-backend",
-  "version": "1.0.0",
   "description": "ClawUI Backend - OpenClaw Web Client Server",
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec ts-node src/index.ts",
     "build": "tsc",
+    "test": "tsc --noEmit",
     "start": "node dist/index.js"
   },
   "dependencies": {

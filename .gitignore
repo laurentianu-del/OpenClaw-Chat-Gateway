@@ -31,6 +31,5 @@ yarn-error.log*
 .clawui/
 .clawui_dev/
 .clawui_release/
-openclaw-chat-gateway/
-openclaw-chat-gateway.zip
+.clawui-build.json
 /tmp/
