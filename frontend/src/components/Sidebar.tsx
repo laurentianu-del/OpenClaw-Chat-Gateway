@@ -24,6 +24,11 @@ interface SidebarProps {
   onSelectGroup: (id: string) => void;
 }
 
+type AppVersionInfo = {
+  version: string;
+  openclawVersion: string | null;
+};
+
 type GroupSummary = {
   id: string;
   name: string;
@@ -184,11 +189,21 @@ function SessionSkeleton() {
   );
 }
 
-function SidebarHeader() {
+function SidebarHeader({ openclawVersion, appVersion }: { openclawVersion: string; appVersion: string }) {
   return (
     <div className="pt-4 pb-6 px-6">
-      <div className="text-2xl font-black text-gray-900 tracking-tighter leading-tight mb-1">OpenClaw</div>
-      <div className="text-[1.15rem] font-bold text-gray-400 tracking-widest uppercase leading-tight">CHAT GATEWAY</div>
+      <div className="mb-1 flex items-baseline gap-2 whitespace-nowrap leading-none">
+        <div className="text-2xl font-black text-gray-900 tracking-tighter leading-tight">OpenClaw</div>
+        {openclawVersion ? (
+          <div className="text-[0.8rem] font-medium text-gray-800 leading-none">{openclawVersion}</div>
+        ) : null}
+      </div>
+      <div className="flex items-baseline gap-2 whitespace-nowrap leading-none">
+        <div className="text-[1.15rem] font-bold text-gray-400 tracking-widest uppercase leading-tight">CHAT GATEWAY</div>
+        {appVersion ? (
+          <div className="text-[0.8rem] font-medium text-gray-400 leading-none">{appVersion}</div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -210,6 +225,29 @@ export default function Sidebar({
   onSelectGroup
 }: SidebarProps) {
   const { t } = useTranslation();
+  const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch('/api/version')
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled) return;
+        if (typeof data?.version === 'string') {
+          setAppVersionInfo({
+            version: data.version,
+            openclawVersion: typeof data?.openclawVersion === 'string' ? data.openclawVersion : null,
+          });
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const resolveGroupMemberDisplayName = (member: { agent_id?: string; agentId?: string; display_name?: string; displayName?: string }) => {
     const agentId = member.agent_id || member.agentId || '';
     const linkedSession = sessions.find((session) => (session.agentId || session.id) === agentId);
@@ -1106,7 +1144,10 @@ export default function Sidebar({
           />
         )}
         <aside className={`fixed inset-y-0 left-0 z-50 w-[75vw] md:w-64 flex-shrink-0 flex-col border-r border-gray-200 bg-gray-100 h-full transition-transform duration-300 md:relative md:translate-x-0 md:flex ${isMobileMenuOpen ? 'translate-x-0 flex' : '-translate-x-full hidden'}`}>
-          <SidebarHeader />
+          <SidebarHeader
+            openclawVersion={appVersionInfo?.openclawVersion || ''}
+            appVersion={appVersionInfo?.version || ''}
+          />
         <nav className="flex-1 px-4 py-2 space-y-1">
           <button 
             onClick={() => navigateTo('settings', 'gateway', false)}
@@ -1182,7 +1223,10 @@ export default function Sidebar({
         />
       )}
       <aside className={`fixed inset-y-0 left-0 z-50 w-[75vw] md:w-64 flex-shrink-0 flex-col border-r border-gray-200 bg-gray-100 h-full transition-transform duration-300 md:relative md:translate-x-0 md:flex ${isMobileMenuOpen ? 'translate-x-0 flex' : '-translate-x-full hidden'}`}>
-        <SidebarHeader />
+        <SidebarHeader
+          openclawVersion={appVersionInfo?.openclawVersion || ''}
+          appVersion={appVersionInfo?.version || ''}
+        />
 
       {/* + 新建 按钮组 */}
       <div className="px-4 pb-3">

@@ -44,6 +44,11 @@ cp "$PROJECT_ROOT/clawui.service" "$SERVICE_DIR/$SERVICE_NAME.service"
 sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/backend|" "$SERVICE_DIR/$SERVICE_NAME.service"
 sed -i "s/Environment=PORT=.*/Environment=PORT=$CLAWUI_PORT/" "$SERVICE_DIR/$SERVICE_NAME.service"
 sed -i "s/Description=.*/Description=ClawUI Service (Port $CLAWUI_PORT)/" "$SERVICE_DIR/$SERVICE_NAME.service"
+if grep -q '^Environment=PATH=' "$SERVICE_DIR/$SERVICE_NAME.service"; then
+    sed -i "s|^Environment=PATH=.*|Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin|" "$SERVICE_DIR/$SERVICE_NAME.service"
+else
+    sed -i "/Environment=NODE_ENV=.*/a Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$SERVICE_DIR/$SERVICE_NAME.service"
+fi
 
 echo "Reloading systemd daemon..."
 systemctl --user daemon-reload

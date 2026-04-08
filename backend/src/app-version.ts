@@ -33,6 +33,7 @@ export type CurrentAppVersionInfo = {
   commit: string | null;
   buildTime: string | null;
   repositoryUrl: string | null;
+  openclawVersion: string | null;
 };
 
 export type LatestVersionInfo = {
@@ -203,6 +204,7 @@ export function getCurrentAppVersionInfo(): CurrentAppVersionInfo {
     commit: normalizeText(process.env.CLAWUI_BUILD_COMMIT) || normalizeText(buildMeta?.commit) || safeReadGit(['rev-parse', '--short', 'HEAD']),
     buildTime: normalizeText(process.env.CLAWUI_BUILD_TIME) || normalizeText(buildMeta?.buildTime),
     repositoryUrl: repository?.htmlUrl || normalizeText(rootPackageJson.homepage),
+    openclawVersion: null,
   };
 }
 

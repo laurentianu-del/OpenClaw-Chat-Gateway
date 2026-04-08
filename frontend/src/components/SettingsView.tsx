@@ -93,6 +93,7 @@ type AppVersionInfo = {
   commit: string | null;
   buildTime: string | null;
   repositoryUrl: string | null;
+  openclawVersion: string | null;
 };
 
 type LatestVersionInfo = {
@@ -136,6 +137,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [gatewayError, setGatewayError] = useState(false);
   const [isDetectingAll, setIsDetectingAll] = useState(false);
   const [detectError, setDetectError] = useState('');
+  const [detectedOpenClawVersion, setDetectedOpenClawVersion] = useState('');
   const [maxPermissions, setMaxPermissions] = useState(false);
   const [isTogglingPermissions, setIsTogglingPermissions] = useState(false);
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
@@ -325,8 +327,10 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         setAppVersionInfo(null);
         return null;
       }
-      setAppVersionInfo(data as AppVersionInfo);
-      return data as AppVersionInfo;
+      const versionInfo = data as AppVersionInfo;
+      setAppVersionInfo(versionInfo);
+      setDetectedOpenClawVersion(versionInfo.openclawVersion || '');
+      return versionInfo;
     } catch (error) {
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
       setAppVersionError({
@@ -361,6 +365,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
           commit: null,
           buildTime: null,
           repositoryUrl: latestData.repositoryUrl,
+          openclawVersion: null,
         });
       }
     } catch (error) {
@@ -387,7 +392,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   };
 
   useEffect(() => {
-    if (settingsTab !== 'about') return;
+    if (settingsTab !== 'about' && settingsTab !== 'gateway') return;
     void fetchCurrentVersionInfo();
   }, [settingsTab]);
 
@@ -746,6 +751,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const handleDetectAll = async () => {
     setIsDetectingAll(true);
     setDetectError('');
+    setDetectedOpenClawVersion('');
     try {
       const res = await fetch('/api/config/detect-all');
       const data = await res.json();
@@ -754,6 +760,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         if (data.data.token) setToken(data.data.token);
         if (data.data.password) setPassword(data.data.password);
         if (data.data.workspacePath) setOpenclawWorkspace(data.data.workspacePath);
+        setDetectedOpenClawVersion(typeof data.data.openclawVersion === 'string' ? data.data.openclawVersion : '');
       } else {
         const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.detectFailed');
         setDetectError(display.message);
@@ -1556,17 +1563,28 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
             <>
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <h3 className="text-lg font-semibold text-gray-900">{t('settings.gateway.connectionTitle')}</h3>
-                  <div className="flex flex-col items-end gap-1 relative">
-                    <button
-                      type="button"
-                      onClick={handleDetectAll}
-                      disabled={isDetectingAll || isLoading}
-                      className={`${secondaryActionButtonClass} shrink-0`}
-                    >
-                      {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-                      {t('settings.gateway.autoDetect')}
-                    </button>
+                  <div className="flex min-w-0 items-baseline gap-3">
+                    <h3 className="text-lg font-semibold text-gray-900">
+                      {t('settings.gateway.connectionTitle')}
+                    </h3>
+                    {detectedOpenClawVersion && (
+                      <span className="text-sm font-normal text-gray-500">
+                        {t('settings.gateway.versionInline', { version: detectedOpenClawVersion })}
+                      </span>
+                    )}
+                  </div>
+                  <div className="relative">
+                    <div className="flex flex-wrap items-center justify-end">
+                      <button
+                        type="button"
+                        onClick={handleDetectAll}
+                        disabled={isDetectingAll || isLoading}
+                        className={`${secondaryActionButtonClass} shrink-0`}
+                      >
+                        {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                        {t('settings.gateway.autoDetect')}
+                      </button>
+                    </div>
                     {detectError && (
                       <div className="absolute top-full mt-2 right-0 w-80 text-xs bg-red-50 text-red-600 border border-red-200 p-2 rounded-lg z-10 break-words pointer-events-none">
                         {detectError}

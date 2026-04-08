@@ -276,8 +276,10 @@
     },
     "gateway": {
       "headerTitle": "设置 - 网关",
-      "connectionTitle": "连接设置",
+      "connectionTitle": "OpenClaw",
       "autoDetect": "自动检测",
+      "detectedVersion": "OpenClaw ver: {{version}}",
+      "versionInline": "{{version}}",
       "description": "配置连接到 OpenClaw 网关的终结点和凭据。",
       "gatewayUrlLabel": "网关地址",
       "tokenLabel": "Token",

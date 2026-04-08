@@ -238,6 +238,62 @@ function getExecApprovalsPath() {
   return path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
 }
 
+function isExecutableFile(filePath: string) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+let cachedOpenClawExecutablePath: string | null = null;
+
+function getOpenClawExecutablePath() {
+  if (cachedOpenClawExecutablePath && isExecutableFile(cachedOpenClawExecutablePath)) {
+    return cachedOpenClawExecutablePath;
+  }
+
+  const executableName = process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw';
+  const candidates = [
+    normalizeCliText(process.env.OPENCLAW_BIN),
+    ...normalizeCliText(process.env.PATH)
+      .split(path.delimiter)
+      .map(entry => entry.trim())
+      .filter(Boolean)
+      .map(entry => path.join(entry, executableName)),
+    path.join(os.homedir(), '.npm-global', 'bin', executableName),
+    path.join(os.homedir(), '.local', 'bin', executableName),
+    '/usr/local/bin/openclaw',
+    '/usr/bin/openclaw',
+  ].filter(Boolean);
+
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (isExecutableFile(candidate)) {
+      cachedOpenClawExecutablePath = candidate;
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `OpenClaw CLI not found. Checked: ${Array.from(seen).join(', ')}`
+  );
+}
+
+async function readOpenClawVersion() {
+  try {
+    const { stdout } = await execFilePromise(getOpenClawExecutablePath(), ['--version']);
+    const raw = normalizeCliText(stdout);
+    const matched = raw.match(/OpenClaw\s+([^\s(]+)/i);
+    return matched?.[1] || raw || null;
+  } catch {
+    return null;
+  }
+}
+
 function readOpenClawConfig(): any | null {
   try {
     const configPath = getOpenClawConfigPath();
@@ -463,7 +519,7 @@ function setBrowserHeadlessMode(enabled: boolean) {
 }
 
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
-  return execFilePromise('openclaw', ['browser', ...args], {
+  return execFilePromise(getOpenClawExecutablePath(), ['browser', ...args], {
     timeout: timeoutMs,
     maxBuffer: 1024 * 1024,
   });
@@ -471,7 +527,7 @@ async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
 
 function startOpenClawBrowserDetached(args: string[] = []) {
   return new Promise<number | null>((resolve, reject) => {
-    const child = spawn('openclaw', ['browser', ...args, 'start'], {
+    const child = spawn(getOpenClawExecutablePath(), ['browser', ...args, 'start'], {
       detached: true,
       stdio: 'ignore',
     });
@@ -626,7 +682,7 @@ async function restartGatewayService() {
     }
   }
   connections.clear();
-  await execPromise('openclaw gateway restart');
+  await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
 }
 
 function createStructuredChatError(rawDetail?: string | null, forcedCode?: string) {
@@ -1548,14 +1604,24 @@ app.get('/health', (_req, res) => {
 
 // API Routes
 app.get('/api/version', (_req, res) => {
-  try {
-    res.json(getCurrentAppVersionInfo());
-  } catch (error: any) {
+  (async () => {
+    try {
+      res.json({
+        ...getCurrentAppVersionInfo(),
+        openclawVersion: await readOpenClawVersion(),
+      });
+    } catch (error: any) {
+      res.status(500).json(buildStructuredApiError(
+        VERSION_INFO_UNAVAILABLE_ERROR_CODE,
+        error instanceof Error ? error.message : String(error),
+      ));
+    }
+  })().catch((error: any) => {
     res.status(500).json(buildStructuredApiError(
       VERSION_INFO_UNAVAILABLE_ERROR_CODE,
       error instanceof Error ? error.message : String(error),
     ));
-  }
+  });
 });
 
 app.get('/api/version/latest', async (_req, res) => {
@@ -1713,13 +1779,14 @@ app.post('/api/config/test', async (req, res) => {
   }
 });
 
-app.get('/api/config/detect-all', (req, res) => {
+app.get('/api/config/detect-all', async (_req, res) => {
   try {
     const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
     let gatewayUrl = '';
     let token = '';
     let password = '';
     let workspacePath = '';
+    const openclawVersion = await readOpenClawVersion();
 
     if (fs.existsSync(configPath)) {
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
@@ -1745,7 +1812,8 @@ app.get('/api/config/detect-all', (req, res) => {
         gatewayUrl,
         token,
         password,
-        workspacePath
+        workspacePath,
+        openclawVersion,
       }
     });
   } catch (error: any) {
@@ -1848,7 +1916,7 @@ app.post('/api/config/restart', async (_req, res) => {
     connections.clear();
 
     // Execute the actual restart command on the system
-    await execPromise('openclaw gateway restart');
+    await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
 
     res.json({ success: true, message: 'Gateway connections reset and service restarted' });
   } catch (error: any) {

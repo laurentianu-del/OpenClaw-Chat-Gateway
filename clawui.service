@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 Environment=PORT=3115
 Environment=NODE_ENV=production
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CLAWUI_DATA_DIR=.clawui_release
 WorkingDirectory=%h/OpenClaw-Chat-Gateway/backend
 ExecStart=/usr/bin/node dist/index.js

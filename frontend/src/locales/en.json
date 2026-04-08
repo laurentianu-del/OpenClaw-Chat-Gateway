@@ -276,8 +276,10 @@
     },
     "gateway": {
       "headerTitle": "Settings - Gateway",
-      "connectionTitle": "Connection Settings",
+      "connectionTitle": "OpenClaw",
       "autoDetect": "Auto Detect",
+      "detectedVersion": "OpenClaw ver: {{version}}",
+      "versionInline": "{{version}}",
       "description": "Configure the endpoint and credentials used to connect to the OpenClaw gateway.",
       "gatewayUrlLabel": "Gateway URL",
       "tokenLabel": "Token",
