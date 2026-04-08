@@ -176,7 +176,9 @@
     "restartFailed": "重啟網關失敗",
     "detectFailed": "檢測網關設定失敗",
     "browserHealthFailed": "瀏覽器健康檢查失敗",
-    "browserSelfHealFailed": "瀏覽器自癒失敗"
+    "browserSelfHealFailed": "瀏覽器自癒失敗",
+    "browserHeadedModeLoadFailed": "讀取有頭模式設定失敗",
+    "browserHeadedModeUpdateFailed": "更新有頭模式設定失敗"
   },
   "models": {
     "createFailed": "新增模型失敗",
@@ -304,6 +306,7 @@
       "maxPermissionsLabel": "最大化權限",
       "maxPermissionsHint": "開啟後將解鎖瀏覽器工具、命令執行（免確認）、檔案操作等全部工具權限。關閉則使用預設 coding 預設。註：瀏覽器工具需系統支援圖形環境或無頭模式。",
       "browserHealthTitle": "瀏覽器",
+      "browserHeadedModeLabel": "有頭模式",
       "browserHealthDescription": "透過網關實際呼叫瀏覽器進行檢查，並結合權限、設定與程序狀態提供診斷和自動修復。",
       "checkBrowserHealth": "健康檢查",
       "checkingBrowserHealth": "檢查中...",

@@ -176,7 +176,9 @@
     "restartFailed": "Failed to restart gateway",
     "detectFailed": "Failed to detect gateway configuration",
     "browserHealthFailed": "Browser health check failed",
-    "browserSelfHealFailed": "Browser self-heal failed"
+    "browserSelfHealFailed": "Browser self-heal failed",
+    "browserHeadedModeLoadFailed": "Failed to load the windowed mode setting",
+    "browserHeadedModeUpdateFailed": "Failed to update the windowed mode setting"
   },
   "models": {
     "createFailed": "Failed to add model",
@@ -304,6 +306,7 @@
       "maxPermissionsLabel": "Maximum Permissions",
       "maxPermissionsHint": "When enabled, browser tools, command execution without confirmation, file operations, and other tools are fully unlocked. When disabled, the default coding preset is used. Note: browser tools require a graphical environment or headless support.",
       "browserHealthTitle": "Browser",
+      "browserHeadedModeLabel": "Windowed Mode",
       "browserHealthDescription": "Check the browser by having the gateway actually invoke it, and combine permissions, configuration, and process state to provide diagnostics and automatic repair.",
       "checkBrowserHealth": "Health Check",
       "checkingBrowserHealth": "Checking...",

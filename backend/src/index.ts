@@ -100,6 +100,8 @@ const GATEWAY_RESTART_FAILED_ERROR_CODE = 'gateway.restartFailed';
 const GATEWAY_DETECT_FAILED_ERROR_CODE = 'gateway.detectFailed';
 const BROWSER_HEALTH_FAILED_ERROR_CODE = 'gateway.browserHealthFailed';
 const BROWSER_SELF_HEAL_FAILED_ERROR_CODE = 'gateway.browserSelfHealFailed';
+const BROWSER_HEADED_MODE_LOAD_FAILED_ERROR_CODE = 'gateway.browserHeadedModeLoadFailed';
+const BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE = 'gateway.browserHeadedModeUpdateFailed';
 const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
 const AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'agents.idContainsWhitespace';
 const AGENT_ID_ALREADY_EXISTS_ERROR_CODE = 'agents.idAlreadyExists';
@@ -199,6 +201,11 @@ type BrowserRuntimeState = {
   detectedBrowser: string | null;
   headless: boolean | null;
   detectError: string | null;
+};
+
+type BrowserHeadedModeConfig = {
+  headless: boolean;
+  headedModeEnabled: boolean;
 };
 
 type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'validationSucceeded' | 'validationDetail'>;
@@ -604,6 +611,12 @@ function readOpenClawConfig(): any | null {
   }
 }
 
+function writeOpenClawConfig(config: any) {
+  const configPath = getOpenClawConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+}
+
 function isMaxPermissionsConfigEnabled(config: any): boolean {
   return !config?.tools?.profile && config?.tools?.exec?.security === 'full';
 }
@@ -640,6 +653,40 @@ function readBrowserConfigState(): BrowserConfigState {
     noSandbox: typeof config?.browser?.noSandbox === 'boolean' ? config.browser.noSandbox : null,
     attachOnly: typeof config?.browser?.attachOnly === 'boolean' ? config.browser.attachOnly : null,
     cdpPort: Number.isFinite(configuredCdpPort) ? Number(configuredCdpPort) : null,
+  };
+}
+
+function readBrowserHeadedModeConfig(): BrowserHeadedModeConfig {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  const headless = config?.browser?.headless === true;
+
+  return {
+    headless,
+    headedModeEnabled: !headless,
+  };
+}
+
+function setBrowserHeadedModeEnabled(headedModeEnabled: boolean): BrowserHeadedModeConfig {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  if (!config.browser || typeof config.browser !== 'object') {
+    config.browser = {};
+  }
+  config.browser.headless = !headedModeEnabled;
+  writeOpenClawConfig(config);
+
+  return {
+    headless: config.browser.headless === true,
+    headedModeEnabled: config.browser.headless !== true,
   };
 }
 
@@ -2529,6 +2576,51 @@ app.get('/api/config/browser-health', async (_req, res) => {
     res.json(buildStructuredApiError(
       BROWSER_HEALTH_FAILED_ERROR_CODE,
       readCliErrorDetail(error) || error?.message || 'Browser health check failed'
+    ));
+  }
+});
+
+app.get('/api/config/browser-headed-mode', (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      config: readBrowserHeadedModeConfig(),
+    });
+  } catch (error: any) {
+    res.status(500).json(buildStructuredApiError(
+      BROWSER_HEADED_MODE_LOAD_FAILED_ERROR_CODE,
+      error?.message || 'Failed to load browser headed mode config'
+    ));
+  }
+});
+
+app.post('/api/config/browser-headed-mode', (req, res) => {
+  const { headedModeEnabled } = req.body ?? {};
+  if (typeof headedModeEnabled !== 'boolean') {
+    return res.status(400).json(buildStructuredApiError(
+      BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
+      'headedModeEnabled must be a boolean'
+    ));
+  }
+
+  try {
+    const config = setBrowserHeadedModeEnabled(headedModeEnabled);
+    res.json({
+      success: true,
+      config,
+      restartQueued: true,
+    });
+
+    void (async () => {
+      await stopOpenClawBrowserBestEffort();
+      await scheduleGatewayRestart();
+    })().catch((error: any) => {
+      console.error('[BrowserHeadedMode] Failed to apply browser mode update:', error?.message || error);
+    });
+  } catch (error: any) {
+    res.status(500).json(buildStructuredApiError(
+      BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
+      error?.message || 'Failed to update browser headed mode config'
     ));
   }
 });

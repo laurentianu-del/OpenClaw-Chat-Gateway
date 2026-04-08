@@ -110,6 +110,11 @@ type BrowserHealthNotice = {
   message: string;
 };
 
+type BrowserHeadedModeConfig = {
+  headless: boolean;
+  headedModeEnabled: boolean;
+};
+
 type AppVersionInfo = {
   appName: string;
   version: string;
@@ -200,6 +205,9 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [browserHealthNotice, setBrowserHealthNotice] = useState<BrowserHealthNotice | null>(null);
   const [isCheckingBrowserHealth, setIsCheckingBrowserHealth] = useState(false);
   const [isSelfHealingBrowser, setIsSelfHealingBrowser] = useState(false);
+  const [browserHeadedModeEnabled, setBrowserHeadedModeEnabled] = useState<boolean | null>(null);
+  const [isLoadingBrowserHeadedMode, setIsLoadingBrowserHeadedMode] = useState(false);
+  const [isTogglingBrowserHeadedMode, setIsTogglingBrowserHeadedMode] = useState(false);
   const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
   const [appVersionError, setAppVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isLoadingAppVersion, setIsLoadingAppVersion] = useState(false);
@@ -580,6 +588,11 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   useEffect(() => {
     if (settingsTab !== 'about' && settingsTab !== 'gateway') return;
     void fetchCurrentVersionInfo();
+  }, [settingsTab]);
+
+  useEffect(() => {
+    if (settingsTab !== 'gateway') return;
+    void fetchBrowserHeadedModeState();
   }, [settingsTab]);
 
   useEffect(() => {
@@ -1031,6 +1044,48 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     if (typeof snapshot.maxPermissionsEnabled === 'boolean') {
       setMaxPermissions(snapshot.maxPermissionsEnabled);
     }
+    if (typeof snapshot.config?.headless === 'boolean') {
+      setBrowserHeadedModeEnabled(snapshot.config.headless !== true);
+    }
+  };
+
+  const applyBrowserHeadedModeConfig = (config: BrowserHeadedModeConfig) => {
+    setBrowserHeadedModeEnabled(config.headedModeEnabled);
+    setBrowserHealth(prev => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        config: {
+          enabled: prev.config?.enabled ?? prev.enabled,
+          headless: config.headless,
+          profile: prev.config?.profile ?? prev.profile,
+          executablePath: prev.config?.executablePath ?? null,
+          noSandbox: prev.config?.noSandbox ?? null,
+          attachOnly: prev.config?.attachOnly ?? null,
+          cdpPort: prev.config?.cdpPort ?? null,
+        },
+      };
+    });
+  };
+
+  const fetchBrowserHeadedModeState = async () => {
+    setIsLoadingBrowserHeadedMode(true);
+    try {
+      const res = await fetch('/api/config/browser-headed-mode');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.config) {
+        applyBrowserHeadedModeConfig(data.config as BrowserHeadedModeConfig);
+      } else {
+        setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHeadedModeLoadFailed'));
+      }
+    } catch (err) {
+      setBrowserHealthError({
+        message: t('gateway.browserHeadedModeLoadFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsLoadingBrowserHeadedMode(false);
+    }
   };
 
   const fetchMaxPermissionsState = async () => {
@@ -1094,6 +1149,40 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       });
     } finally {
       setIsCheckingBrowserHealth(false);
+    }
+  };
+
+  const handleToggleBrowserHeadedMode = async () => {
+    if (browserHeadedModeEnabled === null) return;
+
+    const nextHeadedModeEnabled = !browserHeadedModeEnabled;
+    setBrowserHeadedModeEnabled(nextHeadedModeEnabled);
+    setIsTogglingBrowserHeadedMode(true);
+    setBrowserHealthError(EMPTY_INLINE_ERROR);
+    setBrowserHealthNotice(null);
+
+    try {
+      const res = await fetch('/api/config/browser-headed-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ headedModeEnabled: nextHeadedModeEnabled }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success && data.config) {
+        applyBrowserHeadedModeConfig(data.config as BrowserHeadedModeConfig);
+        setBrowserHealth(null);
+      } else {
+        await fetchBrowserHeadedModeState();
+        setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHeadedModeUpdateFailed'));
+      }
+    } catch (err) {
+      await fetchBrowserHeadedModeState();
+      setBrowserHealthError({
+        message: t('gateway.browserHeadedModeUpdateFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsTogglingBrowserHeadedMode(false);
     }
   };
 
@@ -1948,7 +2037,27 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                 </div>
 
                 <div className="mt-8">
-                  <h3 className="text-lg font-semibold text-gray-900 mb-1">{t('settings.gateway.browserHealthTitle')}</h3>
+                  <div className="mb-1 flex items-center justify-between gap-4">
+                    <h3 className="text-lg font-semibold text-gray-900">{t('settings.gateway.browserHealthTitle')}</h3>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span className="text-sm font-medium text-gray-600 whitespace-nowrap">
+                        {t('settings.gateway.browserHeadedModeLabel')}
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={browserHeadedModeEnabled === true}
+                        aria-label={t('settings.gateway.browserHeadedModeLabel')}
+                        disabled={isLoadingBrowserHeadedMode || isTogglingBrowserHeadedMode || isLoading}
+                        onClick={handleToggleBrowserHeadedMode}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60 ${browserHeadedModeEnabled ? 'bg-blue-600' : 'bg-gray-200'}`}
+                      >
+                        <span
+                          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out ${browserHeadedModeEnabled ? 'translate-x-6' : 'translate-x-1'}`}
+                        />
+                      </button>
+                    </div>
+                  </div>
                   <p className="text-sm text-gray-500 mb-4">{t('settings.gateway.browserHealthDescription')}</p>
 
                   <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200 space-y-4">

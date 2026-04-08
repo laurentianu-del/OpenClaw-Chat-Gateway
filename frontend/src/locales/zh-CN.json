@@ -176,7 +176,9 @@
     "restartFailed": "重启网关失败",
     "detectFailed": "检测网关配置失败",
     "browserHealthFailed": "浏览器健康检查失败",
-    "browserSelfHealFailed": "浏览器自愈失败"
+    "browserSelfHealFailed": "浏览器自愈失败",
+    "browserHeadedModeLoadFailed": "读取有头模式配置失败",
+    "browserHeadedModeUpdateFailed": "更新有头模式配置失败"
   },
   "models": {
     "createFailed": "添加模型失败",
@@ -304,6 +306,7 @@
       "maxPermissionsLabel": "最大化权限",
       "maxPermissionsHint": "开启后将解锁浏览器工具、命令执行（免确认）、文件操作等全部工具权限。关闭则使用默认 coding 预设。注：浏览器工具需系统支持图形环境或无头模式。",
       "browserHealthTitle": "浏览器",
+      "browserHeadedModeLabel": "有头模式",
       "browserHealthDescription": "通过网关实际调用浏览器进行检查，并结合权限、配置与进程状态提供诊断和自动修复。",
       "checkBrowserHealth": "健康检查",
       "checkingBrowserHealth": "检查中...",
