@@ -10,6 +10,7 @@ const PHASE_PREFIX = '::clawui-update-phase::';
 const OPENCLAW_EXECUTABLE = process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw';
 const BROWSER_PROFILE = 'openclaw';
 const BROWSER_TEST_URL = 'https://example.com';
+const BROWSER_FALLBACK_TEST_URL = 'http://example.com';
 const OPENCLAW_CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 const LOCAL_CLIENT_MODES = new Map([
   ['cli', new Set(['cli', 'probe'])],
@@ -51,6 +52,17 @@ function hasDisplayServer() {
     || normalizeText(process.env.WAYLAND_DISPLAY)
     || normalizeText(process.env.MIR_SOCKET)
   );
+}
+
+function isExampleDomainSnapshot(snapshot) {
+  return normalizeText(snapshot).includes('Example Domain');
+}
+
+function isCertificateInterstitialSnapshot(snapshot) {
+  const normalized = normalizeText(snapshot);
+  return /ERR_CERT_/i.test(normalized)
+    || normalized.includes('您的连接不是私密连接')
+    || normalized.includes('Your connection is not private');
 }
 
 function isExecutableFile(filePath) {
@@ -351,13 +363,15 @@ async function captureExampleDomainSnapshot(executablePath) {
       { timeout: 45000 }
     );
     lastSnapshot = snapshotResult.stdout;
-    if (snapshotResult.stdout.includes('Example Domain')) {
+    if (isExampleDomainSnapshot(snapshotResult.stdout)) {
       return snapshotResult.stdout;
     }
     await sleep(BROWSER_RETRY_DELAY_MS);
   }
 
-  throw new Error(`Browser snapshot did not capture the Example Domain page. Last snapshot: ${normalizeText(lastSnapshot) || 'empty'}`);
+  const error = new Error(`Browser snapshot did not capture the Example Domain page. Last snapshot: ${normalizeText(lastSnapshot) || 'empty'}`);
+  error.lastSnapshot = lastSnapshot;
+  throw error;
 }
 
 async function validateBrowserRuntime(executablePath) {
@@ -396,7 +410,25 @@ async function validateBrowserRuntime(executablePath) {
     throw new Error(`Browser open command did not confirm navigation to ${BROWSER_TEST_URL}.`);
   }
 
-  await captureExampleDomainSnapshot(executablePath);
+  try {
+    await captureExampleDomainSnapshot(executablePath);
+  } catch (error) {
+    const lastSnapshot = normalizeText(error?.lastSnapshot);
+    if (!isCertificateInterstitialSnapshot(lastSnapshot)) {
+      throw error;
+    }
+
+    log(`Detected browser certificate interstitial for ${BROWSER_TEST_URL}; retrying runtime validation with ${BROWSER_FALLBACK_TEST_URL}.`);
+    const fallbackOpenResult = await runOpenClaw(
+      executablePath,
+      ['browser', '--browser-profile', BROWSER_PROFILE, '--timeout', '30000', 'open', BROWSER_FALLBACK_TEST_URL],
+      { timeout: 40000 }
+    );
+    if (!/opened:/i.test(fallbackOpenResult.stdout)) {
+      throw new Error(`Browser fallback open command did not confirm navigation to ${BROWSER_FALLBACK_TEST_URL}.`);
+    }
+    await captureExampleDomainSnapshot(executablePath);
+  }
 }
 
 async function main() {
