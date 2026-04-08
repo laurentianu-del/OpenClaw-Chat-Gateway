@@ -65,6 +65,26 @@ type InlineErrorState = {
 
 type BrowserHealthIssue = 'permissions' | 'disabled' | 'stopped' | 'detect-error' | 'timeout' | 'unknown';
 
+type BrowserHealthConfig = {
+  enabled: boolean | null;
+  headless: boolean | null;
+  profile: string | null;
+  executablePath?: string | null;
+  noSandbox?: boolean | null;
+  attachOnly?: boolean | null;
+  cdpPort?: number | null;
+};
+
+type BrowserHealthRuntime = {
+  profile: string | null;
+  running: boolean | null;
+  transport: string | null;
+  chosenBrowser: string | null;
+  detectedBrowser: string | null;
+  headless: boolean | null;
+  detectError: string | null;
+};
+
 type BrowserHealthSnapshot = {
   healthy: boolean;
   issue: BrowserHealthIssue | null;
@@ -79,6 +99,10 @@ type BrowserHealthSnapshot = {
   headless: boolean | null;
   detectError: string | null;
   rawDetail: string | null;
+  validationSucceeded?: boolean | null;
+  validationDetail?: string | null;
+  config?: BrowserHealthConfig | null;
+  runtime?: BrowserHealthRuntime | null;
 };
 
 type BrowserHealthNotice = {
@@ -1713,6 +1737,8 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
   const browserHealthNotCheckedText = t('settings.gateway.browserHealthStates.notChecked');
   const browserHealthValueFallback = browserHealth ? t('common.unknown') : browserHealthNotCheckedText;
+  const browserHealthConfig = browserHealth?.config ?? null;
+  const browserHealthRuntime = browserHealth?.runtime ?? null;
   const browserHealthFacts = [
     {
       label: t('settings.gateway.browserHealthPermissionsLabel'),
@@ -1724,42 +1750,42 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     },
     {
       label: t('settings.gateway.browserHealthEnabledLabel'),
-      value: browserHealth?.enabled === null || !browserHealth
+      value: browserHealthConfig?.enabled === null || browserHealthConfig?.enabled === undefined || !browserHealth
         ? browserHealthValueFallback
-        : browserHealth.enabled
+        : browserHealthConfig.enabled
           ? t('settings.gateway.browserHealthStates.enabled')
           : t('settings.gateway.browserHealthStates.disabled'),
     },
     {
       label: t('settings.gateway.browserHealthRunningLabel'),
-      value: browserHealth?.running === null || !browserHealth
+      value: browserHealthRuntime?.running === null || browserHealthRuntime?.running === undefined || !browserHealth
         ? browserHealthValueFallback
-        : browserHealth.running
+        : browserHealthRuntime.running
           ? t('settings.gateway.browserHealthStates.running')
           : t('settings.gateway.browserHealthStates.stopped'),
     },
     {
       label: t('settings.gateway.browserHealthTransportLabel'),
-      value: browserHealth?.transport || browserHealthValueFallback,
+      value: browserHealthRuntime?.transport || browserHealthValueFallback,
     },
     {
       label: t('settings.gateway.browserHealthModeLabel'),
-      value: browserHealth?.headless === null || !browserHealth
+      value: browserHealthRuntime?.headless === null || browserHealthRuntime?.headless === undefined || !browserHealth
         ? browserHealthValueFallback
-        : browserHealth.headless
+        : browserHealthRuntime.headless
           ? t('settings.gateway.browserHealthStates.headless')
           : t('settings.gateway.browserHealthStates.windowed'),
     },
     {
       label: t('settings.gateway.browserHealthBrowserLabel'),
-      value: browserHealth?.detectedBrowser || browserHealth?.chosenBrowser || browserHealthValueFallback,
+      value: browserHealthRuntime?.detectedBrowser || browserHealthRuntime?.chosenBrowser || browserHealthValueFallback,
     },
     {
       label: t('settings.gateway.browserHealthProfileLabel'),
-      value: browserHealth?.profile || browserHealthValueFallback,
+      value: browserHealthRuntime?.profile || browserHealthConfig?.profile || browserHealth?.profile || browserHealthValueFallback,
     },
   ];
-  const browserHealthDetail = browserHealth?.rawDetail || browserHealth?.detectError || browserHealthError.detail || browserHealthError.message || '';
+  const browserHealthDetail = browserHealth?.validationDetail || browserHealth?.rawDetail || browserHealthRuntime?.detectError || browserHealth?.detectError || browserHealthError.detail || browserHealthError.message || '';
   const browserHealthDetailText = browserHealthDetail
     || (browserHealthError.message
       ? t('settings.gateway.browserHealthButtonNeedsAttention')

@@ -46,14 +46,6 @@ function normalizeText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function hasDisplayServer() {
-  return Boolean(
-    normalizeText(process.env.DISPLAY)
-    || normalizeText(process.env.WAYLAND_DISPLAY)
-    || normalizeText(process.env.MIR_SOCKET)
-  );
-}
-
 function isExampleDomainSnapshot(snapshot) {
   return normalizeText(snapshot).includes('Example Domain');
 }
@@ -138,26 +130,6 @@ function readOpenClawConfig() {
   }
 
   return JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf-8'));
-}
-
-function writeOpenClawConfig(config) {
-  fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2));
-}
-
-function maybeForceHeadlessBrowser() {
-  const config = readOpenClawConfig();
-  if (!config?.browser || config.browser.enabled !== true) {
-    return false;
-  }
-
-  if (hasDisplayServer() || config.browser.headless === true) {
-    return false;
-  }
-
-  config.browser.headless = true;
-  writeOpenClawConfig(config);
-  log('No display server detected; forced browser.headless=true before browser recovery.');
-  return true;
 }
 
 async function runCommand(file, args, options = {}) {
@@ -380,13 +352,6 @@ async function validateBrowserRuntime(executablePath) {
 
   const statusBefore = await readBrowserStatus(executablePath);
   log(`Browser status before recovery: enabled=${String(statusBefore.enabled)} running=${String(statusBefore.running)} detected=${normalizeText(statusBefore.detectedBrowser) || 'unknown'}`);
-
-  const forcedHeadless = maybeForceHeadlessBrowser();
-  if (forcedHeadless) {
-    log('Restarting gateway service after headless browser config change...');
-    await runOpenClaw(executablePath, ['gateway', 'restart', '--json'], { timeout: 120000 });
-    await waitForGatewayReady(executablePath, 'post-headless-browser-config-restart');
-  }
 
   await stopBrowserBestEffort(executablePath);
 

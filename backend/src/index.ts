@@ -142,9 +142,12 @@ const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
 const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
-const BROWSER_GATEWAY_PROBE_TIMEOUT_MS = 15000;
-const BROWSER_GATEWAY_RPC_TIMEOUT_MS = 20000;
-const BROWSER_HEALTH_PROBE_URL = 'about:blank';
+const BROWSER_HEALTH_PROFILE = 'openclaw';
+const BROWSER_HEALTH_VALIDATION_URL = 'https://example.com';
+const BROWSER_HEALTH_FALLBACK_VALIDATION_URL = 'http://example.com';
+const BROWSER_HEALTH_START_TIMEOUT_MS = 30000;
+const BROWSER_HEALTH_OPEN_TIMEOUT_MS = 40000;
+const BROWSER_HEALTH_SNAPSHOT_TIMEOUT_MS = 45000;
 const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
 const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
 const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
@@ -172,17 +175,33 @@ type BrowserHealthSnapshot = {
   headless: boolean | null;
   detectError: string | null;
   rawDetail: string | null;
-  gatewayProbeSucceeded: boolean | null;
-  gatewayProbeDetail: string | null;
+  validationSucceeded: boolean | null;
+  validationDetail: string | null;
+  config: BrowserConfigState;
+  runtime: BrowserRuntimeState | null;
 };
 
 type BrowserConfigState = {
   enabled: boolean | null;
   headless: boolean | null;
   profile: string | null;
+  executablePath: string | null;
+  noSandbox: boolean | null;
+  attachOnly: boolean | null;
+  cdpPort: number | null;
 };
 
-type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'gatewayProbeSucceeded' | 'gatewayProbeDetail'>;
+type BrowserRuntimeState = {
+  profile: string | null;
+  running: boolean | null;
+  transport: string | null;
+  chosenBrowser: string | null;
+  detectedBrowser: string | null;
+  headless: boolean | null;
+  detectError: string | null;
+};
+
+type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'validationSucceeded' | 'validationDetail'>;
 
 type UpdateStatus =
   | 'idle'
@@ -585,12 +604,6 @@ function readOpenClawConfig(): any | null {
   }
 }
 
-function shouldPreferHeadlessBrowser() {
-  return !normalizeCliText(process.env.DISPLAY)
-    && !normalizeCliText(process.env.WAYLAND_DISPLAY)
-    && !normalizeCliText(process.env.MIR_SOCKET);
-}
-
 function isMaxPermissionsConfigEnabled(config: any): boolean {
   return !config?.tools?.profile && config?.tools?.exec?.security === 'full';
 }
@@ -607,12 +620,26 @@ function readMaxPermissionsEnabled(): boolean | null {
   }
 }
 
+function normalizeConfiguredBrowserProfile(config: any): string {
+  return normalizeCliText(config?.browser?.defaultProfile)
+    || normalizeCliText(config?.browser?.profile)
+    || BROWSER_HEALTH_PROFILE;
+}
+
 function readBrowserConfigState(): BrowserConfigState {
   const config = readOpenClawConfig();
+  const profile = normalizeConfiguredBrowserProfile(config);
+  const profileConfig = config?.browser?.profiles?.[profile];
+  const configuredCdpPort = profileConfig?.cdpPort ?? config?.browser?.cdpPort;
+
   return {
     enabled: typeof config?.browser?.enabled === 'boolean' ? config.browser.enabled : null,
     headless: typeof config?.browser?.headless === 'boolean' ? config.browser.headless : null,
-    profile: normalizeCliText(config?.browser?.profile) || null,
+    profile,
+    executablePath: normalizeCliText(config?.browser?.executablePath) || null,
+    noSandbox: typeof config?.browser?.noSandbox === 'boolean' ? config.browser.noSandbox : null,
+    attachOnly: typeof config?.browser?.attachOnly === 'boolean' ? config.browser.attachOnly : null,
+    cdpPort: Number.isFinite(configuredCdpPort) ? Number(configuredCdpPort) : null,
   };
 }
 
@@ -631,17 +658,22 @@ function buildFallbackBrowserHealthDiagnostics(
     transport: null,
     chosenBrowser: null,
     detectedBrowser: null,
-    headless: browserConfig.headless,
+    headless: null,
     detectError: null,
     rawDetail: normalizeCliText(rawDetail) || null,
+    config: browserConfig,
+    runtime: null,
   };
 }
 
-function resolveBrowserProbeFailureIssue(detail: string, diagnostics: BrowserHealthDiagnostics): BrowserHealthIssue {
+function resolveBrowserValidationFailureIssue(detail: string, diagnostics: BrowserHealthDiagnostics): BrowserHealthIssue {
   if (diagnostics.enabled === false || /browser control is disabled/i.test(detail)) {
     return 'disabled';
   }
   if (diagnostics.detectError) {
+    return 'detect-error';
+  }
+  if (/executablepath not found|attachonly|no chrome tabs found/i.test(detail)) {
     return 'detect-error';
   }
   if (diagnostics.running === false) {
@@ -656,24 +688,24 @@ function resolveBrowserProbeFailureIssue(detail: string, diagnostics: BrowserHea
 function finalizeBrowserHealthSnapshot(
   snapshot: BrowserHealthDiagnostics & {
     issue?: BrowserHealthIssue | null;
-    gatewayProbeSucceeded?: boolean | null;
-    gatewayProbeDetail?: string | null;
+    validationSucceeded?: boolean | null;
+    validationDetail?: string | null;
   }
 ): BrowserHealthSnapshot {
   let issue = snapshot.issue ?? null;
-  const gatewayProbeSucceeded = typeof snapshot.gatewayProbeSucceeded === 'boolean'
-    ? snapshot.gatewayProbeSucceeded
+  const validationSucceeded = typeof snapshot.validationSucceeded === 'boolean'
+    ? snapshot.validationSucceeded
     : null;
-  const gatewayProbeDetail = normalizeCliText(snapshot.gatewayProbeDetail) || null;
+  const validationDetail = normalizeCliText(snapshot.validationDetail) || null;
 
   if (!issue) {
     if (snapshot.maxPermissionsEnabled === false) {
       issue = 'permissions';
     } else if (snapshot.enabled === false) {
       issue = 'disabled';
-    } else if (gatewayProbeSucceeded === false) {
-      issue = resolveBrowserProbeFailureIssue(gatewayProbeDetail || snapshot.rawDetail || '', snapshot);
-    } else if (gatewayProbeSucceeded !== true) {
+    } else if (validationSucceeded === false) {
+      issue = resolveBrowserValidationFailureIssue(validationDetail || snapshot.rawDetail || '', snapshot);
+    } else if (validationSucceeded !== true) {
       if (snapshot.running === false) issue = 'stopped';
       else if (snapshot.detectError) issue = 'detect-error';
       else issue = 'unknown';
@@ -681,46 +713,57 @@ function finalizeBrowserHealthSnapshot(
   }
 
   const fallbackDetail = normalizeCliText(snapshot.rawDetail) || null;
-  const rawDetail = gatewayProbeSucceeded === false
-    ? gatewayProbeDetail
+  const rawDetail = validationSucceeded === false
+    ? validationDetail
     : issue === null
       ? null
       : fallbackDetail;
 
   return {
     ...snapshot,
-    healthy: issue === null && gatewayProbeSucceeded === true,
+    healthy: issue === null && validationSucceeded === true,
     issue,
     rawDetail,
-    gatewayProbeSucceeded,
-    gatewayProbeDetail,
+    validationSucceeded,
+    validationDetail,
   };
 }
 
 function buildBrowserHealthDiagnosticsFromCli(
   raw: any,
   checkedAt = Date.now(),
+  browserConfig = readBrowserConfigState(),
   rawDetail?: string | null
 ): BrowserHealthDiagnostics {
   const maxPermissionsEnabled = readMaxPermissionsEnabled();
-  const browserConfig = readBrowserConfigState();
-  const enabled = typeof raw?.enabled === 'boolean' ? raw.enabled : browserConfig.enabled;
+  const enabled = browserConfig.enabled;
   const running = typeof raw?.running === 'boolean' ? raw.running : null;
-  const headless = typeof raw?.headless === 'boolean' ? raw.headless : browserConfig.headless;
+  const headless = typeof raw?.headless === 'boolean' ? raw.headless : null;
   const detectError = normalizeCliText(raw?.detectError) || null;
-
-  return {
-    checkedAt,
-    maxPermissionsEnabled,
+  const runtime: BrowserRuntimeState = {
     profile: normalizeCliText(raw?.profile) || browserConfig.profile,
-    enabled,
     running,
     transport: normalizeCliText(raw?.transport) || null,
     chosenBrowser: normalizeCliText(raw?.chosenBrowser) || null,
     detectedBrowser: normalizeCliText(raw?.detectedBrowser) || null,
     headless,
     detectError,
+  };
+
+  return {
+    checkedAt,
+    maxPermissionsEnabled,
+    profile: runtime.profile || browserConfig.profile,
+    enabled,
+    running,
+    transport: runtime.transport,
+    chosenBrowser: runtime.chosenBrowser,
+    detectedBrowser: runtime.detectedBrowser,
+    headless,
+    detectError,
     rawDetail: normalizeCliText(rawDetail) || null,
+    config: browserConfig,
+    runtime,
   };
 }
 
@@ -765,9 +808,6 @@ function setMaxPermissionsEnabled(enabled: boolean) {
 
     if (!config.browser) config.browser = {};
     config.browser.enabled = true;
-    if (typeof config.browser.headless !== 'boolean' || shouldPreferHeadlessBrowser()) {
-      config.browser.headless = shouldPreferHeadlessBrowser();
-    }
     delete config.browser.ssrfPolicy;
   } else {
     config.tools = { profile: 'coding' };
@@ -784,19 +824,6 @@ function setMaxPermissionsEnabled(enabled: boolean) {
   return { enabled };
 }
 
-function setBrowserHeadlessMode(enabled: boolean) {
-  const configPath = getOpenClawConfigPath();
-  if (!fs.existsSync(configPath)) {
-    throw new Error('openclaw.json not found');
-  }
-
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-  if (!config.browser) config.browser = {};
-  config.browser.enabled = true;
-  config.browser.headless = enabled;
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-}
-
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
   return execFilePromise(getOpenClawExecutablePath(), ['browser', ...args], {
     timeout: timeoutMs,
@@ -804,24 +831,48 @@ async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
   });
 }
 
-function startOpenClawBrowserDetached(args: string[] = []) {
-  return new Promise<number | null>((resolve, reject) => {
-    const child = spawn(getOpenClawExecutablePath(), ['browser', ...args, 'start'], {
-      detached: true,
-      stdio: 'ignore',
-    });
+function buildBrowserProfileArgs(browserConfig: BrowserConfigState, args: string[]) {
+  return ['--browser-profile', browserConfig.profile || BROWSER_HEALTH_PROFILE, ...args];
+}
 
-    child.once('error', reject);
-    child.once('spawn', () => {
-      child.unref();
-      resolve(child.pid ?? null);
-    });
-  });
+function isExampleDomainSnapshot(snapshotText: string) {
+  return normalizeCliText(snapshotText).includes('Example Domain');
+}
+
+function isCertificateInterstitialSnapshot(snapshotText: string) {
+  const normalized = normalizeCliText(snapshotText);
+  return /ERR_CERT_/i.test(normalized)
+    || normalized.includes('您的连接不是私密连接')
+    || normalized.includes('Your connection is not private');
+}
+
+function readConfiguredBrowserValidationError(browserConfig: BrowserConfigState): string | null {
+  if (browserConfig.enabled === false) {
+    return 'browser.enabled is false';
+  }
+
+  if (browserConfig.executablePath) {
+    try {
+      const stat = fs.statSync(browserConfig.executablePath);
+      if (!stat.isFile()) {
+        return `browser.executablePath not found: ${browserConfig.executablePath}`;
+      }
+      fs.accessSync(browserConfig.executablePath, fs.constants.X_OK);
+    } catch {
+      return `browser.executablePath not found: ${browserConfig.executablePath}`;
+    }
+  }
+
+  return null;
 }
 
 async function stopOpenClawBrowserBestEffort() {
   try {
-    await runOpenClawBrowserCommand(['--timeout', String(BROWSER_SELF_HEAL_STOP_TIMEOUT_MS), 'stop'], BROWSER_SELF_HEAL_STOP_TIMEOUT_MS + 3000);
+    const browserConfig = readBrowserConfigState();
+    await runOpenClawBrowserCommand(
+      buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_SELF_HEAL_STOP_TIMEOUT_MS), 'stop']),
+      BROWSER_SELF_HEAL_STOP_TIMEOUT_MS + 3000
+    );
   } catch (error) {
     // Browser may already be stopped or the CLI may time out; self-heal should continue.
   }
@@ -836,7 +887,7 @@ async function waitForBrowserHealth(timeoutMs: number) {
   let lastSnapshot: BrowserHealthSnapshot | null = null;
 
   while (Date.now() < deadline) {
-    lastSnapshot = await runBrowserHealthCheck({ skipGatewayProbeWhenStopped: true });
+    lastSnapshot = await runBrowserHealthCheck();
     if (lastSnapshot.healthy) {
       return lastSnapshot;
     }
@@ -846,110 +897,142 @@ async function waitForBrowserHealth(timeoutMs: number) {
   return lastSnapshot || runBrowserHealthCheck();
 }
 
-async function readBrowserHealthDiagnostics(checkedAt = Date.now()): Promise<BrowserHealthDiagnostics> {
+async function readBrowserHealthDiagnostics(
+  browserConfig = readBrowserConfigState(),
+  checkedAt = Date.now(),
+  rawDetail?: string | null
+): Promise<BrowserHealthDiagnostics> {
   try {
     const { stdout } = await runOpenClawBrowserCommand(
-      ['--json', '--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS), 'status'],
+      buildBrowserProfileArgs(browserConfig, ['--json', '--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS), 'status']),
       BROWSER_HEALTH_EXEC_TIMEOUT_MS
     );
     const parsed = JSON.parse(normalizeCliText(stdout) || '{}');
-    return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt);
+    return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt, browserConfig, rawDetail);
   } catch (error: any) {
     const stdout = normalizeCliText(error?.stdout);
     if (stdout) {
       try {
-        return buildBrowserHealthDiagnosticsFromCli(JSON.parse(stdout), checkedAt, readCliErrorDetail(error));
+        return buildBrowserHealthDiagnosticsFromCli(JSON.parse(stdout), checkedAt, browserConfig, rawDetail || readCliErrorDetail(error));
       } catch {}
     }
 
-    return buildFallbackBrowserHealthDiagnostics(checkedAt, readCliErrorDetail(error));
+    return buildFallbackBrowserHealthDiagnostics(checkedAt, rawDetail || readCliErrorDetail(error));
   }
 }
 
-async function runGatewayBrowserProbe(): Promise<{ succeeded: boolean; detail: string | null }> {
-  const config = configManager.getConfig();
-  const gatewayUrl = normalizeCliText(config.gatewayUrl);
+async function waitForBrowserRunning(browserConfig: BrowserConfigState, checkedAt: number) {
+  let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    if (diagnostics.running === true) {
+      return diagnostics;
+    }
+    await sleep(2000);
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+  }
+  return diagnostics;
+}
 
-  if (!gatewayUrl) {
-    return {
-      succeeded: false,
-      detail: 'Gateway URL is required',
-    };
+async function readBrowserSnapshot(browserConfig: BrowserConfigState) {
+  const { stdout } = await runOpenClawBrowserCommand(
+    buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_OPEN_TIMEOUT_MS), 'snapshot']),
+    BROWSER_HEALTH_SNAPSHOT_TIMEOUT_MS
+  );
+  return normalizeCliText(stdout);
+}
+
+async function captureExampleDomainSnapshot(browserConfig: BrowserConfigState) {
+  let lastSnapshot = '';
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    lastSnapshot = await readBrowserSnapshot(browserConfig);
+    if (isExampleDomainSnapshot(lastSnapshot)) {
+      return lastSnapshot;
+    }
+    await sleep(2000);
   }
 
-  const client = new OpenClawClient({
-    gatewayUrl,
-    token: config.token,
-    password: config.password,
-  });
-  client.on('error', (err) => {
-    console.error('[BrowserHealth] Gateway probe client error:', err.message);
-  });
+  const error = new Error(`Browser snapshot did not capture the Example Domain page. Last snapshot: ${lastSnapshot || 'empty'}`);
+  (error as Error & { snapshotText?: string }).snapshotText = lastSnapshot;
+  throw error;
+}
 
-  let targetId: string | null = null;
+async function openBrowserValidationUrl(browserConfig: BrowserConfigState, url: string) {
+  const { stdout } = await runOpenClawBrowserCommand(
+    buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_OPEN_TIMEOUT_MS), 'open', url]),
+    BROWSER_HEALTH_OPEN_TIMEOUT_MS
+  );
 
-  try {
-    const opened = await client.call('browser.request', {
-      method: 'POST',
-      path: '/tabs/open',
-      body: {
-        url: BROWSER_HEALTH_PROBE_URL,
-      },
-      timeoutMs: BROWSER_GATEWAY_PROBE_TIMEOUT_MS,
-    }, BROWSER_GATEWAY_RPC_TIMEOUT_MS);
-
-    targetId = normalizeCliText(opened?.targetId) || null;
-    const wsUrl = normalizeCliText(opened?.wsUrl) || null;
-
-    if (!targetId && !wsUrl) {
-      throw new Error('Gateway browser probe did not return targetId or wsUrl');
-    }
-
-    return {
-      succeeded: true,
-      detail: null,
-    };
-  } catch (error: any) {
-    return {
-      succeeded: false,
-      detail: normalizeCliText(error?.message) || 'Gateway browser probe failed',
-    };
-  } finally {
-    if (targetId) {
-      try {
-        await client.call('browser.request', {
-          method: 'DELETE',
-          path: `/tabs/${encodeURIComponent(targetId)}`,
-          timeoutMs: BROWSER_GATEWAY_PROBE_TIMEOUT_MS,
-        }, BROWSER_GATEWAY_RPC_TIMEOUT_MS);
-      } catch (cleanupError: any) {
-        console.warn('[BrowserHealth] Failed to close probe tab:', normalizeCliText(cleanupError?.message) || cleanupError);
-      }
-    }
-
-    client.disconnect();
+  if (!/opened:/i.test(normalizeCliText(stdout))) {
+    throw new Error(`Browser open command did not confirm navigation to ${url}.`);
   }
 }
 
-async function runBrowserHealthCheck(options?: { skipGatewayProbeWhenStopped?: boolean }): Promise<BrowserHealthSnapshot> {
+async function runBrowserHealthCheck(): Promise<BrowserHealthSnapshot> {
   const checkedAt = Date.now();
-  const diagnostics = await readBrowserHealthDiagnostics(checkedAt);
+  const browserConfig = readBrowserConfigState();
+  const configError = readConfiguredBrowserValidationError(browserConfig);
 
-  if (options?.skipGatewayProbeWhenStopped && diagnostics.running === false) {
+  if (configError && browserConfig.enabled === false) {
     return finalizeBrowserHealthSnapshot({
-      ...diagnostics,
-      gatewayProbeSucceeded: null,
-      gatewayProbeDetail: null,
+      ...buildFallbackBrowserHealthDiagnostics(checkedAt, configError),
+      validationSucceeded: null,
+      validationDetail: null,
     });
   }
 
-  const probe = await runGatewayBrowserProbe();
+  if (configError) {
+    return finalizeBrowserHealthSnapshot({
+      ...buildFallbackBrowserHealthDiagnostics(checkedAt, configError),
+      validationSucceeded: false,
+      validationDetail: configError,
+    });
+  }
 
-  return finalizeBrowserHealthSnapshot({
-    ...diagnostics,
-    gatewayProbeSucceeded: probe.succeeded,
-    gatewayProbeDetail: probe.detail,
-  });
+  let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+
+  try {
+    await runOpenClawBrowserCommand(
+      buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_START_TIMEOUT_MS), 'start']),
+      BROWSER_HEALTH_START_TIMEOUT_MS
+    );
+
+    diagnostics = await waitForBrowserRunning(browserConfig, checkedAt);
+    if (diagnostics.running !== true) {
+      throw new Error('Browser runtime did not become healthy after start.');
+    }
+
+    await openBrowserValidationUrl(browserConfig, BROWSER_HEALTH_VALIDATION_URL);
+
+    try {
+      await captureExampleDomainSnapshot(browserConfig);
+    } catch (error: any) {
+      const snapshotText = normalizeCliText(error?.snapshotText);
+      if (!isCertificateInterstitialSnapshot(snapshotText)) {
+        throw error;
+      }
+
+      await openBrowserValidationUrl(browserConfig, BROWSER_HEALTH_FALLBACK_VALIDATION_URL);
+      await captureExampleDomainSnapshot(browserConfig);
+    }
+
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+
+    return finalizeBrowserHealthSnapshot({
+      ...diagnostics,
+      validationSucceeded: true,
+      validationDetail: null,
+    });
+  } catch (error: any) {
+    const detail = readCliErrorDetail(error) || error?.message || 'Browser health check failed';
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
+
+    return finalizeBrowserHealthSnapshot({
+      ...diagnostics,
+      validationSucceeded: false,
+      validationDetail: detail,
+    });
+  }
 }
 
 async function restartGatewayService() {
@@ -2457,25 +2540,13 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
     setMaxPermissionsEnabled(true);
     await restartGatewayService();
     await stopOpenClawBrowserBestEffort();
-    await startOpenClawBrowserDetached(['--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS)]);
-
-    let after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
-    let usedHeadlessFallback = false;
-
-    if (!after.healthy && readBrowserConfigState().headless !== true) {
-      usedHeadlessFallback = true;
-      setBrowserHeadlessMode(true);
-      await stopOpenClawBrowserBestEffort();
-      await startOpenClawBrowserDetached(['--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS)]);
-      after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
-    }
+    const after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
 
     res.json({
       success: true,
       before,
       after,
       gatewayRestarted: true,
-      usedHeadlessFallback,
     });
   } catch (error: any) {
     res.json(buildStructuredApiError(
