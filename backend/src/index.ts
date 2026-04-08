@@ -298,6 +298,12 @@ function getUpdatePhaseMessage(phase: string) {
       return 'Building the project.';
     case 'patch-config':
       return 'Patching OpenClaw configuration.';
+    case 'reconcile-openclaw-runtime':
+      return 'Reconciling OpenClaw runtime.';
+    case 'repair-openclaw-device':
+      return 'Repairing local OpenClaw device scopes.';
+    case 'recover-browser-runtime':
+      return 'Recovering and validating browser runtime.';
     case 'setup-service':
       return 'Updating service configuration.';
     case 'service-restart':
@@ -519,6 +525,8 @@ function isExecutableFile(filePath: string) {
 }
 
 let cachedOpenClawExecutablePath: string | null = null;
+let gatewayRestartTask: Promise<void> | null = null;
+let gatewayRestartQueued = false;
 
 function getOpenClawExecutablePath() {
   if (cachedOpenClawExecutablePath && isExecutableFile(cachedOpenClawExecutablePath)) {
@@ -954,6 +962,24 @@ async function restartGatewayService() {
   }
   connections.clear();
   await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
+}
+
+function scheduleGatewayRestart() {
+  gatewayRestartQueued = true;
+  if (gatewayRestartTask) {
+    return gatewayRestartTask;
+  }
+
+  gatewayRestartTask = (async () => {
+    while (gatewayRestartQueued) {
+      gatewayRestartQueued = false;
+      await restartGatewayService();
+    }
+  })().finally(() => {
+    gatewayRestartTask = null;
+  });
+
+  return gatewayRestartTask;
 }
 
 function buildUpdateCommand(targetPort: string) {
@@ -2471,9 +2497,11 @@ app.post('/api/config/max-permissions', (req, res) => {
   (async () => {
     const { enabled } = req.body;
     setMaxPermissionsEnabled(Boolean(enabled));
-    await restartGatewayService();
-
     res.json({ success: true, enabled: Boolean(enabled) });
+
+    void scheduleGatewayRestart().catch((error: any) => {
+      console.error('[MaxPermissions] Failed to restart gateway after config update:', error?.message || error);
+    });
   })().catch((error: any) => {
     res.status(500).json({ success: false, message: error.message });
   });

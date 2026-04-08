@@ -336,10 +336,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     fetchGlobalFallbacks();
     fetchEndpoints();
 
-    fetch('/api/config/max-permissions')
-      .then(r => r.json())
-      .then(data => setMaxPermissions(!!data.enabled))
-      .catch(console.error);
+    fetchMaxPermissionsState().catch(console.error);
   }, []);
 
   const fetchCurrentVersionInfo = async () => {
@@ -1012,7 +1009,20 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
+  const fetchMaxPermissionsState = async () => {
+    const res = await fetch('/api/config/max-permissions');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(typeof data?.message === 'string' ? data.message : 'Failed to load max permissions state');
+    }
+    const enabled = !!data.enabled;
+    setMaxPermissions(enabled);
+    return enabled;
+  };
+
   const handleToggleMaxPermissions = async () => {
+    const nextEnabled = !maxPermissions;
+    setMaxPermissions(nextEnabled);
     setIsTogglingPermissions(true);
     setBrowserHealthNotice(null);
     setBrowserHealthError(EMPTY_INLINE_ERROR);
@@ -1020,15 +1030,22 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       const res = await fetch('/api/config/max-permissions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: !maxPermissions }),
+        body: JSON.stringify({ enabled: nextEnabled }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
         setMaxPermissions(!!data.enabled);
         setBrowserHealth(null);
+      } else {
+        await fetchMaxPermissionsState().catch(() => {
+          setMaxPermissions(!nextEnabled);
+        });
       }
     } catch (err) {
       console.error(err);
+      await fetchMaxPermissionsState().catch(() => {
+        setMaxPermissions(!nextEnabled);
+      });
     } finally {
       setIsTogglingPermissions(false);
     }
@@ -1894,7 +1911,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                         aria-checked={maxPermissions}
                         disabled={isTogglingPermissions}
                         onClick={handleToggleMaxPermissions}
-                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:opacity-50 ${ maxPermissions ? 'bg-blue-600' : 'bg-gray-200' }`}
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed ${ maxPermissions ? 'bg-blue-600' : 'bg-gray-200' }`}
                       >
                         <span
                           className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out ${ maxPermissions ? 'translate-x-6' : 'translate-x-1' }`}

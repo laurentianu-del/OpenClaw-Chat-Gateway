@@ -40,6 +40,10 @@ emit_phase "patch-config"
 echo "Patching OpenClaw configuration for local backend connections..."
 node backend/patch-config.js || echo "Warning: Failed to patch OpenClaw config automatically."
 
+emit_phase "reconcile-openclaw-runtime"
+echo "Reconciling OpenClaw runtime after deploy..."
+node scripts/reconcile-openclaw-runtime.mjs
+
 emit_phase "setup-service"
 echo "Setting up systemd service..."
 mkdir -p "$SERVICE_DIR"
