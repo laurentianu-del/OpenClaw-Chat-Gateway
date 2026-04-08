@@ -11,6 +11,7 @@
 - 浏览器健康接口会返回更完整的配置诊断信息，包括 profile、`executablePath`、`noSandbox`、`attachOnly`、`cdpPort`，便于定位 OpenClaw 浏览器配置问题。
 - 当 `https://example.com` 遇到证书拦截页时，健康检查和 runtime 收敛会识别证书告警，再用 `http://example.com` 做 runtime 可用性确认，避免把证书页误判成浏览器不可用。
 - 设置页浏览器健康卡片改为优先显示运行态字段；拿不到实时运行态时才显示 `未知`，不再把配置值冒充运行时真值。
+- 升级脚本现在会在 `git pull` 前和部署完成后清理部署目录里被 `npm` 改写的 lockfile，避免上一次部署留下脏工作树，导致下一次自动升级卡在 `git-pull`。
 
 ## 验证范围
 

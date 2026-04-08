@@ -11,6 +11,10 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+restore_deploy_lockfiles() {
+    git restore -- package-lock.json backend/package-lock.json frontend/package-lock.json 2>/dev/null || true
+}
+
 echo -e "${BLUE}================================================${NC}"
 echo -e "${BLUE}    OpenClaw Chat Gateway - 一键安装脚本       ${NC}"
 echo -e "${BLUE}================================================${NC}"
@@ -38,6 +42,7 @@ echo -e "\n${BLUE}步骤 2: 获取项目源码...${NC}"
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${BLUE}目录 $INSTALL_DIR 已存在，正在更新...${NC}"
     cd "$INSTALL_DIR"
+    restore_deploy_lockfiles
     git pull
 else
     git clone "$REPO_URL" "$INSTALL_DIR"

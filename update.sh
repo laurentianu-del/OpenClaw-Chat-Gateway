@@ -9,6 +9,10 @@ emit_phase() {
     echo "::clawui-update-phase::$1"
 }
 
+restore_deploy_lockfiles() {
+    git restore -- package-lock.json backend/package-lock.json frontend/package-lock.json 2>/dev/null || true
+}
+
 if [ -f "deploy-release.sh" ]; then
     PROJECT_ROOT="$(pwd)"
 elif [ -d "$INSTALL_DIR" ]; then
@@ -49,6 +53,7 @@ TARGET_PORT=${TARGET_PORT:-3115}
 emit_phase "git-pull"
 echo "正在从 GitHub 更新代码，目录: $PROJECT_ROOT..."
 cd "$PROJECT_ROOT"
+restore_deploy_lockfiles
 git pull
 
 emit_phase "deploy-release"

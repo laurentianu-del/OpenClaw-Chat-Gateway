@@ -10,6 +10,10 @@ emit_phase() {
     echo "::clawui-update-phase::$1"
 }
 
+restore_deploy_lockfiles() {
+    git restore -- package-lock.json backend/package-lock.json frontend/package-lock.json 2>/dev/null || true
+}
+
 # Default Port
 CLAWUI_PORT=${1:-3115}
 SERVICE_NAME="clawui-${CLAWUI_PORT}"
@@ -35,6 +39,7 @@ cd frontend && npm install --include=dev && cd ..
 emit_phase "build"
 echo "Building projects..."
 npm run build
+restore_deploy_lockfiles
 
 emit_phase "patch-config"
 echo "Patching OpenClaw configuration for local backend connections..."
