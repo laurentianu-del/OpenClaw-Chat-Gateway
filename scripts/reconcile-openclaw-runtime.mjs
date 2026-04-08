@@ -26,6 +26,8 @@ const ALLOWED_OPERATOR_REPAIR_SCOPES = new Set([
 const SNAPSHOT_RETRY_COUNT = 5;
 const BROWSER_RUNNING_RETRY_COUNT = 5;
 const BROWSER_RETRY_DELAY_MS = 2000;
+const GATEWAY_READY_RETRY_COUNT = 10;
+const GATEWAY_READY_DELAY_MS = 3000;
 
 function emitPhase(phase) {
   process.stdout.write(`${PHASE_PREFIX}${phase}\n`);
@@ -181,6 +183,42 @@ async function runOpenClaw(executablePath, args, options = {}) {
   });
 }
 
+function isRetryableGatewayError(error) {
+  const detail = normalizeText(error instanceof Error ? error.message : String(error)).toLowerCase();
+  return detail.includes('gateway timeout')
+    || detail.includes('connect econnrefused')
+    || detail.includes('socket hang up')
+    || detail.includes('failed to start cli');
+}
+
+async function listDevicesJson(executablePath) {
+  const result = await runOpenClaw(executablePath, ['devices', 'list', '--json'], { timeout: 30000 });
+  return parseJsonPayload(result.stdout);
+}
+
+async function waitForGatewayReady(executablePath, context) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= GATEWAY_READY_RETRY_COUNT; attempt += 1) {
+    try {
+      await listDevicesJson(executablePath);
+      if (attempt > 1) {
+        log(`OpenClaw gateway became ready after ${attempt} attempts (${context}).`);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableGatewayError(error) || attempt === GATEWAY_READY_RETRY_COUNT) {
+        throw error;
+      }
+      log(`Waiting for OpenClaw gateway to become ready (${context}), attempt ${attempt}/${GATEWAY_READY_RETRY_COUNT}...`);
+      await sleep(GATEWAY_READY_DELAY_MS);
+    }
+  }
+
+  throw lastError ?? new Error(`OpenClaw gateway did not become ready (${context}).`);
+}
+
 async function ensureGatewayServiceAligned(executablePath) {
   emitPhase('reconcile-openclaw-runtime');
 
@@ -196,6 +234,7 @@ async function ensureGatewayServiceAligned(executablePath) {
 
   log('Restarting OpenClaw gateway service after service reinstall...');
   await runOpenClaw(executablePath, ['gateway', 'restart', '--json'], { timeout: 120000 });
+  await waitForGatewayReady(executablePath, 'post-gateway-restart');
 }
 
 function isEligibleRepairRequest(pending, pairedEntries) {
@@ -228,8 +267,7 @@ async function reconcileLocalDeviceRepairs(executablePath) {
   emitPhase('repair-openclaw-device');
   log('Checking for local OpenClaw device repair requests...');
 
-  const beforeResult = await runOpenClaw(executablePath, ['devices', 'list', '--json'], { timeout: 30000 });
-  const before = parseJsonPayload(beforeResult.stdout);
+  const before = await listDevicesJson(executablePath);
   const pending = Array.isArray(before.pending) ? before.pending : [];
   const paired = Array.isArray(before.paired) ? before.paired : [];
   const eligible = pending.filter((entry) => isEligibleRepairRequest(entry, paired));
@@ -249,8 +287,7 @@ async function reconcileLocalDeviceRepairs(executablePath) {
     );
   }
 
-  const afterResult = await runOpenClaw(executablePath, ['devices', 'list', '--json'], { timeout: 30000 });
-  const after = parseJsonPayload(afterResult.stdout);
+  const after = await listDevicesJson(executablePath);
   const afterPending = Array.isArray(after.pending) ? after.pending : [];
   const afterPaired = Array.isArray(after.paired) ? after.paired : [];
 
@@ -334,6 +371,7 @@ async function validateBrowserRuntime(executablePath) {
   if (forcedHeadless) {
     log('Restarting gateway service after headless browser config change...');
     await runOpenClaw(executablePath, ['gateway', 'restart', '--json'], { timeout: 120000 });
+    await waitForGatewayReady(executablePath, 'post-headless-browser-config-restart');
   }
 
   await stopBrowserBestEffort(executablePath);
