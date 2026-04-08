@@ -115,6 +115,15 @@ type BrowserHeadedModeConfig = {
   headedModeEnabled: boolean;
 };
 
+type BrowserTaskStatus = 'idle' | 'checking' | 'repairing';
+
+type BrowserTaskInfo = {
+  status: BrowserTaskStatus;
+  phase: string | null;
+  rawDetail: string | null;
+  updatedAt: string | null;
+};
+
 type AppVersionInfo = {
   appName: string;
   version: string;
@@ -178,6 +187,11 @@ type UpdatePhaseVisual = {
   labelKey: string;
 };
 
+type BrowserTaskPhaseVisual = {
+  progress: number;
+  labelKey: string;
+};
+
 type UpdateProgressLayout = 'compact' | 'expanded';
 
 const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
@@ -193,6 +207,30 @@ const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
   'setup-service': { progress: 96, labelKey: 'settings.about.updateProgressSettingUpService' },
   'service-restart': { progress: 98, labelKey: 'settings.about.updateProgressSettingUpService' },
   'complete': { progress: 100, labelKey: 'settings.about.updateProgressFinishing' },
+};
+
+const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
+  'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
+  'read-status': { progress: 28, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
+  'start-browser': { progress: 52, labelKey: 'settings.gateway.browserTaskPhases.startBrowser' },
+  'wait-running': { progress: 68, labelKey: 'settings.gateway.browserTaskPhases.waitRunning' },
+  'open-validation': { progress: 84, labelKey: 'settings.gateway.browserTaskPhases.openValidation' },
+  'capture-snapshot': { progress: 94, labelKey: 'settings.gateway.browserTaskPhases.captureSnapshot' },
+  'finalize': { progress: 100, labelKey: 'settings.gateway.browserTaskPhases.finalizeCheck' },
+};
+
+const BROWSER_REPAIR_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
+  'inspect-current': { progress: 8, labelKey: 'settings.gateway.browserTaskPhases.inspectCurrent' },
+  'read-config': { progress: 18, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
+  'read-status': { progress: 28, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
+  'enable-permissions': { progress: 42, labelKey: 'settings.gateway.browserTaskPhases.enablePermissions' },
+  'restart-gateway': { progress: 58, labelKey: 'settings.gateway.browserTaskPhases.restartGateway' },
+  'stop-browser': { progress: 70, labelKey: 'settings.gateway.browserTaskPhases.stopBrowser' },
+  'start-browser': { progress: 82, labelKey: 'settings.gateway.browserTaskPhases.startBrowser' },
+  'wait-running': { progress: 90, labelKey: 'settings.gateway.browserTaskPhases.waitRunning' },
+  'open-validation': { progress: 96, labelKey: 'settings.gateway.browserTaskPhases.openValidation' },
+  'capture-snapshot': { progress: 99, labelKey: 'settings.gateway.browserTaskPhases.captureSnapshot' },
+  'finalize': { progress: 100, labelKey: 'settings.gateway.browserTaskPhases.finalizeRepair' },
 };
 
 function joinDistinctLines(values: Array<string | null | undefined>) {
@@ -241,6 +279,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [browserHealthNotice, setBrowserHealthNotice] = useState<BrowserHealthNotice | null>(null);
   const [isCheckingBrowserHealth, setIsCheckingBrowserHealth] = useState(false);
   const [isSelfHealingBrowser, setIsSelfHealingBrowser] = useState(false);
+  const [browserTaskInfo, setBrowserTaskInfo] = useState<BrowserTaskInfo | null>(null);
   const [browserHeadedModeEnabled, setBrowserHeadedModeEnabled] = useState<boolean | null>(null);
   const [isLoadingBrowserHeadedMode, setIsLoadingBrowserHeadedMode] = useState(false);
   const [isTogglingBrowserHeadedMode, setIsTogglingBrowserHeadedMode] = useState(false);
@@ -262,7 +301,6 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [generalSaved, setGeneralSaved] = useState(false);
   const [generalError, setGeneralError] = useState(false);
   const [aiNameError, setAiNameError] = useState<'' | 'required' | 'tooLong'>('');
-  const [openclawWorkspace, setOpenclawWorkspace] = useState('');
   const [historyPageRoundsInput, setHistoryPageRoundsInput] = useState(() => String(readChatHistoryPageRounds()));
 
   const getVisualLength = (str: string) => {
@@ -389,7 +427,6 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         if (data.loginEnabled !== undefined) setLoginEnabled(data.loginEnabled);
         if (data.loginPassword) setLoginPassword(data.loginPassword);
         if (data.allowedHosts) setAllowedHosts(data.allowedHosts);
-        if (data.openclawWorkspace) setOpenclawWorkspace(data.openclawWorkspace);
         if (data.historyPageRounds !== undefined) {
           const nextHistoryPageRounds = normalizeChatHistoryPageRounds(data.historyPageRounds);
           setHistoryPageRoundsInput(String(nextHistoryPageRounds));
@@ -490,6 +527,20 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       }
       const latestData = data as LatestVersionInfo;
       setLatestVersionInfo(latestData);
+      setUpdateStatusInfo(prev => {
+        if (!prev) return prev;
+        if (['checking', 'updating', 'stopping', 'update_succeeded', 'update_failed', 'restarting', 'restart_failed'].includes(prev.status)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          status: latestData.hasUpdate ? 'has_update' : 'idle',
+          currentVersion: latestData.currentVersion || prev.currentVersion,
+          latestVersion: latestData.latestVersion || null,
+          message: null,
+          rawDetail: null,
+        };
+      });
       if (!appVersionInfo) {
         setAppVersionInfo(prev => prev || {
           appName: latestData.appName,
@@ -647,6 +698,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   useEffect(() => {
     if (settingsTab !== 'gateway') return;
     void fetchBrowserHeadedModeState();
+    void fetchBrowserTaskStatus({ quiet: true });
   }, [settingsTab]);
 
   useEffect(() => {
@@ -687,6 +739,30 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       window.clearInterval(timer);
     };
   }, [settingsTab, updateStatusInfo?.status]);
+
+  useEffect(() => {
+    if (settingsTab !== 'gateway') return;
+    const activeStatus = browserTaskInfo?.status;
+    if (!activeStatus || !['checking', 'repairing'].includes(activeStatus)) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const nextTask = await fetchBrowserTaskStatus({ quiet: true });
+      if (cancelled || !nextTask) return;
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [settingsTab, browserTaskInfo?.status]);
 
   useEffect(() => {
     if (updateStatusInfo?.status !== 'updating') {
@@ -1033,7 +1109,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gatewayUrl: url, token, password, openclawWorkspace }),
+        body: JSON.stringify({ gatewayUrl: url, token, password }),
       });
       if (res.ok) {
         setGatewaySaved(true);
@@ -1058,7 +1134,6 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         if (data.data.gatewayUrl) setUrl(data.data.gatewayUrl);
         if (data.data.token) setToken(data.data.token);
         if (data.data.password) setPassword(data.data.password);
-        if (data.data.workspacePath) setOpenclawWorkspace(data.data.workspacePath);
         setDetectedOpenClawVersion(typeof data.data.openclawVersion === 'string' ? data.data.openclawVersion : '');
       } else {
         const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.detectFailed');
@@ -1191,8 +1266,39 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
+  const fetchBrowserTaskStatus = async (options?: { quiet?: boolean }) => {
+    try {
+      const res = await fetch('/api/config/browser-health/status');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.task) {
+        if (!options?.quiet) {
+          setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHealthFailed'));
+        }
+        return null;
+      }
+      const nextTask = data.task as BrowserTaskInfo;
+      setBrowserTaskInfo(nextTask);
+      return nextTask;
+    } catch (err) {
+      if (!options?.quiet) {
+        setBrowserHealthError({
+          message: t('gateway.browserHealthFailed'),
+          detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+        });
+      }
+      return null;
+    }
+  };
+
   const handleCheckBrowserHealth = async () => {
     setIsCheckingBrowserHealth(true);
+    setBrowserTaskInfo({
+      status: 'checking',
+      phase: 'read-config',
+      rawDetail: null,
+      updatedAt: null,
+    });
+    setBrowserHealth(null);
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
     try {
@@ -1209,6 +1315,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
       });
     } finally {
+      setBrowserTaskInfo({
+        status: 'idle',
+        phase: null,
+        rawDetail: null,
+        updatedAt: new Date().toISOString(),
+      });
       setIsCheckingBrowserHealth(false);
     }
   };
@@ -1249,6 +1361,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
   const handleSelfHealBrowser = async () => {
     setIsSelfHealingBrowser(true);
+    setBrowserTaskInfo({
+      status: 'repairing',
+      phase: 'inspect-current',
+      rawDetail: null,
+      updatedAt: null,
+    });
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
     try {
@@ -1272,6 +1390,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
       });
     } finally {
+      setBrowserTaskInfo({
+        status: 'idle',
+        phase: null,
+        rawDetail: null,
+        updatedAt: new Date().toISOString(),
+      });
       setIsSelfHealingBrowser(false);
     }
   };
@@ -1855,7 +1979,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const currentPrimaryModelId = models.find((model) => model.primary)?.id || '';
 
   const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
-  const effectiveLatestVersion = updateStatusInfo?.latestVersion || latestVersionInfo?.latestVersion || null;
+  const effectiveLatestVersion = latestVersionInfo?.latestVersion || updateStatusInfo?.latestVersion || null;
   const updatePhaseVisual = updateStatusInfo?.phase && UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
     ? UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
     : { progress: 8, labelKey: 'settings.about.updateProgressPreparing' };
@@ -2093,6 +2217,28 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     ? t('settings.about.updateCancelConfirmMessage')
     : t('settings.about.updateCancelUnavailableMessage');
   const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
+  const browserProgressToneClasses = {
+    container: 'border-blue-200 bg-blue-50',
+    text: 'text-[#2563eb]',
+    icon: 'text-[#2563eb]',
+    fill: 'bg-blue-200/90',
+  };
+  const activeBrowserTaskInfo = browserTaskInfo && ['checking', 'repairing'].includes(browserTaskInfo.status)
+    ? browserTaskInfo
+    : null;
+  const activeBrowserTaskPhaseVisual = activeBrowserTaskInfo
+    ? (activeBrowserTaskInfo.status === 'repairing'
+      ? (BROWSER_REPAIR_PHASE_VISUALS[activeBrowserTaskInfo.phase || 'inspect-current'] || BROWSER_REPAIR_PHASE_VISUALS['inspect-current'])
+      : (BROWSER_CHECK_PHASE_VISUALS[activeBrowserTaskInfo.phase || 'read-config'] || BROWSER_CHECK_PHASE_VISUALS['read-config']))
+    : null;
+  const activeBrowserTaskLabel = activeBrowserTaskPhaseVisual
+    ? t(activeBrowserTaskPhaseVisual.labelKey)
+    : '';
+  const canSelfHealBrowser = browserHealth?.healthy === false
+    && !isCheckingBrowserHealth
+    && !isSelfHealingBrowser
+    && !isLoading
+    && !activeBrowserTaskInfo;
   const browserHealthNotCheckedText = t('settings.gateway.browserHealthStates.notChecked');
   const browserHealthValueFallback = browserHealth ? t('common.unknown') : browserHealthNotCheckedText;
   const browserHealthConfig = browserHealth?.config ?? null;
@@ -2143,7 +2289,15 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       value: browserHealthRuntime?.profile || browserHealthConfig?.profile || browserHealth?.profile || browserHealthValueFallback,
     },
   ];
-  const browserHealthDetail = browserHealth?.validationDetail || browserHealth?.rawDetail || browserHealthRuntime?.detectError || browserHealth?.detectError || browserHealthError.detail || browserHealthError.message || '';
+  const browserHealthDetail = activeBrowserTaskInfo?.rawDetail
+    || (activeBrowserTaskInfo ? activeBrowserTaskLabel : '')
+    || browserHealth?.validationDetail
+    || browserHealth?.rawDetail
+    || browserHealthRuntime?.detectError
+    || browserHealth?.detectError
+    || browserHealthError.detail
+    || browserHealthError.message
+    || '';
   const browserHealthDetailText = browserHealthDetail
     || (browserHealthError.message
       ? t('settings.gateway.browserHealthButtonNeedsAttention')
@@ -2152,6 +2306,51 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
           ? t('settings.gateway.browserHealthButtonHealthy')
           : t('settings.gateway.browserHealthButtonNeedsAttention')
         : browserHealthNotCheckedText);
+  const renderBrowserTaskActionButton = (
+    mode: 'checking' | 'repairing',
+    onClick: () => void,
+    defaultLabel: string,
+    defaultIcon: 'activity' | 'wrench',
+  ) => {
+    const isActive = activeBrowserTaskInfo?.status === mode && activeBrowserTaskPhaseVisual;
+    if (!isActive || !activeBrowserTaskPhaseVisual) {
+      const disabled = mode === 'repairing'
+        ? !canSelfHealBrowser
+        : isCheckingBrowserHealth || isSelfHealingBrowser || isLoading || !!activeBrowserTaskInfo;
+      return (
+        <button
+          type="button"
+          onClick={onClick}
+          disabled={disabled}
+          className={`${secondaryActionButtonClass} flex-1 min-w-0 ${disabled && mode === 'repairing' ? 'border-gray-200 bg-gray-100 text-gray-400 hover:bg-gray-100' : ''}`}
+        >
+          {defaultIcon === 'wrench'
+            ? <Wrench className="hidden sm:block w-4 h-4 shrink-0" />
+            : <Activity className="hidden sm:block w-4 h-4 shrink-0" />}
+          <span className="min-w-0 text-center leading-snug">{defaultLabel}</span>
+        </button>
+      );
+    }
+
+    return (
+      <button
+        type="button"
+        disabled
+        className={`relative overflow-hidden rounded-xl border text-left transition-colors flex-1 min-w-0 ${browserProgressToneClasses.container} cursor-default opacity-90`}
+      >
+        <div
+          className={`absolute inset-y-0 left-0 rounded-l-xl transition-[width] duration-500 ease-out ${browserProgressToneClasses.fill}`}
+          style={{ width: `${Math.min(Math.max(activeBrowserTaskPhaseVisual.progress, 0), 100)}%` }}
+        />
+        <div className="relative z-10 flex items-center justify-center gap-2 px-4 py-2.5 text-center">
+          <Loader2 className={`h-4 w-4 shrink-0 animate-spin ${browserProgressToneClasses.icon}`} />
+          <span className={`truncate whitespace-nowrap text-sm font-semibold leading-5 ${browserProgressToneClasses.text}`}>
+            {t(activeBrowserTaskPhaseVisual.labelKey)}
+          </span>
+        </div>
+      </button>
+    );
+  };
   const headerTitle = settingsTab === 'gateway'
     ? t('settings.gateway.headerTitle')
     : settingsTab === 'general'
@@ -2255,25 +2454,6 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                       </button>
                     </div>
                   </div>
-
-                  {/* OpenClaw Workspace Path */}
-                  <div className="border-t border-gray-100 pt-5">
-                    <label className="block text-sm font-semibold text-gray-900 mb-2">
-                      {t('settings.gateway.workspaceLabel')}
-                    </label>
-                    <div className="flex gap-2">
-                      <input
-                        type="text"
-                        value={openclawWorkspace}
-                        onChange={(e) => setOpenclawWorkspace(e.target.value)}
-                        placeholder="/root/.openclaw/workspace-main"
-                        className="block w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm font-mono"
-                      />
-                    </div>
-                    <p className="text-xs text-gray-400 mt-1.5">
-                      {t('settings.gateway.workspaceHint')}
-                    </p>
-                  </div>
                 </div>
 
                 {/* Max Permissions Toggle */}
@@ -2332,30 +2512,18 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                   <div className="bg-white p-4 sm:p-6 rounded-2xl border border-gray-200 space-y-4">
                     <div className="space-y-3">
                       <div className="flex gap-2 flex-nowrap">
-                        <button
-                          type="button"
-                          onClick={handleCheckBrowserHealth}
-                          disabled={isCheckingBrowserHealth || isSelfHealingBrowser || isLoading}
-                          className={`${secondaryActionButtonClass} flex-1 min-w-0`}
-                        >
-                          {isCheckingBrowserHealth ? <Loader2 className="hidden sm:block w-4 h-4 animate-spin shrink-0" /> : <Activity className="hidden sm:block w-4 h-4 shrink-0" />}
-                          <span className="min-w-0 text-center leading-snug">
-                            {isCheckingBrowserHealth
-                              ? t('settings.gateway.checkingBrowserHealth')
-                              : t('settings.gateway.checkBrowserHealth')}
-                          </span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleSelfHealBrowser}
-                          disabled={isCheckingBrowserHealth || isSelfHealingBrowser || isLoading}
-                          className={`${secondaryActionButtonClass} flex-1 min-w-0`}
-                        >
-                          {isSelfHealingBrowser ? <Loader2 className="hidden sm:block w-4 h-4 animate-spin shrink-0" /> : <Wrench className="hidden sm:block w-4 h-4 shrink-0" />}
-                          <span className="min-w-0 text-center leading-snug">
-                            {isSelfHealingBrowser ? t('settings.gateway.selfHealingBrowser') : t('settings.gateway.selfHealBrowser')}
-                          </span>
-                        </button>
+                        {renderBrowserTaskActionButton(
+                          'checking',
+                          handleCheckBrowserHealth,
+                          t('settings.gateway.checkBrowserHealth'),
+                          'activity',
+                        )}
+                        {renderBrowserTaskActionButton(
+                          'repairing',
+                          handleSelfHealBrowser,
+                          t('settings.gateway.selfHealBrowser'),
+                          'wrench',
+                        )}
                       </div>
 
                       <p className="text-sm text-gray-500 whitespace-pre-wrap break-all">

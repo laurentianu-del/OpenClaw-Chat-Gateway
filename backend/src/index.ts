@@ -100,6 +100,7 @@ const GATEWAY_RESTART_FAILED_ERROR_CODE = 'gateway.restartFailed';
 const GATEWAY_DETECT_FAILED_ERROR_CODE = 'gateway.detectFailed';
 const BROWSER_HEALTH_FAILED_ERROR_CODE = 'gateway.browserHealthFailed';
 const BROWSER_SELF_HEAL_FAILED_ERROR_CODE = 'gateway.browserSelfHealFailed';
+const BROWSER_TASK_BUSY_ERROR_CODE = 'gateway.browserTaskBusy';
 const BROWSER_HEADED_MODE_LOAD_FAILED_ERROR_CODE = 'gateway.browserHeadedModeLoadFailed';
 const BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE = 'gateway.browserHeadedModeUpdateFailed';
 const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
@@ -209,6 +210,15 @@ type BrowserHeadedModeConfig = {
 };
 
 type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'validationSucceeded' | 'validationDetail'>;
+
+type BrowserTaskStatus = 'idle' | 'checking' | 'repairing';
+
+type BrowserTaskSnapshot = {
+  status: BrowserTaskStatus;
+  phase: string | null;
+  rawDetail: string | null;
+  updatedAt: string | null;
+};
 
 type UpdateStatus =
   | 'idle'
@@ -553,6 +563,39 @@ function isExecutableFile(filePath: string) {
 let cachedOpenClawExecutablePath: string | null = null;
 let gatewayRestartTask: Promise<void> | null = null;
 let gatewayRestartQueued = false;
+let browserTaskSnapshot: BrowserTaskSnapshot = {
+  status: 'idle',
+  phase: null,
+  rawDetail: null,
+  updatedAt: null,
+};
+
+function getBrowserTaskSnapshot(): BrowserTaskSnapshot {
+  return { ...browserTaskSnapshot };
+}
+
+function updateBrowserTaskSnapshot(patch: Partial<Omit<BrowserTaskSnapshot, 'updatedAt'>>) {
+  browserTaskSnapshot = {
+    ...browserTaskSnapshot,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resetBrowserTaskSnapshot() {
+  browserTaskSnapshot = {
+    status: 'idle',
+    phase: null,
+    rawDetail: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function ensureBrowserTaskIdle() {
+  if (browserTaskSnapshot.status !== 'idle') {
+    throw new StructuredRequestError(409, BROWSER_TASK_BUSY_ERROR_CODE, 'Another browser task is already running.');
+  }
+}
 
 function getOpenClawExecutablePath() {
   if (cachedOpenClawExecutablePath && isExecutableFile(cachedOpenClawExecutablePath)) {
@@ -929,19 +972,101 @@ function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function waitForBrowserHealth(timeoutMs: number) {
+type BrowserTaskProgressReporter = (phase: string, rawDetail?: string | null) => void;
+
+type BrowserRuntimeReadiness = {
+  ready: boolean;
+  terminalFailure: boolean;
+  diagnostics: BrowserHealthDiagnostics;
+  detail: string | null;
+};
+
+async function runBrowserRuntimeReadinessCheck(reportProgress?: BrowserTaskProgressReporter): Promise<BrowserRuntimeReadiness> {
+  reportProgress?.('read-config');
+  const checkedAt = Date.now();
+  const browserConfig = readBrowserConfigState();
+  const configError = readConfiguredBrowserValidationError(browserConfig);
+
+  if (configError && browserConfig.enabled === false) {
+    return {
+      ready: false,
+      terminalFailure: true,
+      diagnostics: buildFallbackBrowserHealthDiagnostics(checkedAt, configError),
+      detail: null,
+    };
+  }
+
+  if (configError) {
+    return {
+      ready: false,
+      terminalFailure: true,
+      diagnostics: buildFallbackBrowserHealthDiagnostics(checkedAt, configError),
+      detail: configError,
+    };
+  }
+
+  reportProgress?.('read-status');
+  let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+  if (diagnostics.running === true && !diagnostics.detectError) {
+    return {
+      ready: true,
+      terminalFailure: false,
+      diagnostics,
+      detail: null,
+    };
+  }
+
+  try {
+    reportProgress?.('start-browser');
+    await runOpenClawBrowserCommand(
+      buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_START_TIMEOUT_MS), 'start']),
+      BROWSER_HEALTH_START_TIMEOUT_MS
+    );
+
+    reportProgress?.('wait-running');
+    diagnostics = await waitForBrowserRunning(browserConfig, checkedAt);
+    if (diagnostics.running !== true) {
+      return {
+        ready: false,
+        terminalFailure: false,
+        diagnostics,
+        detail: 'Browser runtime did not become healthy after start.',
+      };
+    }
+
+    return {
+      ready: true,
+      terminalFailure: false,
+      diagnostics,
+      detail: null,
+    };
+  } catch (error: any) {
+    const detail = readCliErrorDetail(error) || error?.message || 'Browser health check failed';
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
+    return {
+      ready: false,
+      terminalFailure: false,
+      diagnostics,
+      detail,
+    };
+  }
+}
+
+async function waitForBrowserHealth(timeoutMs: number, reportProgress?: BrowserTaskProgressReporter) {
   const deadline = Date.now() + timeoutMs;
-  let lastSnapshot: BrowserHealthSnapshot | null = null;
+  let terminalFailure = false;
 
   while (Date.now() < deadline) {
-    lastSnapshot = await runBrowserHealthCheck();
-    if (lastSnapshot.healthy) {
-      return lastSnapshot;
+    const readiness = await runBrowserRuntimeReadinessCheck(reportProgress);
+    if (readiness.ready) {
+      return runBrowserHealthCheck(reportProgress);
     }
+    terminalFailure = readiness.terminalFailure;
+    if (terminalFailure) break;
     await sleep(BROWSER_SELF_HEAL_POLL_INTERVAL_MS);
   }
 
-  return lastSnapshot || runBrowserHealthCheck();
+  return runBrowserHealthCheck(reportProgress);
 }
 
 async function readBrowserHealthDiagnostics(
@@ -1015,7 +1140,8 @@ async function openBrowserValidationUrl(browserConfig: BrowserConfigState, url: 
   }
 }
 
-async function runBrowserHealthCheck(): Promise<BrowserHealthSnapshot> {
+async function runBrowserHealthCheck(reportProgress?: BrowserTaskProgressReporter): Promise<BrowserHealthSnapshot> {
+  reportProgress?.('read-config');
   const checkedAt = Date.now();
   const browserConfig = readBrowserConfigState();
   const configError = readConfiguredBrowserValidationError(browserConfig);
@@ -1036,22 +1162,27 @@ async function runBrowserHealthCheck(): Promise<BrowserHealthSnapshot> {
     });
   }
 
+  reportProgress?.('read-status');
   let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
 
   try {
+    reportProgress?.('start-browser');
     await runOpenClawBrowserCommand(
       buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_START_TIMEOUT_MS), 'start']),
       BROWSER_HEALTH_START_TIMEOUT_MS
     );
 
+    reportProgress?.('wait-running');
     diagnostics = await waitForBrowserRunning(browserConfig, checkedAt);
     if (diagnostics.running !== true) {
       throw new Error('Browser runtime did not become healthy after start.');
     }
 
+    reportProgress?.('open-validation');
     await openBrowserValidationUrl(browserConfig, BROWSER_HEALTH_VALIDATION_URL);
 
     try {
+      reportProgress?.('capture-snapshot');
       await captureExampleDomainSnapshot(browserConfig);
     } catch (error: any) {
       const snapshotText = normalizeCliText(error?.snapshotText);
@@ -1059,10 +1190,13 @@ async function runBrowserHealthCheck(): Promise<BrowserHealthSnapshot> {
         throw error;
       }
 
+      reportProgress?.('open-validation');
       await openBrowserValidationUrl(browserConfig, BROWSER_HEALTH_FALLBACK_VALIDATION_URL);
+      reportProgress?.('capture-snapshot');
       await captureExampleDomainSnapshot(browserConfig);
     }
 
+    reportProgress?.('finalize');
     diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
 
     return finalizeBrowserHealthSnapshot({
@@ -1072,6 +1206,7 @@ async function runBrowserHealthCheck(): Promise<BrowserHealthSnapshot> {
     });
   } catch (error: any) {
     const detail = readCliErrorDetail(error) || error?.message || 'Browser health check failed';
+    reportProgress?.('finalize', detail);
     diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
 
     return finalizeBrowserHealthSnapshot({
@@ -2356,7 +2491,6 @@ app.get('/api/config', (_req, res) => {
     loginEnabled: config.loginEnabled || false,
     loginPassword: config.loginPassword || '123456',
     allowedHosts: config.allowedHosts || [],
-    openclawWorkspace: config.openclawWorkspace || '',
     historyPageRounds: config.historyPageRounds || 30,
   });
 });
@@ -2517,7 +2651,6 @@ app.get('/api/config/detect-all', async (_req, res) => {
     let gatewayUrl = '';
     let token = '';
     let password = '';
-    let workspacePath = '';
     const openclawVersion = await readOpenClawVersion();
 
     if (fs.existsSync(configPath)) {
@@ -2529,13 +2662,8 @@ app.get('/api/config/detect-all', async (_req, res) => {
       }
     }
 
-    const mainWorkspace = agentProvisioner.getWorkspacePath('main');
-    if (fs.existsSync(mainWorkspace)) {
-      workspacePath = mainWorkspace;
-    }
-
-    if (!gatewayUrl && !workspacePath) {
-      return res.json(buildStructuredApiError(GATEWAY_DETECT_FAILED_ERROR_CODE, 'Could not detect gateway config or workspace'));
+    if (!gatewayUrl) {
+      return res.json(buildStructuredApiError(GATEWAY_DETECT_FAILED_ERROR_CODE, 'Could not detect gateway config'));
     }
 
     res.json({
@@ -2544,7 +2672,6 @@ app.get('/api/config/detect-all', async (_req, res) => {
         gatewayUrl,
         token,
         password,
-        workspacePath,
         openclawVersion,
       }
     });
@@ -2568,15 +2695,43 @@ const MAX_PERMISSIONS_TOOLS = {
   }
 };
 
+app.get('/api/config/browser-health/status', (_req, res) => {
+  res.json({
+    success: true,
+    task: getBrowserTaskSnapshot(),
+  });
+});
+
 app.get('/api/config/browser-health', async (_req, res) => {
+  let taskStarted = false;
   try {
-    const health = await runBrowserHealthCheck();
+    ensureBrowserTaskIdle();
+    updateBrowserTaskSnapshot({
+      status: 'checking',
+      phase: 'read-config',
+      rawDetail: null,
+    });
+    taskStarted = true;
+    const health = await runBrowserHealthCheck((phase, rawDetail) => {
+      updateBrowserTaskSnapshot({
+        status: 'checking',
+        phase,
+        rawDetail: normalizeCliText(rawDetail) || null,
+      });
+    });
     res.json({ success: true, health });
   } catch (error: any) {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
     res.json(buildStructuredApiError(
       BROWSER_HEALTH_FAILED_ERROR_CODE,
       readCliErrorDetail(error) || error?.message || 'Browser health check failed'
     ));
+  } finally {
+    if (taskStarted) {
+      resetBrowserTaskSnapshot();
+    }
   }
 });
 
@@ -2626,13 +2781,33 @@ app.post('/api/config/browser-headed-mode', (req, res) => {
 });
 
 app.post('/api/config/browser-health/self-heal', async (_req, res) => {
+  let taskStarted = false;
   try {
-    const before = await runBrowserHealthCheck();
+    ensureBrowserTaskIdle();
+    updateBrowserTaskSnapshot({
+      status: 'repairing',
+      phase: 'inspect-current',
+      rawDetail: null,
+    });
+    taskStarted = true;
 
+    const reportRepairProgress = (phase: string, rawDetail?: string | null) => {
+      updateBrowserTaskSnapshot({
+        status: 'repairing',
+        phase,
+        rawDetail: normalizeCliText(rawDetail) || null,
+      });
+    };
+
+    const before = await runBrowserHealthCheck(reportRepairProgress);
+
+    reportRepairProgress('enable-permissions');
     setMaxPermissionsEnabled(true);
+    reportRepairProgress('restart-gateway');
     await restartGatewayService();
+    reportRepairProgress('stop-browser');
     await stopOpenClawBrowserBestEffort();
-    const after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS);
+    const after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS, reportRepairProgress);
 
     res.json({
       success: true,
@@ -2641,10 +2816,17 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
       gatewayRestarted: true,
     });
   } catch (error: any) {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
     res.json(buildStructuredApiError(
       BROWSER_SELF_HEAL_FAILED_ERROR_CODE,
       readCliErrorDetail(error) || error?.message || 'Browser self-heal failed'
     ));
+  } finally {
+    if (taskStarted) {
+      resetBrowserTaskSnapshot();
+    }
   }
 });
 

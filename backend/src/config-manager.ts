@@ -10,7 +10,6 @@ interface Config {
   loginEnabled?: boolean;
   loginPassword?: string;
   allowedHosts?: string[];
-  openclawWorkspace?: string;
   historyPageRounds?: number;
   sidebarFavorites?: {
     agents: string[];
@@ -99,7 +98,6 @@ const DEFAULT_CONFIG: Config = {
   loginEnabled: false,
   loginPassword: '123456',
   allowedHosts: [],
-  openclawWorkspace: '',
   historyPageRounds: 30,
   sidebarFavorites: {
     agents: [],
@@ -120,9 +118,22 @@ export class ConfigManager {
     if (!raw) return { ...DEFAULT_CONFIG };
     try {
       const parsed = JSON.parse(raw);
-      return {
+      const merged = {
         ...DEFAULT_CONFIG,
         ...parsed,
+      };
+      return {
+        gatewayUrl: merged.gatewayUrl,
+        token: merged.token,
+        password: merged.password,
+        defaultAgent: merged.defaultAgent,
+        language: normalizeConfigLanguage(merged.language),
+        aiName: merged.aiName,
+        loginEnabled: merged.loginEnabled,
+        loginPassword: merged.loginPassword,
+        allowedHosts: normalizeStoredStringArray(merged.allowedHosts),
+        historyPageRounds: normalizeHistoryPageRounds(merged.historyPageRounds),
+        sidebarFavorites: normalizeSidebarFavorites(merged.sidebarFavorites),
       };
     } catch {
       return { ...DEFAULT_CONFIG };
