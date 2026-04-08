@@ -171,6 +171,42 @@ type UpdateStatusInfo = {
 
 const EMPTY_INLINE_ERROR: InlineErrorState = { message: '', detail: '' };
 
+type UpdateProgressTone = 'neutral' | 'brand' | 'success' | 'error';
+
+type UpdatePhaseVisual = {
+  progress: number;
+  labelKey: string;
+};
+
+type UpdateProgressLayout = 'compact' | 'expanded';
+
+const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
+  'downloading-script': { progress: 10, labelKey: 'settings.about.updateProgressFetchingCode' },
+  'detect-service': { progress: 18, labelKey: 'settings.about.updateProgressPreparing' },
+  'git-pull': { progress: 26, labelKey: 'settings.about.updateProgressFetchingCode' },
+  'install-dependencies': { progress: 40, labelKey: 'settings.about.updateProgressInstallingDependencies' },
+  'build': { progress: 58, labelKey: 'settings.about.updateProgressBuilding' },
+  'patch-config': { progress: 68, labelKey: 'settings.about.updateProgressApplyingConfig' },
+  'reconcile-openclaw-runtime': { progress: 78, labelKey: 'settings.about.updateProgressReconcilingRuntime' },
+  'repair-openclaw-device': { progress: 86, labelKey: 'settings.about.updateProgressRepairingDevice' },
+  'recover-browser-runtime': { progress: 92, labelKey: 'settings.about.updateProgressRecoveringBrowser' },
+  'setup-service': { progress: 96, labelKey: 'settings.about.updateProgressSettingUpService' },
+  'service-restart': { progress: 98, labelKey: 'settings.about.updateProgressSettingUpService' },
+  'complete': { progress: 100, labelKey: 'settings.about.updateProgressFinishing' },
+};
+
+function joinDistinctLines(values: Array<string | null | undefined>) {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const value of values) {
+    const normalized = typeof value === 'string' ? value.trim() : '';
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    lines.push(normalized);
+  }
+  return lines.join('\n');
+}
+
 export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
   const { t, i18n } = useTranslation();
 
@@ -215,6 +251,8 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
   const [updateStatusInfo, setUpdateStatusInfo] = useState<UpdateStatusInfo | null>(null);
+  const [isUpdateCancelModalOpen, setIsUpdateCancelModalOpen] = useState(false);
+  const [isCancellingUpdate, setIsCancellingUpdate] = useState(false);
 
   // --- General settings state ---
   const [aiName, setAiName] = useState(() => t('settings.general.aiNamePlaceholder'));
@@ -496,6 +534,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   };
 
   const handleCancelUpdate = async () => {
+    setIsCancellingUpdate(true);
     try {
       const res = await fetch('/api/update/cancel', {
         method: 'POST',
@@ -506,12 +545,16 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       if (!res.ok) {
         const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateCancelFailed');
         openSettingsErrorModal(display.message, display.detail);
-        return;
+        return false;
       }
       setUpdateStatusInfo(data.update as UpdateStatusInfo);
+      return true;
     } catch (error) {
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
       openSettingsErrorModal(t('settings.about.updateCancelFailed'), detail);
+      return false;
+    } finally {
+      setIsCancellingUpdate(false);
     }
   };
 
@@ -563,7 +606,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
 
     if (updateStatusInfo?.status === 'updating') {
-      void handleCancelUpdate();
+      setIsUpdateCancelModalOpen(true);
       return;
     }
 
@@ -583,6 +626,17 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
 
     void handleCheckLatestVersion();
+  };
+
+  const handleConfirmCancelUpdate = async () => {
+    if (!updateStatusInfo?.canCancel || updateStatusInfo.status !== 'updating') {
+      return;
+    }
+
+    const cancelled = await handleCancelUpdate();
+    if (cancelled) {
+      setIsUpdateCancelModalOpen(false);
+    }
   };
 
   useEffect(() => {
@@ -633,6 +687,13 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       window.clearInterval(timer);
     };
   }, [settingsTab, updateStatusInfo?.status]);
+
+  useEffect(() => {
+    if (updateStatusInfo?.status !== 'updating') {
+      setIsUpdateCancelModalOpen(false);
+      setIsCancellingUpdate(false);
+    }
+  }, [updateStatusInfo?.status]);
 
   const fetchModels = async () => {
     try {
@@ -1795,34 +1856,242 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
   const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
   const effectiveLatestVersion = updateStatusInfo?.latestVersion || latestVersionInfo?.latestVersion || null;
-  const latestVersionButtonLabel = updateStatusInfo?.status === 'checking'
-    ? t('settings.about.updatePreparingButton')
-    : updateStatusInfo?.status === 'updating'
-      ? t('settings.about.updateUpdatingButton')
-      : updateStatusInfo?.status === 'stopping'
-        ? t('settings.about.updateStoppingButton')
-        : updateStatusInfo?.status === 'update_succeeded'
-          ? t('settings.about.updateSucceededButton')
-          : updateStatusInfo?.status === 'update_failed'
-            ? t('settings.about.updateFailedButton')
-            : updateStatusInfo?.status === 'restarting'
-              ? t('settings.about.restartingButton')
-              : updateStatusInfo?.status === 'restart_failed'
-                ? t('settings.about.restartFailedButton')
-                : isCheckingLatestVersion
-                  ? t('settings.about.checkInProgress')
-                  : updateStatusInfo?.status === 'has_update' || latestVersionInfo?.status === 'update_available'
-                    ? t('settings.about.checkUpdateAvailableButton', {
-                      version: effectiveLatestVersion || t('settings.about.unavailable'),
-                    })
-                    : latestVersionInfo?.status === 'up_to_date'
-                      ? t('settings.about.checkUpToDateButton')
-                      : latestVersionInfo?.status === 'no_release'
-                        ? t('settings.about.checkNoReleaseButton')
-                        : latestVersionError.message
-                          ? t('settings.about.checkRetryButton')
-                          : t('settings.about.checkNewVersion');
-  const latestVersionButtonTitle = updateStatusInfo?.rawDetail || latestVersionError.detail || latestVersionError.message || undefined;
+  const updatePhaseVisual = updateStatusInfo?.phase && UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
+    ? UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
+    : { progress: 8, labelKey: 'settings.about.updateProgressPreparing' };
+  const updateFailureDetail = joinDistinctLines([
+    updateStatusInfo?.rawDetail,
+    updateStatusInfo?.message,
+  ]);
+  const updateCheckDetail = joinDistinctLines([
+    latestVersionError.detail,
+    latestVersionError.message,
+  ]);
+  const updateProgressVisual = (() => {
+    const baseProgress = updatePhaseVisual.progress;
+    const clickableIdle = !isCheckingLatestVersion;
+
+    if (updateStatusInfo?.status === 'checking') {
+      return {
+        progress: Math.max(baseProgress, 12),
+        label: t('settings.about.updateProgressChecking'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'updating') {
+      return {
+        progress: Math.max(baseProgress, 10),
+        label: `${t(updatePhaseVisual.labelKey)}${t('settings.about.updateProgressClickToStopSuffix')}`,
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'stopping') {
+      return {
+        progress: Math.max(baseProgress, 15),
+        label: t('settings.about.updateProgressStopping'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'update_succeeded') {
+      return {
+        progress: 100,
+        label: t('settings.about.updateSucceededButton'),
+        detail: '',
+        tone: 'success' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'success' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'update_failed') {
+      return {
+        progress: Math.max(baseProgress, 12),
+        label: t('settings.about.updateFailedButton'),
+        detail: updateFailureDetail,
+        tone: 'error' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'error' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'restarting') {
+      return {
+        progress: 100,
+        label: t('settings.about.restartingButton'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'restart_failed') {
+      return {
+        progress: 100,
+        label: t('settings.about.restartFailedButton'),
+        detail: updateFailureDetail,
+        tone: 'error' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'error' as const,
+      };
+    }
+
+    if (updateStatusInfo?.status === 'has_update' || latestVersionInfo?.status === 'update_available') {
+      return {
+        progress: 0,
+        label: t('settings.about.checkUpdateAvailableButton', {
+          version: effectiveLatestVersion || t('settings.about.unavailable'),
+        }),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (isCheckingLatestVersion) {
+      return {
+        progress: 12,
+        label: t('settings.about.updateProgressChecking'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (latestVersionInfo?.status === 'up_to_date') {
+      return {
+        progress: 100,
+        label: t('settings.about.checkUpToDateButton'),
+        detail: '',
+        tone: 'success' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: clickableIdle,
+        showSpinner: false,
+        icon: 'success' as const,
+      };
+    }
+
+    if (latestVersionInfo?.status === 'no_release') {
+      return {
+        progress: 0,
+        label: t('settings.about.checkNoReleaseButton'),
+        detail: '',
+        tone: 'neutral' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: clickableIdle,
+        showSpinner: false,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (latestVersionError.message) {
+      return {
+        progress: 0,
+        label: t('settings.about.checkRetryButton'),
+        detail: updateCheckDetail,
+        tone: 'error' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: clickableIdle,
+        showSpinner: false,
+        icon: 'error' as const,
+      };
+    }
+
+    return {
+      progress: 0,
+      label: t('settings.about.checkNewVersion'),
+      detail: '',
+      tone: 'neutral' as UpdateProgressTone,
+      layout: 'compact' as UpdateProgressLayout,
+      clickable: clickableIdle,
+      showSpinner: false,
+      icon: 'activity' as const,
+    };
+  })();
+  const updateProgressToneClasses = updateProgressVisual.tone === 'success'
+    ? {
+      container: 'border-emerald-200 bg-emerald-50',
+      hover: 'hover:bg-emerald-100',
+      text: 'text-emerald-700',
+      icon: 'text-emerald-600',
+      fill: 'bg-emerald-200/90',
+      detail: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+    }
+    : updateProgressVisual.tone === 'error'
+      ? {
+        container: 'border-red-200 bg-red-50',
+        hover: 'hover:bg-red-100',
+        text: 'text-red-700',
+        icon: 'text-red-600',
+        fill: 'bg-red-200/90',
+        detail: 'border-red-200 bg-red-50 text-red-700',
+      }
+      : updateProgressVisual.tone === 'brand'
+        ? {
+          container: 'border-blue-200 bg-blue-50',
+          hover: 'hover:bg-blue-100',
+          text: 'text-[#2563eb]',
+          icon: 'text-[#2563eb]',
+          fill: 'bg-blue-200/90',
+          detail: 'border-blue-200 bg-blue-50 text-[#2563eb]',
+        }
+        : {
+          container: 'border-blue-200 bg-blue-50',
+          hover: 'hover:bg-blue-100',
+          text: 'text-[#2563eb]',
+          icon: 'text-[#2563eb]',
+          fill: 'bg-blue-200/90',
+          detail: 'border-blue-200 bg-blue-50 text-[#2563eb]',
+        };
+  const updateProgressTitle = updateProgressVisual.detail || updateFailureDetail || updateCheckDetail || undefined;
+  const updateProgressWidthClass = updateProgressVisual.layout === 'expanded'
+    ? 'w-full sm:w-[24rem]'
+    : 'w-full sm:w-auto';
+  const updateProgressButtonWidthClass = updateProgressVisual.layout === 'expanded'
+    ? 'w-full sm:min-w-[24rem]'
+    : 'w-full sm:w-auto';
+  const updateCancelUnsafeDetail = joinDistinctLines([
+    updateStatusInfo?.rawDetail,
+    updateStatusInfo?.message,
+  ]);
+  const updateCancelModalTitle = updateStatusInfo?.canCancel
+    ? t('settings.about.updateCancelConfirmTitle')
+    : t('settings.about.updateCancelUnavailableTitle');
+  const updateCancelModalMessage = updateStatusInfo?.canCancel
+    ? t('settings.about.updateCancelConfirmMessage')
+    : t('settings.about.updateCancelUnavailableMessage');
   const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
   const browserHealthNotCheckedText = t('settings.gateway.browserHealthStates.notChecked');
   const browserHealthValueFallback = browserHealth ? t('common.unknown') : browserHealthNotCheckedText;
@@ -2948,18 +3217,37 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                             : appVersionInfo?.version || t('settings.about.unavailable')}
                         </span>
                       </div>
-                      <button
-                        type="button"
-                        onClick={handleLatestVersionAction}
-                        disabled={isCheckingLatestVersion || updateStatusInfo?.status === 'checking' || updateStatusInfo?.status === 'stopping' || updateStatusInfo?.status === 'restarting'}
-                        title={latestVersionButtonTitle}
-                        className="inline-flex max-w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60"
-                      >
-                        {isCheckingLatestVersion || updateStatusInfo?.status === 'checking' || updateStatusInfo?.status === 'stopping' || updateStatusInfo?.status === 'restarting'
-                          ? <Loader2 className="h-4 w-4 animate-spin" />
-                          : <Activity className="h-4 w-4" />}
-                        <span className="whitespace-normal break-words">{latestVersionButtonLabel}</span>
-                      </button>
+                      <div className={updateProgressWidthClass}>
+                        <button
+                          type="button"
+                          onClick={handleLatestVersionAction}
+                          disabled={!updateProgressVisual.clickable}
+                          title={updateProgressTitle}
+                          className={`relative overflow-hidden rounded-xl border text-left transition-colors ${updateProgressButtonWidthClass} ${updateProgressToneClasses.container} ${updateProgressVisual.clickable ? updateProgressToneClasses.hover : 'cursor-default'} ${!updateProgressVisual.clickable ? 'opacity-90' : ''}`}
+                        >
+                          <div
+                            className={`absolute inset-y-0 left-0 rounded-l-xl transition-[width] duration-500 ease-out ${updateProgressToneClasses.fill}`}
+                            style={{ width: `${Math.min(Math.max(updateProgressVisual.progress, 0), 100)}%` }}
+                          />
+                          <div className="relative z-10 flex items-center justify-center gap-2 px-4 py-2.5 text-center">
+                            {updateProgressVisual.showSpinner
+                              ? <Loader2 className={`h-4 w-4 shrink-0 animate-spin ${updateProgressToneClasses.icon}`} />
+                              : updateProgressVisual.icon === 'success'
+                                ? <Check className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />
+                                : updateProgressVisual.icon === 'error'
+                                  ? <X className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />
+                                  : <Activity className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />}
+                            <span className={`truncate whitespace-nowrap text-sm font-semibold leading-5 ${updateProgressToneClasses.text}`}>
+                              {updateProgressVisual.label}
+                            </span>
+                          </div>
+                        </button>
+                        {updateProgressVisual.detail ? (
+                          <div className={`mt-2 whitespace-pre-wrap rounded-xl border px-4 py-3 text-sm ${updateProgressToneClasses.detail}`}>
+                            {updateProgressVisual.detail}
+                          </div>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
 
@@ -3035,6 +3323,61 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
         </div>
       </div>
+
+      {isUpdateCancelModalOpen && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity"
+            onClick={() => {
+              if (!isCancellingUpdate) {
+                setIsUpdateCancelModalOpen(false);
+              }
+            }}
+          />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full ${updateStatusInfo?.canCancel ? 'bg-amber-100' : 'bg-blue-100'}`}>
+                <Activity className={`h-6 w-6 ${updateStatusInfo?.canCancel ? 'text-amber-600' : 'text-blue-600'}`} />
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">{updateCancelModalTitle}</h3>
+              <p className="text-sm text-gray-500">{updateCancelModalMessage}</p>
+              {!updateStatusInfo?.canCancel && updateCancelUnsafeDetail ? (
+                <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>
+                  <p className="whitespace-pre-wrap break-all text-xs text-gray-500">{updateCancelUnsafeDetail}</p>
+                </div>
+              ) : null}
+            </div>
+            <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+              <button
+                type="button"
+                onClick={() => setIsUpdateCancelModalOpen(false)}
+                disabled={isCancellingUpdate}
+                className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {updateStatusInfo?.canCancel ? t('settings.about.updateCancelKeepRunning') : t('common.gotIt')}
+              </button>
+              {updateStatusInfo?.canCancel ? (
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmCancelUpdate()}
+                  disabled={isCancellingUpdate}
+                  className="flex-1 rounded-xl bg-red-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isCancellingUpdate ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {t('settings.about.updateStoppingButton')}
+                    </span>
+                  ) : (
+                    t('settings.about.updateCancelConfirmAction')
+                  )}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Shared Delete Confirmation Modal */}
       {isDeleteModalOpen && (
