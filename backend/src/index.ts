@@ -42,7 +42,7 @@ import {
   shouldPreferSettledAssistantText,
 } from './chat-history-reconciliation';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
-import { getCurrentAppVersionInfo, getLatestVersionInfo } from './app-version';
+import { getCurrentAppVersionInfo, getLatestVersionInfo, type LatestVersionInfo as AppLatestVersionInfo } from './app-version';
 
 const execPromise = util.promisify(exec);
 const execFilePromise = util.promisify(execFile);
@@ -117,8 +117,19 @@ const MODEL_DISCOVER_FAILED_ERROR_CODE = 'models.discoverFailed';
 const ENDPOINT_CREATE_FAILED_ERROR_CODE = 'endpoints.createFailed';
 const ENDPOINT_DELETE_FAILED_ERROR_CODE = 'endpoints.deleteFailed';
 const ENDPOINT_TEST_FAILED_ERROR_CODE = 'endpoints.testFailed';
+const AUTH_LOGIN_REQUIRED_ERROR_CODE = 'auth.loginRequired';
 const VERSION_INFO_UNAVAILABLE_ERROR_CODE = 'version.infoUnavailable';
 const VERSION_LOOKUP_FAILED_ERROR_CODE = 'version.lookupFailed';
+const UPDATE_START_FAILED_ERROR_CODE = 'update.startFailed';
+const UPDATE_ALREADY_RUNNING_ERROR_CODE = 'update.alreadyRunning';
+const UPDATE_NO_NEW_VERSION_ERROR_CODE = 'update.noNewVersion';
+const UPDATE_CANCEL_FAILED_ERROR_CODE = 'update.cancelFailed';
+const UPDATE_NOT_RUNNING_ERROR_CODE = 'update.notRunning';
+const UPDATE_CANNOT_CANCEL_PHASE_ERROR_CODE = 'update.cannotCancelCurrentPhase';
+const UPDATE_RESET_FAILED_ERROR_CODE = 'update.resetFailed';
+const UPDATE_RESTART_FAILED_ERROR_CODE = 'update.restartFailed';
+const UPDATE_RESTART_NOT_READY_ERROR_CODE = 'update.restartNotReady';
+const UPDATE_SERVICE_NOT_FOUND_ERROR_CODE = 'update.serviceNotFound';
 const DEFAULT_HISTORY_PAGE_LIMIT = 200;
 const MAX_HISTORY_PAGE_LIMIT = 200;
 const CHAT_STREAM_COMPLETION_PROBE_DELAY_MS = 400;
@@ -137,6 +148,13 @@ const BROWSER_HEALTH_PROBE_URL = 'about:blank';
 const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
 const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
 const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
+const UPDATE_SCRIPT_URL = 'https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh';
+const UPDATE_PHASE_MARKER_PREFIX = '::clawui-update-phase::';
+const UPDATE_LOG_LIMIT = 200;
+const UPDATE_CANCEL_KILL_TIMEOUT_MS = 5000;
+const UPDATE_RESTART_DELAY_MS = 250;
+const UPDATE_CANCELLABLE_PHASES = new Set(['downloading-script', 'detect-service', 'git-pull']);
+const CLAWUI_SERVICE_FILE_REGEX = /^clawui(?:-\d+)?\.service$/;
 
 type BrowserHealthIssue = 'permissions' | 'disabled' | 'stopped' | 'detect-error' | 'timeout' | 'unknown';
 
@@ -165,6 +183,259 @@ type BrowserConfigState = {
 };
 
 type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'gatewayProbeSucceeded' | 'gatewayProbeDetail'>;
+
+type UpdateStatus =
+  | 'idle'
+  | 'has_update'
+  | 'checking'
+  | 'updating'
+  | 'stopping'
+  | 'update_succeeded'
+  | 'update_failed'
+  | 'restarting'
+  | 'restart_failed';
+
+type UpdateSnapshot = {
+  status: UpdateStatus;
+  phase: string | null;
+  canCancel: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+  message: string | null;
+  rawDetail: string | null;
+  logs: string[];
+  startedAt: string | null;
+  updatedAt: string | null;
+  serviceName: string | null;
+};
+
+type ActiveUpdateProcess = {
+  child: ReturnType<typeof spawn>;
+  startCommit: string | null;
+  cancelRequested: boolean;
+  cancelTimer: NodeJS.Timeout | null;
+};
+
+const appRepoRoot = path.resolve(__dirname, '..', '..');
+
+function createDefaultUpdateSnapshot(): UpdateSnapshot {
+  return {
+    status: 'idle',
+    phase: null,
+    canCancel: false,
+    currentVersion: getCurrentAppVersionInfo().version,
+    latestVersion: null,
+    message: null,
+    rawDetail: null,
+    logs: [],
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+    serviceName: null,
+  };
+}
+
+let updateSnapshot = createDefaultUpdateSnapshot();
+let activeUpdateProcess: ActiveUpdateProcess | null = null;
+let cachedLatestVersionInfo: AppLatestVersionInfo | null = null;
+
+function appendUpdateLog(message: string) {
+  const line = normalizeCliText(message);
+  if (!line) return;
+  updateSnapshot.logs = [...updateSnapshot.logs.slice(-(UPDATE_LOG_LIMIT - 1)), line];
+  updateSnapshot.updatedAt = new Date().toISOString();
+}
+
+function patchUpdateSnapshot(patch: Partial<UpdateSnapshot>) {
+  updateSnapshot = {
+    ...updateSnapshot,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resetUpdateSnapshot() {
+  updateSnapshot = createDefaultUpdateSnapshot();
+}
+
+function rememberLatestVersionInfo(info: AppLatestVersionInfo | null) {
+  cachedLatestVersionInfo = info;
+  if (!info) {
+    if (updateSnapshot.status === 'has_update') {
+      patchUpdateSnapshot({
+        status: 'idle',
+        latestVersion: null,
+      });
+    }
+    return;
+  }
+
+  if (activeUpdateProcess || ['checking', 'updating', 'stopping', 'update_succeeded', 'update_failed', 'restarting', 'restart_failed'].includes(updateSnapshot.status)) {
+    return;
+  }
+
+  patchUpdateSnapshot({
+    status: info.hasUpdate ? 'has_update' : 'idle',
+    latestVersion: info.latestVersion || null,
+    currentVersion: info.currentVersion || getCurrentAppVersionInfo().version,
+    message: null,
+    rawDetail: null,
+  });
+}
+
+function getUpdatePhaseMessage(phase: string) {
+  switch (phase) {
+    case 'downloading-script':
+      return 'Downloading update script.';
+    case 'detect-service':
+      return 'Detecting current service.';
+    case 'git-pull':
+      return 'Pulling the latest code.';
+    case 'deploy-release':
+      return 'Running deploy-release.sh.';
+    case 'install-dependencies':
+      return 'Installing dependencies.';
+    case 'build':
+      return 'Building the project.';
+    case 'patch-config':
+      return 'Patching OpenClaw configuration.';
+    case 'setup-service':
+      return 'Updating service configuration.';
+    case 'service-restart':
+      return 'Restarting service.';
+    case 'complete':
+      return 'Update completed.';
+    default:
+      return null;
+  }
+}
+
+function updatePhaseState(phase: string) {
+  patchUpdateSnapshot({
+    phase,
+    canCancel: UPDATE_CANCELLABLE_PHASES.has(phase),
+    message: getUpdatePhaseMessage(phase),
+  });
+}
+
+function consumeUpdateOutputLine(line: string, source: 'stdout' | 'stderr') {
+  const trimmed = line.replace(/\r$/, '');
+  if (!trimmed.trim()) return;
+  appendUpdateLog(trimmed);
+  if (trimmed.startsWith(UPDATE_PHASE_MARKER_PREFIX)) {
+    const phase = normalizeCliText(trimmed.slice(UPDATE_PHASE_MARKER_PREFIX.length));
+    if (phase) updatePhaseState(phase);
+    return;
+  }
+  if (source === 'stderr') {
+    patchUpdateSnapshot({
+      rawDetail: trimmed,
+    });
+  }
+}
+
+function attachUpdateOutput(stream: NodeJS.ReadableStream | null, source: 'stdout' | 'stderr') {
+  if (!stream) return;
+  let buffer = '';
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      consumeUpdateOutputLine(line, source);
+      newlineIndex = buffer.indexOf('\n');
+    }
+  });
+  stream.on('end', () => {
+    if (buffer) {
+      consumeUpdateOutputLine(buffer, source);
+      buffer = '';
+    }
+  });
+}
+
+async function readGitHeadCommit() {
+  try {
+    const { stdout } = await execFilePromise('git', ['rev-parse', 'HEAD'], {
+      cwd: appRepoRoot,
+      maxBuffer: 1024 * 1024,
+    });
+    return normalizeCliText(stdout) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function cleanupUpdateResidualFiles() {
+  const lockFiles = [
+    path.join(appRepoRoot, '.git', 'index.lock'),
+    path.join(appRepoRoot, '.git', 'HEAD.lock'),
+    path.join(appRepoRoot, '.git', 'FETCH_HEAD.lock'),
+    path.join(appRepoRoot, '.git', 'shallow.lock'),
+    path.join(appRepoRoot, '.git', 'config.lock'),
+    path.join(appRepoRoot, '.git', 'ORIG_HEAD.lock'),
+  ];
+
+  for (const filePath of lockFiles) {
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {}
+  }
+}
+
+async function revertUpdateWorkspace(startCommit: string | null) {
+  if (!startCommit) return;
+  await execFilePromise('git', ['reset', '--hard', startCommit], {
+    cwd: appRepoRoot,
+    maxBuffer: 1024 * 1024,
+  });
+  await cleanupUpdateResidualFiles();
+}
+
+function buildUpdateStatusResponse(): UpdateSnapshot {
+  if (updateSnapshot.status === 'idle' && cachedLatestVersionInfo?.hasUpdate) {
+    return {
+      ...updateSnapshot,
+      status: 'has_update',
+      latestVersion: cachedLatestVersionInfo.latestVersion || updateSnapshot.latestVersion,
+      currentVersion: cachedLatestVersionInfo.currentVersion || updateSnapshot.currentVersion,
+    };
+  }
+
+  return {
+    ...updateSnapshot,
+  };
+}
+
+function getCurrentClawUiPort() {
+  return normalizeCliText(process.env.PORT) || '3115';
+}
+
+function resolveClawUiServiceName() {
+  const serviceDir = path.join(os.homedir(), '.config', 'systemd', 'user');
+  const currentPort = getCurrentClawUiPort();
+  const preferred = `clawui-${currentPort}.service`;
+  const preferredPath = path.join(serviceDir, preferred);
+  if (fs.existsSync(preferredPath)) {
+    return preferred;
+  }
+
+  const legacyPath = path.join(serviceDir, 'clawui.service');
+  if (currentPort === '3115' && fs.existsSync(legacyPath)) {
+    return 'clawui.service';
+  }
+
+  try {
+    const candidates = fs.readdirSync(serviceDir).filter((entry) => CLAWUI_SERVICE_FILE_REGEX.test(entry));
+    if (candidates.includes(preferred)) return preferred;
+    if (candidates.includes('clawui.service')) return 'clawui.service';
+    if (candidates.length === 1) return candidates[0];
+  } catch {}
+
+  throw new StructuredRequestError(404, UPDATE_SERVICE_NOT_FOUND_ERROR_CODE, `Could not determine the current ClawUI service for port ${currentPort}.`);
+}
 
 function buildStructuredApiError(
   errorCode: string,
@@ -683,6 +954,225 @@ async function restartGatewayService() {
   }
   connections.clear();
   await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
+}
+
+function buildUpdateCommand(targetPort: string) {
+  return `set -o pipefail; curl -fsSL ${JSON.stringify(UPDATE_SCRIPT_URL)} | bash -s -- ${JSON.stringify(targetPort)}`;
+}
+
+async function startUpdateTask() {
+  if (activeUpdateProcess || ['checking', 'updating', 'stopping', 'restarting'].includes(updateSnapshot.status)) {
+    throw new StructuredRequestError(409, UPDATE_ALREADY_RUNNING_ERROR_CODE, 'An update task is already running.');
+  }
+
+  patchUpdateSnapshot({
+    status: 'checking',
+    phase: null,
+    canCancel: false,
+    message: 'Checking for updates.',
+    rawDetail: null,
+    logs: [],
+    startedAt: new Date().toISOString(),
+    currentVersion: getCurrentAppVersionInfo().version,
+    latestVersion: null,
+  });
+
+  const latestInfo = await getLatestVersionInfo();
+  rememberLatestVersionInfo(latestInfo);
+  if (!latestInfo.hasUpdate || !latestInfo.latestVersion) {
+    resetUpdateSnapshot();
+    throw new StructuredRequestError(409, UPDATE_NO_NEW_VERSION_ERROR_CODE, 'No newer version is available.');
+  }
+
+  const startCommit = await readGitHeadCommit();
+  const targetPort = getCurrentClawUiPort();
+  const child = spawn('/bin/bash', ['-lc', buildUpdateCommand(targetPort)], {
+    cwd: appRepoRoot,
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      CLAWUI_SKIP_SERVICE_RESTART: '1',
+    },
+  });
+
+  activeUpdateProcess = {
+    child,
+    startCommit,
+    cancelRequested: false,
+    cancelTimer: null,
+  };
+
+  patchUpdateSnapshot({
+    status: 'updating',
+    phase: 'downloading-script',
+    canCancel: true,
+    currentVersion: latestInfo.currentVersion || getCurrentAppVersionInfo().version,
+    latestVersion: latestInfo.latestVersion,
+    message: getUpdatePhaseMessage('downloading-script'),
+    rawDetail: null,
+  });
+  appendUpdateLog(`Starting update to ${latestInfo.latestVersion}.`);
+
+  attachUpdateOutput(child.stdout, 'stdout');
+  attachUpdateOutput(child.stderr, 'stderr');
+
+  child.once('error', (error) => {
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    patchUpdateSnapshot({
+      status: 'update_failed',
+      canCancel: false,
+      message: 'Update failed.',
+      rawDetail: detail,
+    });
+    appendUpdateLog(`Update process failed to start: ${detail}`);
+    activeUpdateProcess = null;
+  });
+
+  child.once('close', async (code, signal) => {
+    const activeProcess = activeUpdateProcess;
+    activeUpdateProcess = null;
+    if (activeProcess?.cancelTimer) {
+      clearTimeout(activeProcess.cancelTimer);
+    }
+
+    if (activeProcess?.cancelRequested) {
+      try {
+        await revertUpdateWorkspace(activeProcess.startCommit);
+        resetUpdateSnapshot();
+        appendUpdateLog('Update cancelled and workspace restored to the previous version.');
+      } catch (error) {
+        const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+        patchUpdateSnapshot({
+          status: 'update_failed',
+          canCancel: false,
+          message: 'Update cancel cleanup failed.',
+          rawDetail: detail,
+        });
+        appendUpdateLog(`Failed to restore workspace after cancel: ${detail}`);
+      }
+      rememberLatestVersionInfo(null);
+      return;
+    }
+
+    if (code === 0) {
+      patchUpdateSnapshot({
+        status: 'update_succeeded',
+        phase: 'complete',
+        canCancel: false,
+        currentVersion: getCurrentAppVersionInfo().version,
+        latestVersion: latestInfo.latestVersion,
+        message: 'Update completed. Restart the service to apply the new build.',
+        rawDetail: null,
+      });
+      appendUpdateLog('Update completed successfully. Waiting for service restart.');
+      return;
+    }
+
+    const detail = updateSnapshot.rawDetail
+      || `Update exited with ${signal ? `signal ${signal}` : `code ${String(code)}`}.`;
+    patchUpdateSnapshot({
+      status: 'update_failed',
+      canCancel: false,
+      message: 'Update failed.',
+      rawDetail: detail,
+    });
+    appendUpdateLog(`Update failed: ${detail}`);
+  });
+
+  return buildUpdateStatusResponse();
+}
+
+async function cancelUpdateTask() {
+  if (!activeUpdateProcess || !['updating', 'checking', 'stopping'].includes(updateSnapshot.status)) {
+    throw new StructuredRequestError(409, UPDATE_NOT_RUNNING_ERROR_CODE, 'There is no running update task to stop.');
+  }
+
+  if (updateSnapshot.status === 'stopping') {
+    return buildUpdateStatusResponse();
+  }
+
+  if (!updateSnapshot.canCancel || !updateSnapshot.phase || !UPDATE_CANCELLABLE_PHASES.has(updateSnapshot.phase)) {
+    throw new StructuredRequestError(409, UPDATE_CANNOT_CANCEL_PHASE_ERROR_CODE, `The current phase (${updateSnapshot.phase || 'unknown'}) cannot be stopped safely.`);
+  }
+
+  patchUpdateSnapshot({
+    status: 'stopping',
+    canCancel: false,
+    message: 'Stopping update task.',
+  });
+  appendUpdateLog('Stopping update task on user request.');
+
+  activeUpdateProcess.cancelRequested = true;
+  try {
+    process.kill(-activeUpdateProcess.child.pid!, 'SIGTERM');
+  } catch (error) {
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    patchUpdateSnapshot({
+      status: 'update_failed',
+      canCancel: false,
+      message: 'Failed to stop update task.',
+      rawDetail: detail,
+    });
+    throw new StructuredRequestError(500, UPDATE_CANCEL_FAILED_ERROR_CODE, detail);
+  }
+
+  activeUpdateProcess.cancelTimer = setTimeout(() => {
+    try {
+      if (activeUpdateProcess?.cancelRequested) {
+        process.kill(-activeUpdateProcess.child.pid!, 'SIGKILL');
+      }
+    } catch {}
+  }, UPDATE_CANCEL_KILL_TIMEOUT_MS);
+
+  return buildUpdateStatusResponse();
+}
+
+async function resetUpdateTaskState() {
+  if (activeUpdateProcess) {
+    throw new StructuredRequestError(409, UPDATE_ALREADY_RUNNING_ERROR_CODE, 'Cannot reset while an update task is running.');
+  }
+  rememberLatestVersionInfo(null);
+  resetUpdateSnapshot();
+  return buildUpdateStatusResponse();
+}
+
+async function restartClawUiService() {
+  if (updateSnapshot.status !== 'update_succeeded') {
+    throw new StructuredRequestError(409, UPDATE_RESTART_NOT_READY_ERROR_CODE, 'Service restart is only available after a successful update.');
+  }
+
+  const serviceName = resolveClawUiServiceName();
+  await execFilePromise('systemctl', ['--user', 'show', serviceName, '--property', 'LoadState'], {
+    maxBuffer: 1024 * 1024,
+  });
+
+  patchUpdateSnapshot({
+    status: 'restarting',
+    canCancel: false,
+    serviceName,
+    message: `Restarting ${serviceName}.`,
+    rawDetail: null,
+  });
+  appendUpdateLog(`Scheduling restart for ${serviceName}.`);
+
+  setTimeout(() => {
+    execFilePromise('systemctl', ['--user', 'restart', serviceName, '--no-block'], {
+      maxBuffer: 1024 * 1024,
+    }).catch((error) => {
+      const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+      patchUpdateSnapshot({
+        status: 'restart_failed',
+        canCancel: false,
+        serviceName,
+        message: `Failed to restart ${serviceName}.`,
+        rawDetail: detail,
+      });
+      appendUpdateLog(`Restart failed: ${detail}`);
+    });
+  }, UPDATE_RESTART_DELAY_MS);
+
+  return buildUpdateStatusResponse();
 }
 
 function createStructuredChatError(rawDetail?: string | null, forcedCode?: string) {
@@ -1626,7 +2116,9 @@ app.get('/api/version', (_req, res) => {
 
 app.get('/api/version/latest', async (_req, res) => {
   try {
-    res.json(await getLatestVersionInfo());
+    const latestInfo = await getLatestVersionInfo();
+    rememberLatestVersionInfo(latestInfo);
+    res.json(latestInfo);
   } catch (error: any) {
     console.error('[VersionCheck] Failed to fetch latest release:', error instanceof Error ? error.message : String(error));
     res.status(502).json(buildStructuredApiError(
@@ -1634,6 +2126,65 @@ app.get('/api/version/latest', async (_req, res) => {
       error instanceof Error ? error.message : String(error),
     ));
   }
+});
+
+app.get('/api/update/status', requireAdminAuth, (_req, res) => {
+  res.json({
+    success: true,
+    update: buildUpdateStatusResponse(),
+  });
+});
+
+app.post('/api/update/start', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await startUpdateTask();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(UPDATE_START_FAILED_ERROR_CODE, detail));
+  });
+});
+
+app.post('/api/update/cancel', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await cancelUpdateTask();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(UPDATE_CANCEL_FAILED_ERROR_CODE, detail));
+  });
+});
+
+app.post('/api/update/reset', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await resetUpdateTaskState();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(UPDATE_RESET_FAILED_ERROR_CODE, detail));
+  });
+});
+
+app.post('/api/update/restart-service', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await restartClawUiService();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(UPDATE_RESTART_FAILED_ERROR_CODE, detail));
+  });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -1690,6 +2241,31 @@ import crypto from 'crypto';
 
 function generateAuthToken(password: string): string {
   return crypto.createHash('sha256').update(password + '_clawui_salt').digest('hex');
+}
+
+function readRequestAuthToken(req: express.Request): string {
+  const forwarded = req.header('x-clawui-auth-token');
+  if (forwarded) return normalizeCliText(forwarded);
+  const authorization = normalizeCliText(req.header('authorization'));
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice(7).trim();
+  }
+  return '';
+}
+
+function requireAdminAuth(req: express.Request, _res: express.Response, next: express.NextFunction) {
+  const config = configManager.getConfig();
+  if (!config.loginEnabled) {
+    return next();
+  }
+
+  const expectedToken = generateAuthToken(config.loginPassword || '123456');
+  const providedToken = readRequestAuthToken(req);
+  if (providedToken && providedToken === expectedToken) {
+    return next();
+  }
+
+  return next(new StructuredRequestError(401, AUTH_LOGIN_REQUIRED_ERROR_CODE, 'Login is required to perform this action.'));
 }
 
 // Auth endpoints
@@ -4349,6 +4925,9 @@ app.get('*', (_req, res) => {
 // Error handling
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('Express error:', err);
+  if (isStructuredRequestError(err)) {
+    return res.status(err.status).json(err.payload);
+  }
   res.status(500).json({ success: false, error: err.message });
 });
 

@@ -186,7 +186,7 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-export function getCurrentAppVersionInfo(): CurrentAppVersionInfo {
+function readCurrentAppVersionInfoFromDisk(): CurrentAppVersionInfo {
   const rootPackageJson = readRootPackageJson();
   const buildMeta = readBuildMeta();
   const repository = resolveGitHubRepository(rootPackageJson);
@@ -205,6 +205,14 @@ export function getCurrentAppVersionInfo(): CurrentAppVersionInfo {
     buildTime: normalizeText(process.env.CLAWUI_BUILD_TIME) || normalizeText(buildMeta?.buildTime),
     repositoryUrl: repository?.htmlUrl || normalizeText(rootPackageJson.homepage),
     openclawVersion: null,
+  };
+}
+
+const runningAppVersionInfo = readCurrentAppVersionInfoFromDisk();
+
+export function getCurrentAppVersionInfo(): CurrentAppVersionInfo {
+  return {
+    ...runningAppVersionInfo,
   };
 }
 

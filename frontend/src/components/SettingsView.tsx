@@ -115,6 +115,31 @@ type LatestVersionInfo = {
   upgradeReason: string | null;
 };
 
+type UpdateStatus =
+  | 'idle'
+  | 'has_update'
+  | 'checking'
+  | 'updating'
+  | 'stopping'
+  | 'update_succeeded'
+  | 'update_failed'
+  | 'restarting'
+  | 'restart_failed';
+
+type UpdateStatusInfo = {
+  status: UpdateStatus;
+  phase: string | null;
+  canCancel: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+  message: string | null;
+  rawDetail: string | null;
+  logs: string[];
+  startedAt: string | null;
+  updatedAt: string | null;
+  serviceName: string | null;
+};
+
 const EMPTY_INLINE_ERROR: InlineErrorState = { message: '', detail: '' };
 
 export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
@@ -157,6 +182,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [latestVersionInfo, setLatestVersionInfo] = useState<LatestVersionInfo | null>(null);
   const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
+  const [updateStatusInfo, setUpdateStatusInfo] = useState<UpdateStatusInfo | null>(null);
 
   // --- General settings state ---
   const [aiName, setAiName] = useState(() => t('settings.general.aiNamePlaceholder'));
@@ -344,6 +370,46 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
+  const buildUpdateRequestHeaders = (includeJson = false): HeadersInit => {
+    const headers: Record<string, string> = {};
+    const authToken = localStorage.getItem('clawui_auth_token');
+    if (authToken && authToken !== 'disabled') {
+      headers['X-ClawUI-Auth-Token'] = authToken;
+    }
+    if (includeJson) {
+      headers['Content-Type'] = 'application/json';
+    }
+    return headers;
+  };
+
+  const fetchUpdateStatus = async (options?: { quiet?: boolean }) => {
+    try {
+      const res = await fetch('/api/update/status', {
+        headers: buildUpdateRequestHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (!options?.quiet) {
+          const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateStatusLoadFailed');
+          setLatestVersionError(display);
+        }
+        return null;
+      }
+      const nextUpdate = data.update as UpdateStatusInfo;
+      setUpdateStatusInfo(nextUpdate);
+      return nextUpdate;
+    } catch (error) {
+      if (!options?.quiet) {
+        const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+        setLatestVersionError({
+          message: t('settings.about.updateStatusLoadFailed'),
+          detail,
+        });
+      }
+      return null;
+    }
+  };
+
   const handleCheckLatestVersion = async () => {
     setIsCheckingLatestVersion(true);
     setLatestVersionError(EMPTY_INLINE_ERROR);
@@ -379,15 +445,114 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
+  const handleStartUpdate = async () => {
+    try {
+      const res = await fetch('/api/update/start', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateStartFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return;
+      }
+      setLatestVersionError(EMPTY_INLINE_ERROR);
+      setUpdateStatusInfo(data.update as UpdateStatusInfo);
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.about.updateStartFailed'), detail);
+    }
+  };
+
+  const handleCancelUpdate = async () => {
+    try {
+      const res = await fetch('/api/update/cancel', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateCancelFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return;
+      }
+      setUpdateStatusInfo(data.update as UpdateStatusInfo);
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.about.updateCancelFailed'), detail);
+    }
+  };
+
+  const handleResetUpdateState = async () => {
+    try {
+      const res = await fetch('/api/update/reset', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateResetFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return;
+      }
+      setUpdateStatusInfo(data.update as UpdateStatusInfo);
+      setLatestVersionInfo(null);
+      setLatestVersionError(EMPTY_INLINE_ERROR);
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.about.updateResetFailed'), detail);
+    }
+  };
+
+  const handleRestartUpdatedService = async () => {
+    try {
+      const res = await fetch('/api/update/restart-service', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.about.restartServiceFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return;
+      }
+      setUpdateStatusInfo(data.update as UpdateStatusInfo);
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.about.restartServiceFailed'), detail);
+    }
+  };
+
   const handleLatestVersionAction = () => {
-    if (
-      latestVersionInfo?.status === 'update_available'
-      && latestVersionActionUrl
-      && typeof window !== 'undefined'
-    ) {
-      window.open(latestVersionActionUrl, '_blank', 'noopener,noreferrer');
+    if (updateStatusInfo?.status === 'checking' || updateStatusInfo?.status === 'stopping' || updateStatusInfo?.status === 'restarting') {
       return;
     }
+
+    if (updateStatusInfo?.status === 'updating') {
+      void handleCancelUpdate();
+      return;
+    }
+
+    if (updateStatusInfo?.status === 'update_succeeded') {
+      void handleRestartUpdatedService();
+      return;
+    }
+
+    if (updateStatusInfo?.status === 'update_failed' || updateStatusInfo?.status === 'restart_failed') {
+      void handleResetUpdateState();
+      return;
+    }
+
+    if (updateStatusInfo?.status === 'has_update' || latestVersionInfo?.status === 'update_available') {
+      void handleStartUpdate();
+      return;
+    }
+
     void handleCheckLatestVersion();
   };
 
@@ -395,6 +560,45 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     if (settingsTab !== 'about' && settingsTab !== 'gateway') return;
     void fetchCurrentVersionInfo();
   }, [settingsTab]);
+
+  useEffect(() => {
+    if (settingsTab !== 'about') return;
+    void fetchUpdateStatus({ quiet: true });
+  }, [settingsTab]);
+
+  useEffect(() => {
+    if (settingsTab !== 'about') return;
+    const activeStatus = updateStatusInfo?.status;
+    if (!activeStatus || !['checking', 'updating', 'stopping', 'restarting'].includes(activeStatus)) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const nextUpdate = await fetchUpdateStatus({ quiet: activeStatus === 'restarting' });
+      if (cancelled || !nextUpdate) return;
+
+      if (activeStatus === 'restarting' && nextUpdate.status === 'idle') {
+        await fetchCurrentVersionInfo();
+        await handleCheckLatestVersion();
+      }
+
+      if ((activeStatus === 'stopping' || activeStatus === 'updating') && nextUpdate.status === 'idle') {
+        setLatestVersionInfo(null);
+        setLatestVersionError(EMPTY_INLINE_ERROR);
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [settingsTab, updateStatusInfo?.status]);
 
   const fetchModels = async () => {
     try {
@@ -1460,21 +1664,35 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const currentPrimaryModelId = models.find((model) => model.primary)?.id || '';
 
   const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
-  const latestVersionActionUrl = latestVersionInfo?.downloadUrl || latestVersionInfo?.releaseUrl || null;
-  const latestVersionButtonLabel = isCheckingLatestVersion
-    ? t('settings.about.checkInProgress')
-    : latestVersionInfo?.status === 'update_available'
-      ? t('settings.about.checkUpdateAvailableButton', {
-        version: latestVersionInfo.latestVersion || t('settings.about.unavailable'),
-      })
-      : latestVersionInfo?.status === 'up_to_date'
-        ? t('settings.about.checkUpToDateButton')
-        : latestVersionInfo?.status === 'no_release'
-          ? t('settings.about.checkNoReleaseButton')
-          : latestVersionError.message
-            ? t('settings.about.checkRetryButton')
-            : t('settings.about.checkNewVersion');
-  const latestVersionButtonTitle = latestVersionError.detail || latestVersionError.message || undefined;
+  const effectiveLatestVersion = updateStatusInfo?.latestVersion || latestVersionInfo?.latestVersion || null;
+  const latestVersionButtonLabel = updateStatusInfo?.status === 'checking'
+    ? t('settings.about.updatePreparingButton')
+    : updateStatusInfo?.status === 'updating'
+      ? t('settings.about.updateUpdatingButton')
+      : updateStatusInfo?.status === 'stopping'
+        ? t('settings.about.updateStoppingButton')
+        : updateStatusInfo?.status === 'update_succeeded'
+          ? t('settings.about.updateSucceededButton')
+          : updateStatusInfo?.status === 'update_failed'
+            ? t('settings.about.updateFailedButton')
+            : updateStatusInfo?.status === 'restarting'
+              ? t('settings.about.restartingButton')
+              : updateStatusInfo?.status === 'restart_failed'
+                ? t('settings.about.restartFailedButton')
+                : isCheckingLatestVersion
+                  ? t('settings.about.checkInProgress')
+                  : updateStatusInfo?.status === 'has_update' || latestVersionInfo?.status === 'update_available'
+                    ? t('settings.about.checkUpdateAvailableButton', {
+                      version: effectiveLatestVersion || t('settings.about.unavailable'),
+                    })
+                    : latestVersionInfo?.status === 'up_to_date'
+                      ? t('settings.about.checkUpToDateButton')
+                      : latestVersionInfo?.status === 'no_release'
+                        ? t('settings.about.checkNoReleaseButton')
+                        : latestVersionError.message
+                          ? t('settings.about.checkRetryButton')
+                          : t('settings.about.checkNewVersion');
+  const latestVersionButtonTitle = updateStatusInfo?.rawDetail || latestVersionError.detail || latestVersionError.message || undefined;
   const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
   const browserHealthNotCheckedText = t('settings.gateway.browserHealthStates.notChecked');
   const browserHealthValueFallback = browserHealth ? t('common.unknown') : browserHealthNotCheckedText;
@@ -2581,11 +2799,13 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                       <button
                         type="button"
                         onClick={handleLatestVersionAction}
-                        disabled={isCheckingLatestVersion}
+                        disabled={isCheckingLatestVersion || updateStatusInfo?.status === 'checking' || updateStatusInfo?.status === 'stopping' || updateStatusInfo?.status === 'restarting'}
                         title={latestVersionButtonTitle}
                         className="inline-flex max-w-full items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60"
                       >
-                        {isCheckingLatestVersion ? <Loader2 className="h-4 w-4 animate-spin" /> : <Activity className="h-4 w-4" />}
+                        {isCheckingLatestVersion || updateStatusInfo?.status === 'checking' || updateStatusInfo?.status === 'stopping' || updateStatusInfo?.status === 'restarting'
+                          ? <Loader2 className="h-4 w-4 animate-spin" />
+                          : <Activity className="h-4 w-4" />}
                         <span className="whitespace-normal break-words">{latestVersionButtonLabel}</span>
                       </button>
                     </div>
@@ -2593,16 +2813,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
                   <div className="w-full border-t border-gray-200" />
 
-                  {/* Version Status */}
-                  <div className="w-full">
-
-                    {appVersionError.message && (
-                      <div className="rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-                        <div className="font-semibold">{appVersionError.message}</div>
-                        {appVersionError.detail ? <div className="mt-1 whitespace-pre-wrap text-red-600">{appVersionError.detail}</div> : null}
-                      </div>
-                    )}
-                  </div>
+                  {appVersionError.message && (
+                    <div className="w-full rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+                      <div className="font-semibold">{appVersionError.message}</div>
+                      {appVersionError.detail ? <div className="mt-1 whitespace-pre-wrap text-red-600">{appVersionError.detail}</div> : null}
+                    </div>
+                  )}
 
                   {/* Author Info */}
                   <div className="w-full text-center text-xl font-medium leading-8 text-gray-700">

@@ -112,8 +112,21 @@
     "ai": "AI"
   },
   "auth": {
+    "loginRequired": "請先登入後再執行此操作",
     "invalidPassword": "密碼錯誤",
     "connectionFailed": "連接伺服器失敗"
+  },
+  "update": {
+    "startFailed": "啟動升級失敗",
+    "alreadyRunning": "已有升級任務正在進行",
+    "noNewVersion": "目前沒有可升級的新版本",
+    "cancelFailed": "停止升級失敗",
+    "notRunning": "目前沒有可停止的升級任務",
+    "cannotCancelCurrentPhase": "目前階段不可安全停止升級",
+    "resetFailed": "重設升級狀態失敗",
+    "restartFailed": "重新啟動服務失敗",
+    "restartNotReady": "升級成功後才能重新啟動服務",
+    "serviceNotFound": "未找到目前的 OpenClaw Chat Gateway 服務"
   },
   "version": {
     "infoUnavailable": "讀取系統版本資訊失敗",
@@ -510,6 +523,18 @@
       "checkUpToDateButton": "目前已是最新版本，無需更新",
       "checkNoReleaseButton": "目前已是最新版本，無需更新",
       "checkRetryButton": "檢查失敗，點擊重試",
+      "updatePreparingButton": "正在準備升級...",
+      "updateUpdatingButton": "正在升級...點擊停止升級",
+      "updateStoppingButton": "正在停止升級...",
+      "updateSucceededButton": "更新成功，點擊重新啟動服務",
+      "updateFailedButton": "更新失敗，請手動升級",
+      "restartingButton": "正在重新啟動服務...",
+      "restartFailedButton": "重新啟動失敗，請手動重啟服務",
+      "updateStatusLoadFailed": "讀取升級狀態失敗",
+      "updateStartFailed": "啟動升級失敗",
+      "updateCancelFailed": "停止升級失敗",
+      "updateResetFailed": "重設升級狀態失敗",
+      "restartServiceFailed": "重新啟動服務失敗",
       "viewRelease": "查看更新",
       "downloadRelease": "下載發行包",
       "authorName": "安格視界 / AnGeWorld",

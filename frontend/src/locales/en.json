@@ -112,8 +112,21 @@
     "ai": "AI"
   },
   "auth": {
+    "loginRequired": "Please log in before performing this action",
     "invalidPassword": "Invalid password",
     "connectionFailed": "Failed to connect to the server"
+  },
+  "update": {
+    "startFailed": "Failed to start the update",
+    "alreadyRunning": "An update task is already running",
+    "noNewVersion": "There is no newer version available",
+    "cancelFailed": "Failed to stop the update",
+    "notRunning": "There is no running update task to stop",
+    "cannotCancelCurrentPhase": "The current phase cannot be stopped safely",
+    "resetFailed": "Failed to reset the update state",
+    "restartFailed": "Failed to restart the service",
+    "restartNotReady": "The service can only be restarted after a successful update",
+    "serviceNotFound": "The current OpenClaw Chat Gateway service could not be found"
   },
   "version": {
     "infoUnavailable": "Failed to load system version information",
@@ -510,6 +523,18 @@
       "checkUpToDateButton": "This is already the latest version.",
       "checkNoReleaseButton": "This is already the latest version.",
       "checkRetryButton": "Check failed. Click to retry.",
+      "updatePreparingButton": "Preparing update...",
+      "updateUpdatingButton": "Updating... Click to stop the update.",
+      "updateStoppingButton": "Stopping update...",
+      "updateSucceededButton": "Update succeeded. Click to restart the service.",
+      "updateFailedButton": "Update failed. Please upgrade manually.",
+      "restartingButton": "Restarting service...",
+      "restartFailedButton": "Restart failed. Please restart the service manually.",
+      "updateStatusLoadFailed": "Failed to load the update status",
+      "updateStartFailed": "Failed to start the update",
+      "updateCancelFailed": "Failed to stop the update",
+      "updateResetFailed": "Failed to reset the update state",
+      "restartServiceFailed": "Failed to restart the service",
       "viewRelease": "View Release",
       "downloadRelease": "Download Asset",
       "authorName": "AnGeWorld",

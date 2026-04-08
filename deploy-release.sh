@@ -4,11 +4,23 @@ set -e
 # Configuration
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_DIR="$HOME/.config/systemd/user"
+SKIP_SERVICE_RESTART=${CLAWUI_SKIP_SERVICE_RESTART:-0}
+
+emit_phase() {
+    echo "::clawui-update-phase::$1"
+}
 
 # Default Port
 CLAWUI_PORT=${1:-3115}
 SERVICE_NAME="clawui-${CLAWUI_PORT}"
 
+# Build steps need devDependencies even when the service environment sets NODE_ENV=production.
+export NPM_CONFIG_PRODUCTION=false
+export npm_config_production=false
+export NPM_CONFIG_INCLUDE=dev
+export npm_config_include=dev
+
+emit_phase "install-dependencies"
 echo "Deploying OpenClaw Chat Gateway (Consolidated)..."
 echo "Project Path:  $PROJECT_ROOT"
 echo "Service Port:  $CLAWUI_PORT"
@@ -16,16 +28,19 @@ echo "Service Name:  $SERVICE_NAME"
 
 echo "Installing dependencies..."
 cd "$PROJECT_ROOT"
-npm install
-cd backend && npm install && cd ..
-cd frontend && npm install && cd ..
+npm install --include=dev
+cd backend && npm install --include=dev && cd ..
+cd frontend && npm install --include=dev && cd ..
 
+emit_phase "build"
 echo "Building projects..."
 npm run build
 
+emit_phase "patch-config"
 echo "Patching OpenClaw configuration for local backend connections..."
 node backend/patch-config.js || echo "Warning: Failed to patch OpenClaw config automatically."
 
+emit_phase "setup-service"
 echo "Setting up systemd service..."
 mkdir -p "$SERVICE_DIR"
 
@@ -53,14 +68,21 @@ fi
 echo "Reloading systemd daemon..."
 systemctl --user daemon-reload
 
-echo "Enabling and starting service $SERVICE_NAME..."
+echo "Enabling service $SERVICE_NAME..."
 systemctl --user enable "$SERVICE_NAME.service"
-systemctl --user restart "$SERVICE_NAME.service"
+
+if [ "$SKIP_SERVICE_RESTART" = "1" ]; then
+    echo "Skipping service restart because CLAWUI_SKIP_SERVICE_RESTART=1"
+else
+    emit_phase "service-restart"
+    echo "Restarting service $SERVICE_NAME..."
+    systemctl --user restart "$SERVICE_NAME.service"
+fi
 
 # Ensure services stay running after logout
 echo "Enabling lingering for user $(whoami)..."
 if command -v loginctl >/dev/null 2>&1; then
-    sudo loginctl enable-linger $(whoami) || echo "Warning: Could not enable lingering. Manual action may be required: sudo loginctl enable-linger $(whoami)"
+    sudo -n loginctl enable-linger $(whoami) || echo "Warning: Could not enable lingering. Manual action may be required: sudo loginctl enable-linger $(whoami)"
 fi
 
 # Get local IP address
