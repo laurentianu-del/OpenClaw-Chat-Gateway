@@ -192,6 +192,7 @@ type UpdateStatusInfo = {
   startedAt: string | null;
   updatedAt: string | null;
   serviceName: string | null;
+  restartSteps: UpdateRestartStep[] | null;
 };
 
 type OpenClawUpdateStatus =
@@ -224,6 +225,24 @@ type UpdatePhaseVisual = {
   labelKey: string;
 };
 
+type UpdateRestartStepId =
+  | 'restart_openclaw'
+  | 'restart_project'
+  | 'warmup_browser';
+
+type UpdateRestartStepStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed';
+
+type UpdateRestartStep = {
+  id: UpdateRestartStepId;
+  status: UpdateRestartStepStatus;
+  detail: string | null;
+  updatedAt: string | null;
+};
+
 type BrowserTaskPhaseVisual = {
   progress: number;
   labelKey: string;
@@ -244,6 +263,9 @@ const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
   'recover-browser-runtime': { progress: 92, labelKey: 'settings.about.updateProgressRecoveringBrowser' },
   'setup-service': { progress: 96, labelKey: 'settings.about.updateProgressSettingUpService' },
   'service-restart': { progress: 98, labelKey: 'settings.about.updateProgressSettingUpService' },
+  'restart-openclaw': { progress: 99, labelKey: 'settings.about.restartStepRestartOpenClaw' },
+  'restart-project': { progress: 99, labelKey: 'settings.about.restartStepRestartProject' },
+  'warmup-browser': { progress: 100, labelKey: 'settings.about.restartStepWarmupBrowser' },
   'complete': { progress: 100, labelKey: 'settings.about.updateProgressFinishing' },
 };
 
@@ -262,6 +284,11 @@ const OPENCLAW_UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
 
 const CONNECTION_STATUS_REFRESH_EVENT = 'clawui:refresh-connection-status';
 const UPDATE_RESTART_MODAL_TIMEOUT_MS = 5 * 60 * 1000;
+const UPDATE_RESTART_STEP_IDS: UpdateRestartStepId[] = [
+  'restart_openclaw',
+  'restart_project',
+  'warmup_browser',
+];
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
@@ -359,6 +386,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [updateStatusInfo, setUpdateStatusInfo] = useState<UpdateStatusInfo | null>(null);
   const [updateRestartModalStage, setUpdateRestartModalStage] = useState<RestartFlowModalStage>(null);
   const [updateRestartModalDetail, setUpdateRestartModalDetail] = useState('');
+  const [updateRestartStepSnapshot, setUpdateRestartStepSnapshot] = useState<UpdateRestartStep[] | null>(null);
   const [isUpdateCancelModalOpen, setIsUpdateCancelModalOpen] = useState(false);
   const [isCancellingUpdate, setIsCancellingUpdate] = useState(false);
   const updateRestartModalStartedAtRef = useRef<number | null>(null);
@@ -918,6 +946,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     if (updateRestartModalStage || updateStatusInfo?.status !== 'update_succeeded') {
       return;
     }
+    setUpdateRestartStepSnapshot(null);
     setUpdateRestartModalDetail('');
     setUpdateRestartModalStage('confirm');
   };
@@ -926,6 +955,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     if (updateRestartModalStage === 'restarting') return;
     setUpdateRestartModalStage(null);
     setUpdateRestartModalDetail('');
+    setUpdateRestartStepSnapshot(null);
     updateRestartModalStartedAtRef.current = null;
   };
 
@@ -1135,6 +1165,12 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   }, [updateStatusInfo?.status]);
 
   useEffect(() => {
+    if (updateStatusInfo?.restartSteps?.length) {
+      setUpdateRestartStepSnapshot(updateStatusInfo.restartSteps);
+    }
+  }, [updateStatusInfo?.restartSteps]);
+
+  useEffect(() => {
     if (openClawUpdateStatusInfo?.status !== 'updating') {
       setIsOpenClawUpdateCancelModalOpen(false);
       setIsCancellingOpenClawUpdate(false);
@@ -1162,6 +1198,15 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
     let cancelled = false;
     void (async () => {
+      setUpdateRestartStepSnapshot((current) => UPDATE_RESTART_STEP_IDS.map((id) => {
+        const matched = current?.find((step) => step.id === id) || null;
+        return {
+          id,
+          status: 'completed' as UpdateRestartStepStatus,
+          detail: matched?.detail || null,
+          updatedAt: new Date().toISOString(),
+        };
+      }));
       await fetchCurrentVersionInfo({ silent: true });
       if (cancelled) return;
       setUpdateRestartModalDetail('');
@@ -2488,6 +2533,30 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     updateStatusInfo?.rawDetail,
     updateStatusInfo?.message,
   ]);
+  const updateRestartSteps = UPDATE_RESTART_STEP_IDS.map((id) => {
+    const matched = (updateStatusInfo?.restartSteps || updateRestartStepSnapshot || []).find((step) => step.id === id) || null;
+    return matched || {
+      id,
+      status: 'pending' as UpdateRestartStepStatus,
+      detail: null,
+      updatedAt: null,
+    };
+  });
+  const updateRestartStepItems = updateRestartSteps.map((step) => ({
+    ...step,
+    label: step.id === 'restart_openclaw'
+      ? t('settings.about.restartStepRestartOpenClaw')
+      : step.id === 'restart_project'
+        ? t('settings.about.restartStepRestartProject')
+        : t('settings.about.restartStepWarmupBrowser'),
+    statusLabel: step.status === 'completed'
+      ? t('settings.about.restartStepStatusCompleted')
+      : step.status === 'failed'
+        ? t('settings.about.restartStepStatusFailed')
+        : step.status === 'running'
+          ? t('settings.about.restartStepStatusRunning')
+          : t('settings.about.restartStepStatusPending'),
+  }));
   const openClawUpdateFailureDetail = joinDistinctLines([
     openClawUpdateStatusInfo?.rawDetail,
     openClawUpdateStatusInfo?.message,
@@ -2595,8 +2664,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
     if (updateStatusInfo?.status === 'restarting') {
       return {
-        progress: 100,
-        label: t('settings.about.restartingButton'),
+        progress: Math.max(baseProgress, 99),
+        label: t(updatePhaseVisual.labelKey),
         detail: '',
         tone: 'brand' as UpdateProgressTone,
         layout: 'expanded' as UpdateProgressLayout,
@@ -4464,6 +4533,65 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
               </div>
               <h3 className="mb-2 text-lg font-bold text-gray-900">{updateRestartModalTitle}</h3>
               <p className="text-sm text-gray-500 whitespace-pre-wrap">{updateRestartModalMessage}</p>
+              {updateRestartModalStage !== 'confirm' ? (
+                <div className="mt-4 space-y-2 text-left">
+                  {updateRestartStepItems.map((step) => (
+                    <div
+                      key={step.id}
+                      className={`rounded-xl border px-4 py-3 ${
+                        step.status === 'completed'
+                          ? 'border-emerald-200 bg-emerald-50'
+                          : step.status === 'failed'
+                            ? 'border-red-200 bg-red-50'
+                            : step.status === 'running'
+                              ? 'border-blue-200 bg-blue-50'
+                              : 'border-gray-200 bg-gray-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`flex h-7 w-7 items-center justify-center rounded-full ${
+                          step.status === 'completed'
+                            ? 'bg-emerald-100 text-emerald-600'
+                            : step.status === 'failed'
+                              ? 'bg-red-100 text-red-600'
+                              : step.status === 'running'
+                                ? 'bg-blue-100 text-blue-600'
+                                : 'bg-gray-200 text-gray-500'
+                        }`}>
+                          {step.status === 'completed' ? (
+                            <Check className="h-4 w-4" />
+                          ) : step.status === 'failed' ? (
+                            <X className="h-4 w-4" />
+                          ) : step.status === 'running' ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Activity className="h-4 w-4" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="truncate text-sm font-semibold text-gray-900">{step.label}</p>
+                            <span className={`shrink-0 text-xs font-medium ${
+                              step.status === 'completed'
+                                ? 'text-emerald-700'
+                                : step.status === 'failed'
+                                  ? 'text-red-700'
+                                  : step.status === 'running'
+                                    ? 'text-blue-700'
+                                    : 'text-gray-500'
+                            }`}>
+                              {step.statusLabel}
+                            </span>
+                          </div>
+                          {step.detail ? (
+                            <p className="mt-1 whitespace-pre-wrap break-all text-xs text-gray-500">{step.detail}</p>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               {updateRestartModalDetail && updateRestartModalStage === 'failure' ? (
                 <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
                   <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>

@@ -57,6 +57,7 @@ app.use(express.json());
 const dataDir = process.env.CLAWUI_DATA_DIR || '.clawui';
 const uploadDir = path.join(process.env.HOME || '.', dataDir, 'uploads');
 const browserWarmupMarkerPath = path.join(process.env.HOME || '.', dataDir, 'browser-warmup.pending');
+const updateRestartStatePath = path.join(process.env.HOME || '.', dataDir, 'update-restart-state.json');
 fs.mkdirSync(uploadDir, { recursive: true });
 
 // OpenClaw media directory (screenshots, inbound files, etc.)
@@ -174,6 +175,8 @@ const UPDATE_CANCEL_KILL_TIMEOUT_MS = 5000;
 const UPDATE_RESTART_DELAY_MS = 250;
 const UPDATE_CANCELLABLE_PHASES = new Set(['downloading-script', 'detect-service', 'git-pull']);
 const CLAWUI_SERVICE_FILE_REGEX = /^clawui(?:-\d+)?\.service$/;
+const UPDATE_RESTART_RESUME_POLL_INTERVAL_MS = 1500;
+const UPDATE_RESTART_RESUME_TIMEOUT_MS = 3 * 60 * 1000;
 
 type BrowserHealthIssue = 'permissions' | 'disabled' | 'stopped' | 'detect-error' | 'timeout' | 'unknown';
 
@@ -238,6 +241,24 @@ type BrowserTaskSnapshot = {
   updatedAt: string | null;
 };
 
+type UpdateRestartStepId =
+  | 'restart_openclaw'
+  | 'restart_project'
+  | 'warmup_browser';
+
+type UpdateRestartStepStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed';
+
+type UpdateRestartStep = {
+  id: UpdateRestartStepId;
+  status: UpdateRestartStepStatus;
+  detail: string | null;
+  updatedAt: string | null;
+};
+
 type UpdateStatus =
   | 'idle'
   | 'has_update'
@@ -261,6 +282,7 @@ type UpdateSnapshot = {
   startedAt: string | null;
   updatedAt: string | null;
   serviceName: string | null;
+  restartSteps: UpdateRestartStep[] | null;
 };
 
 type ActiveUpdateProcess = {
@@ -310,6 +332,11 @@ type ActiveOpenClawUpdateProcess = {
 };
 
 const appRepoRoot = path.resolve(__dirname, '..', '..');
+const UPDATE_RESTART_STEP_IDS: UpdateRestartStepId[] = [
+  'restart_openclaw',
+  'restart_project',
+  'warmup_browser',
+];
 const OPENCLAW_LATEST_VERSION_CACHE_TTL_MS = 60 * 1000;
 const OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS = [700, 1000] as const;
 const OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS = 1200;
@@ -333,6 +360,7 @@ function createDefaultUpdateSnapshot(): UpdateSnapshot {
     startedAt: null,
     updatedAt: new Date().toISOString(),
     serviceName: null,
+    restartSteps: null,
   };
 }
 
@@ -351,7 +379,109 @@ function createDefaultOpenClawUpdateSnapshot(): OpenClawUpdateSnapshot {
   };
 }
 
-let updateSnapshot = createDefaultUpdateSnapshot();
+function createDefaultUpdateRestartSteps(): UpdateRestartStep[] {
+  const updatedAt = new Date().toISOString();
+  return UPDATE_RESTART_STEP_IDS.map((id) => ({
+    id,
+    status: 'pending',
+    detail: null,
+    updatedAt,
+  }));
+}
+
+function normalizeUpdateRestartSteps(raw: unknown): UpdateRestartStep[] | null {
+  if (!Array.isArray(raw)) return null;
+
+  const normalized: UpdateRestartStep[] = [];
+  for (const id of UPDATE_RESTART_STEP_IDS) {
+    const matched = raw.find((entry) => (
+      entry
+      && typeof entry === 'object'
+      && normalizeCliText((entry as { id?: unknown }).id) === id
+    )) as { status?: unknown; detail?: unknown; updatedAt?: unknown } | undefined;
+
+    const status = normalizeCliText(matched?.status);
+    normalized.push({
+      id,
+      status: status === 'running' || status === 'completed' || status === 'failed' ? status : 'pending',
+      detail: normalizeCliText(matched?.detail) || null,
+      updatedAt: normalizeCliText(matched?.updatedAt) || null,
+    });
+  }
+
+  return normalized;
+}
+
+function updateRestartStepStatus(
+  steps: UpdateRestartStep[] | null | undefined,
+  id: UpdateRestartStepId,
+  status: UpdateRestartStepStatus,
+  detail?: string | null
+) {
+  const nextSteps = normalizeUpdateRestartSteps(steps) || createDefaultUpdateRestartSteps();
+  const updatedAt = new Date().toISOString();
+
+  return nextSteps.map((step) => (
+    step.id === id
+      ? {
+        ...step,
+        status,
+        detail: normalizeCliText(detail) || null,
+        updatedAt,
+      }
+      : step
+  ));
+}
+
+function readPersistedUpdateRestartSnapshot(): UpdateSnapshot | null {
+  try {
+    if (!fs.existsSync(updateRestartStatePath)) {
+      return null;
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(updateRestartStatePath, 'utf8')) as Partial<UpdateSnapshot>;
+    if (parsed.status !== 'restarting' && parsed.status !== 'restart_failed') {
+      return null;
+    }
+
+    return {
+      ...createDefaultUpdateSnapshot(),
+      ...parsed,
+      status: parsed.status,
+      phase: normalizeCliText(parsed.phase) || null,
+      currentVersion: normalizeCliText(parsed.currentVersion) || null,
+      latestVersion: normalizeCliText(parsed.latestVersion) || null,
+      message: normalizeCliText(parsed.message) || null,
+      rawDetail: normalizeCliText(parsed.rawDetail) || null,
+      serviceName: normalizeCliText(parsed.serviceName) || null,
+      startedAt: normalizeCliText(parsed.startedAt) || null,
+      updatedAt: normalizeCliText(parsed.updatedAt) || new Date().toISOString(),
+      logs: Array.isArray(parsed.logs)
+        ? parsed.logs.map((entry) => normalizeCliText(entry)).filter((entry): entry is string => Boolean(entry))
+        : [],
+      restartSteps: normalizeUpdateRestartSteps(parsed.restartSteps) || createDefaultUpdateRestartSteps(),
+    };
+  } catch (error) {
+    console.warn('[UpdateRestart] Failed to read persisted restart state:', error);
+    return null;
+  }
+}
+
+function syncPersistedUpdateRestartSnapshot() {
+  try {
+    if (updateSnapshot.status === 'restarting' || updateSnapshot.status === 'restart_failed') {
+      fs.mkdirSync(path.dirname(updateRestartStatePath), { recursive: true });
+      fs.writeFileSync(updateRestartStatePath, `${JSON.stringify(updateSnapshot, null, 2)}\n`);
+      return;
+    }
+
+    fs.rmSync(updateRestartStatePath, { force: true });
+  } catch (error) {
+    console.warn('[UpdateRestart] Failed to sync persisted restart state:', error);
+  }
+}
+
+let updateSnapshot = readPersistedUpdateRestartSnapshot() || createDefaultUpdateSnapshot();
 let activeUpdateProcess: ActiveUpdateProcess | null = null;
 let cachedLatestVersionInfo: AppLatestVersionInfo | null = null;
 let openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
@@ -361,12 +491,14 @@ let cachedOpenClawLatestVersionCheckedAt = 0;
 let openClawUpdateRuntimeReconcileInFlight: Promise<void> | null = null;
 let lastOpenClawUpdateRuntimeReconcileAt = 0;
 let openClawUpdateSuccessResetTimer: NodeJS.Timeout | null = null;
+let updateRestartResumeTask: Promise<void> | null = null;
 
 function appendUpdateLog(message: string) {
   const line = normalizeCliText(message);
   if (!line) return;
   updateSnapshot.logs = [...updateSnapshot.logs.slice(-(UPDATE_LOG_LIMIT - 1)), line];
   updateSnapshot.updatedAt = new Date().toISOString();
+  syncPersistedUpdateRestartSnapshot();
 }
 
 function patchUpdateSnapshot(patch: Partial<UpdateSnapshot>) {
@@ -375,10 +507,12 @@ function patchUpdateSnapshot(patch: Partial<UpdateSnapshot>) {
     ...patch,
     updatedAt: new Date().toISOString(),
   };
+  syncPersistedUpdateRestartSnapshot();
 }
 
 function resetUpdateSnapshot() {
   updateSnapshot = createDefaultUpdateSnapshot();
+  syncPersistedUpdateRestartSnapshot();
 }
 
 function rememberLatestVersionInfo(info: AppLatestVersionInfo | null) {
@@ -434,6 +568,12 @@ function getUpdatePhaseMessage(phase: string) {
       return 'Updating service configuration.';
     case 'service-restart':
       return 'Restarting service.';
+    case 'restart-openclaw':
+      return 'Restarting OpenClaw.';
+    case 'restart-project':
+      return 'Restarting this project.';
+    case 'warmup-browser':
+      return 'Warming up the browser runtime.';
     case 'complete':
       return 'Update completed.';
     default:
@@ -1341,7 +1481,7 @@ let browserTaskSnapshot: BrowserTaskSnapshot = {
   rawDetail: null,
   updatedAt: null,
 };
-let browserWarmupTask: Promise<void> | null = null;
+let browserWarmupTask: Promise<{ ready: boolean; detail: string | null }> | null = null;
 
 function getBrowserTaskSnapshot(): BrowserTaskSnapshot {
   return { ...browserTaskSnapshot };
@@ -2206,7 +2346,7 @@ async function waitForBrowserHealth(timeoutMs: number, reportProgress?: BrowserT
   return runBrowserHealthCheck(reportProgress);
 }
 
-async function runDeferredBrowserWarmupOnce() {
+async function runDeferredBrowserWarmupOnce(): Promise<{ ready: boolean; detail: string | null }> {
   const reportProgress = (phase: string, rawDetail?: string | null) => {
     updateBrowserTaskSnapshot({
       status: 'checking',
@@ -2220,7 +2360,10 @@ async function runDeferredBrowserWarmupOnce() {
   if (readiness.ready) {
     reportProgress('finalize');
     console.log('[BrowserWarmup] Browser runtime is ready after restart.');
-    return;
+    return {
+      ready: true,
+      detail: null,
+    };
   }
 
   const detail = readiness.detail
@@ -2229,9 +2372,13 @@ async function runDeferredBrowserWarmupOnce() {
     || 'Browser warmup did not complete.';
   reportProgress('finalize', detail);
   console.warn(`[BrowserWarmup] Browser warmup finished without readiness: ${detail}`);
+  return {
+    ready: false,
+    detail,
+  };
 }
 
-function scheduleDeferredBrowserWarmup() {
+function scheduleDeferredBrowserWarmup(): Promise<{ ready: boolean; detail: string | null }> {
   if (browserWarmupTask) {
     return browserWarmupTask;
   }
@@ -2241,14 +2388,21 @@ function scheduleDeferredBrowserWarmup() {
 
     if (browserTaskSnapshot.status !== 'idle') {
       console.log('[BrowserWarmup] Skipping deferred warmup because another browser task is running.');
-      return;
+      return {
+        ready: false,
+        detail: 'Another browser task is already running.',
+      };
     }
 
     try {
-      await runDeferredBrowserWarmupOnce();
+      return await runDeferredBrowserWarmupOnce();
     } catch (error: any) {
       const detail = readCliErrorDetail(error) || error?.message || 'Deferred browser warmup failed';
       console.warn(`[BrowserWarmup] ${detail}`);
+      return {
+        ready: false,
+        detail,
+      };
     } finally {
       resetBrowserTaskSnapshot();
     }
@@ -2496,6 +2650,29 @@ async function waitForGatewayRestartAfterBrowserModeChange(previousPid: number |
   throw new Error(lastFailure || 'Timed out waiting for OpenClaw to restart.');
 }
 
+async function waitForGatewayConnectionStable(timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  let stableConnectedChecks = 0;
+  let lastFailure = 'OpenClaw connection is still recovering';
+
+  while (Date.now() < deadline) {
+    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    if (probe.connected) {
+      stableConnectedChecks += 1;
+      if (stableConnectedChecks >= 2) {
+        return;
+      }
+    } else {
+      stableConnectedChecks = 0;
+      lastFailure = probe.message || lastFailure;
+    }
+
+    await sleep(UPDATE_RESTART_RESUME_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(lastFailure || 'Timed out waiting for OpenClaw to become available.');
+}
+
 function scheduleGatewayRestart() {
   gatewayRestartQueued = true;
   if (gatewayRestartTask) {
@@ -2512,6 +2689,70 @@ function scheduleGatewayRestart() {
   });
 
   return gatewayRestartTask;
+}
+
+async function resumePersistedUpdateRestartFlow() {
+  if (updateSnapshot.status !== 'restarting') {
+    return;
+  }
+  if (updateRestartResumeTask) {
+    return updateRestartResumeTask;
+  }
+
+  updateRestartResumeTask = (async () => {
+    try {
+      let restartSteps = normalizeUpdateRestartSteps(updateSnapshot.restartSteps) || createDefaultUpdateRestartSteps();
+
+      if (restartSteps.some((step) => step.id === 'restart_openclaw' && step.status !== 'completed')) {
+        patchUpdateSnapshot({
+          phase: 'restart-openclaw',
+          message: getUpdatePhaseMessage('restart-openclaw'),
+          rawDetail: null,
+          restartSteps,
+        });
+        await waitForGatewayConnectionStable(UPDATE_RESTART_RESUME_TIMEOUT_MS);
+        restartSteps = updateRestartStepStatus(restartSteps, 'restart_openclaw', 'completed');
+      }
+
+      restartSteps = updateRestartStepStatus(restartSteps, 'restart_project', 'completed');
+      restartSteps = updateRestartStepStatus(restartSteps, 'warmup_browser', 'running');
+      patchUpdateSnapshot({
+        phase: 'warmup-browser',
+        message: getUpdatePhaseMessage('warmup-browser'),
+        rawDetail: null,
+        restartSteps,
+      });
+
+      const warmupResult = await scheduleDeferredBrowserWarmup();
+      if (!warmupResult.ready) {
+        throw new Error(warmupResult.detail || 'Browser warmup did not complete successfully.');
+      }
+
+      rememberLatestVersionInfo(null);
+      resetUpdateSnapshot();
+    } catch (error) {
+      const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+      let restartSteps = normalizeUpdateRestartSteps(updateSnapshot.restartSteps) || createDefaultUpdateRestartSteps();
+      const failingStepId: UpdateRestartStepId = updateSnapshot.phase === 'warmup-browser'
+        ? 'warmup_browser'
+        : updateSnapshot.phase === 'restart-project'
+          ? 'restart_project'
+          : 'restart_openclaw';
+      restartSteps = updateRestartStepStatus(restartSteps, failingStepId, 'failed', detail);
+      patchUpdateSnapshot({
+        status: 'restart_failed',
+        canCancel: false,
+        message: 'Failed to restart OpenClaw and finish browser warmup.',
+        rawDetail: detail,
+        restartSteps,
+      });
+      appendUpdateLog(`Restart flow failed: ${detail}`);
+    } finally {
+      updateRestartResumeTask = null;
+    }
+  })();
+
+  return updateRestartResumeTask;
 }
 
 function buildUpdateCommand(targetPort: string) {
@@ -2704,31 +2945,51 @@ async function restartClawUiService() {
   await execFilePromise('systemctl', ['--user', 'show', serviceName, '--property', 'LoadState'], {
     maxBuffer: 1024 * 1024,
   });
-  markBrowserWarmupRequested();
+  const previousGatewayRuntimeState = await readOpenClawGatewayServiceRuntimeState();
+  let restartSteps = createDefaultUpdateRestartSteps();
+  restartSteps = updateRestartStepStatus(restartSteps, 'restart_openclaw', 'running');
 
   patchUpdateSnapshot({
     status: 'restarting',
+    phase: 'restart-openclaw',
     canCancel: false,
     serviceName,
-    message: `Restarting OpenClaw and ${serviceName}.`,
+    message: getUpdatePhaseMessage('restart-openclaw'),
     rawDetail: null,
+    restartSteps,
   });
-  appendUpdateLog(`Scheduling restart for OpenClaw and ${serviceName}.`);
+  appendUpdateLog(`Restart flow started for OpenClaw and ${serviceName}.`);
 
   setTimeout(() => {
     (async () => {
       await scheduleGatewayRestart();
+      await waitForGatewayRestartAfterBrowserModeChange(previousGatewayRuntimeState.execMainPid);
+      restartSteps = updateRestartStepStatus(restartSteps, 'restart_openclaw', 'completed');
+      restartSteps = updateRestartStepStatus(restartSteps, 'restart_project', 'running');
+      patchUpdateSnapshot({
+        phase: 'restart-project',
+        message: getUpdatePhaseMessage('restart-project'),
+        restartSteps,
+      });
+      appendUpdateLog(`OpenClaw restart finished. Restarting ${serviceName}.`);
+      markBrowserWarmupRequested();
       await execFilePromise('systemctl', ['--user', 'restart', serviceName, '--no-block'], {
         maxBuffer: 1024 * 1024,
       });
     })().catch((error) => {
       const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+      let failedSteps = normalizeUpdateRestartSteps(updateSnapshot.restartSteps) || restartSteps;
+      const failingStepId: UpdateRestartStepId = updateSnapshot.phase === 'restart-project'
+        ? 'restart_project'
+        : 'restart_openclaw';
+      failedSteps = updateRestartStepStatus(failedSteps, failingStepId, 'failed', detail);
       patchUpdateSnapshot({
         status: 'restart_failed',
         canCancel: false,
         serviceName,
-        message: `Failed to restart ${serviceName}.`,
+        message: `Failed during the restart flow for ${serviceName}.`,
         rawDetail: detail,
+        restartSteps: failedSteps,
       });
       appendUpdateLog(`Restart failed: ${detail}`);
     });
@@ -6634,5 +6895,9 @@ server.listen(PORT, '0.0.0.0', () => {
   if (consumeBrowserWarmupRequest()) {
     console.log('[BrowserWarmup] Scheduling deferred browser warmup after restart.');
     void scheduleDeferredBrowserWarmup();
+  }
+  if (updateSnapshot.status === 'restarting') {
+    console.log('[UpdateRestart] Resuming persisted restart flow after service restart.');
+    void resumePersistedUpdateRestartFlow();
   }
 });
