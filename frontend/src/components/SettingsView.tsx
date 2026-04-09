@@ -233,6 +233,7 @@ const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
   'install-dependencies': { progress: 40, labelKey: 'settings.about.updateProgressInstallingDependencies' },
   'build': { progress: 58, labelKey: 'settings.about.updateProgressBuilding' },
   'patch-config': { progress: 68, labelKey: 'settings.about.updateProgressApplyingConfig' },
+  'restart-openclaw-runtime': { progress: 86, labelKey: 'settings.about.updateProgressRestartingOpenClaw' },
   'reconcile-openclaw-runtime': { progress: 78, labelKey: 'settings.about.updateProgressReconcilingRuntime' },
   'repair-openclaw-device': { progress: 86, labelKey: 'settings.about.updateProgressRepairingDevice' },
   'recover-browser-runtime': { progress: 92, labelKey: 'settings.about.updateProgressRecoveringBrowser' },
@@ -245,14 +246,16 @@ const OPENCLAW_UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
   'checking-status': { progress: 12, labelKey: 'settings.openclawUpdate.progressChecking' },
   'download-package': { progress: 28, labelKey: 'settings.openclawUpdate.progressDownloading' },
   'install-package': { progress: 52, labelKey: 'settings.openclawUpdate.progressInstalling' },
-  'switch-command-entrypoint': { progress: 72, labelKey: 'settings.openclawUpdate.progressInstalling' },
-  'finalize-update': { progress: 84, labelKey: 'settings.openclawUpdate.progressInstalling' },
+  'switch-command-entrypoint': { progress: 72, labelKey: 'settings.openclawUpdate.progressSwitchingEntrypoint' },
+  'finalize-update': { progress: 84, labelKey: 'settings.openclawUpdate.progressFinalizingPackage' },
   'running-update': { progress: 52, labelKey: 'settings.openclawUpdate.progressInstalling' },
   'stopping-update': { progress: 72, labelKey: 'settings.openclawUpdate.progressStopping' },
   'repair-command-entrypoint': { progress: 92, labelKey: 'settings.openclawUpdate.progressRepairingEntrypoint' },
   'verifying-version': { progress: 96, labelKey: 'settings.openclawUpdate.progressVerifying' },
   'complete': { progress: 100, labelKey: 'settings.openclawUpdate.progressFinishing' },
 };
+
+const CONNECTION_STATUS_REFRESH_EVENT = 'clawui:refresh-connection-status';
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
@@ -1019,10 +1022,10 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     if (activeStatus === 'update_succeeded') {
       void (async () => {
         await fetchCurrentVersionInfo({ silent: true });
-        const latest = await fetchOpenClawLatestVersion({ quiet: true });
-        if (latest) {
-          setOpenClawLatestVersionInfo(latest);
-        }
+        await detectGatewayConfig({ silent: true });
+        setOpenClawLatestVersionInfo(null);
+        setOpenClawLatestVersionError(EMPTY_INLINE_ERROR);
+        window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
         await handleResetOpenClawUpdateState();
       })();
       return;
@@ -1038,10 +1041,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
       if (activeStatus === 'stopping' && nextUpdate.status === 'idle') {
         await fetchCurrentVersionInfo({ silent: true });
+        await detectGatewayConfig({ silent: true });
         const latest = await fetchOpenClawLatestVersion({ quiet: true });
         if (latest) {
           setOpenClawLatestVersionInfo(latest);
         }
+        window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
         return;
       }
     };

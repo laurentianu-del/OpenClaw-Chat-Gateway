@@ -588,6 +588,7 @@
       "updateProgressInstallingDependencies": "正在准备运行依赖",
       "updateProgressBuilding": "正在构建新版本",
       "updateProgressApplyingConfig": "正在同步升级配置",
+      "updateProgressRestartingOpenClaw": "正在重启 OpenClaw 网关",
       "updateProgressReconcilingRuntime": "正在校准 OpenClaw 运行环境",
       "updateProgressRepairingDevice": "正在恢复本机设备权限",
       "updateProgressRecoveringBrowser": "正在恢复浏览器运行环境",

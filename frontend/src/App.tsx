@@ -9,6 +9,9 @@ export type ViewType = 'chat' | 'settings' | 'groups';
 export type SettingsTab = 'gateway' | 'general' | 'models' | 'commands' | 'about';
 const LAST_CONVERSATION_VIEW_STORAGE_KEY = 'clawui_last_conversation_view';
 const BOOTSTRAP_REQUEST_TIMEOUT_MS = 8000;
+const CONNECTION_STATUS_POLL_CONNECTED_MS = 10000;
+const CONNECTION_STATUS_POLL_DISCONNECTED_MS = 2000;
+const CONNECTION_STATUS_REFRESH_EVENT = 'clawui:refresh-connection-status';
 
 type SessionSummary = {
   id: string;
@@ -247,6 +250,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    reloadSessions();
+  }, []);
+
+  useEffect(() => {
     const checkStatus = async () => {
       try {
         const data = await fetchJsonWithTimeout<{ connected?: boolean }>('/api/gateway/status');
@@ -256,11 +263,32 @@ export default function App() {
       }
     };
 
-    checkStatus();
-    reloadSessions();
-    const timer = setInterval(checkStatus, 10000);
-    return () => clearInterval(timer);
-  }, []);
+    const handleImmediateCheck = () => {
+      void checkStatus();
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void checkStatus();
+      }
+    };
+
+    void checkStatus();
+    const timer = window.setInterval(() => {
+      void checkStatus();
+    }, isConnected ? CONNECTION_STATUS_POLL_CONNECTED_MS : CONNECTION_STATUS_POLL_DISCONNECTED_MS);
+    window.addEventListener('focus', handleImmediateCheck);
+    window.addEventListener('online', handleImmediateCheck);
+    window.addEventListener(CONNECTION_STATUS_REFRESH_EVENT, handleImmediateCheck as EventListener);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', handleImmediateCheck);
+      window.removeEventListener('online', handleImmediateCheck);
+      window.removeEventListener(CONNECTION_STATUS_REFRESH_EVENT, handleImmediateCheck as EventListener);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isConnected]);
 
   const reloadModels = async () => {
     try {
@@ -315,6 +343,7 @@ export default function App() {
         ) : currentView === 'groups' ? (
           <UnifiedChatView
             mode="group"
+            isConnected={isConnected}
             onMenuClick={() => navigateTo(currentView, settingsTab, true)}
             sessions={sessions}
             availableModels={availableModels}

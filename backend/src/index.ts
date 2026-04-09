@@ -140,6 +140,7 @@ const OPENCLAW_UPDATE_NO_NEW_VERSION_ERROR_CODE = 'openclawUpdate.noNewVersion';
 const OPENCLAW_UPDATE_CANCEL_FAILED_ERROR_CODE = 'openclawUpdate.cancelFailed';
 const OPENCLAW_UPDATE_NOT_RUNNING_ERROR_CODE = 'openclawUpdate.notRunning';
 const OPENCLAW_UPDATE_RESET_FAILED_ERROR_CODE = 'openclawUpdate.resetFailed';
+const OPENCLAW_UPDATE_STATUS_FAILED_ERROR_CODE = 'openclawUpdate.statusFailed';
 const DEFAULT_HISTORY_PAGE_LIMIT = 200;
 const MAX_HISTORY_PAGE_LIMIT = 200;
 const CHAT_STREAM_COMPLETION_PROBE_DELAY_MS = 400;
@@ -300,6 +301,9 @@ type ActiveOpenClawUpdateProcess = {
 
 const appRepoRoot = path.resolve(__dirname, '..', '..');
 const OPENCLAW_LATEST_VERSION_CACHE_TTL_MS = 60 * 1000;
+const OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS = [700, 1000] as const;
+const OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS = 1200;
+const OPENCLAW_UPDATE_SUCCESS_AUTO_RESET_MS = 5000;
 const OPENCLAW_UPDATE_CANCELLABLE_PHASES = new Set([
   'download-package',
   'install-package',
@@ -344,6 +348,9 @@ let openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
 let activeOpenClawUpdateProcess: ActiveOpenClawUpdateProcess | null = null;
 let cachedOpenClawLatestVersionInfo: OpenClawLatestVersionInfo | null = null;
 let cachedOpenClawLatestVersionCheckedAt = 0;
+let openClawUpdateRuntimeReconcileInFlight: Promise<void> | null = null;
+let lastOpenClawUpdateRuntimeReconcileAt = 0;
+let openClawUpdateSuccessResetTimer: NodeJS.Timeout | null = null;
 
 function appendUpdateLog(message: string) {
   const line = normalizeCliText(message);
@@ -405,6 +412,8 @@ function getUpdatePhaseMessage(phase: string) {
       return 'Building the project.';
     case 'patch-config':
       return 'Patching OpenClaw configuration.';
+    case 'restart-openclaw-runtime':
+      return 'Restarting the OpenClaw gateway.';
     case 'reconcile-openclaw-runtime':
       return 'Reconciling OpenClaw runtime.';
     case 'repair-openclaw-device':
@@ -538,7 +547,23 @@ function patchOpenClawUpdateSnapshot(patch: Partial<OpenClawUpdateSnapshot>) {
 }
 
 function resetOpenClawUpdateSnapshot() {
+  if (openClawUpdateSuccessResetTimer) {
+    clearTimeout(openClawUpdateSuccessResetTimer);
+    openClawUpdateSuccessResetTimer = null;
+  }
   openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
+}
+
+function scheduleOpenClawUpdateSuccessAutoReset() {
+  if (openClawUpdateSuccessResetTimer) {
+    clearTimeout(openClawUpdateSuccessResetTimer);
+  }
+  openClawUpdateSuccessResetTimer = setTimeout(() => {
+    if (activeOpenClawUpdateProcess || openClawUpdateSnapshot.status !== 'update_succeeded') {
+      return;
+    }
+    resetOpenClawUpdateSnapshot();
+  }, OPENCLAW_UPDATE_SUCCESS_AUTO_RESET_MS);
 }
 
 function rememberOpenClawLatestVersionInfo(info: OpenClawLatestVersionInfo | null) {
@@ -607,6 +632,83 @@ function buildOpenClawUpdateStatusResponse(): OpenClawUpdateSnapshot {
   return {
     ...openClawUpdateSnapshot,
   };
+}
+
+async function reconcileOpenClawUpdateSnapshotFromRuntime() {
+  if (openClawUpdateSnapshot.status !== 'updating') {
+    return;
+  }
+
+  const latestVersion = normalizeCliText(openClawUpdateSnapshot.latestVersion);
+  if (!latestVersion) {
+    return;
+  }
+
+  const now = Date.now();
+  if (openClawUpdateRuntimeReconcileInFlight) {
+    await openClawUpdateRuntimeReconcileInFlight;
+    return;
+  }
+  if ((now - lastOpenClawUpdateRuntimeReconcileAt) < OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS) {
+    return;
+  }
+
+  lastOpenClawUpdateRuntimeReconcileAt = now;
+  openClawUpdateRuntimeReconcileInFlight = (async () => {
+    let observedVersion: string | null = null;
+    try {
+      observedVersion = await readOpenClawVersion();
+    } catch {
+      return;
+    }
+
+    if (!observedVersion) {
+      return;
+    }
+
+    if (observedVersion !== openClawUpdateSnapshot.currentVersion) {
+      patchOpenClawUpdateSnapshot({
+        currentVersion: observedVersion,
+      });
+    }
+
+    if (observedVersion !== latestVersion) {
+      return;
+    }
+
+    if (activeOpenClawUpdateProcess) {
+      if (openClawUpdateSnapshot.phase !== 'verifying-version' || openClawUpdateSnapshot.canCancel) {
+        patchOpenClawUpdatePhaseState('verifying-version', {
+          currentVersion: observedVersion,
+          canCancel: false,
+        });
+        appendOpenClawUpdateLog(`Detected OpenClaw ${observedVersion}. Verifying the upgraded version.`);
+      }
+      return;
+    }
+
+    if (openClawUpdateSnapshot.status !== 'update_succeeded' || openClawUpdateSnapshot.phase !== 'complete') {
+      patchOpenClawUpdateSnapshot({
+        status: 'update_succeeded',
+        phase: 'complete',
+        canCancel: false,
+        currentVersion: observedVersion,
+        message: getOpenClawUpdatePhaseMessage('complete'),
+        rawDetail: null,
+      });
+      appendOpenClawUpdateLog(`Detected OpenClaw ${observedVersion}. Update completed successfully.`);
+      scheduleOpenClawUpdateSuccessAutoReset();
+    }
+  })().finally(() => {
+    openClawUpdateRuntimeReconcileInFlight = null;
+  });
+
+  await openClawUpdateRuntimeReconcileInFlight;
+}
+
+async function buildOpenClawUpdateStatusResponseAsync(): Promise<OpenClawUpdateSnapshot> {
+  await reconcileOpenClawUpdateSnapshotFromRuntime();
+  return buildOpenClawUpdateStatusResponse();
 }
 
 function collectOpenClawUpdateTextFragments(value: unknown, fragments: string[] = [], seen = new Set<string>()) {
@@ -901,6 +1003,7 @@ async function startOpenClawUpdateTask() {
           rawDetail: null,
         });
         appendOpenClawUpdateLog(`OpenClaw update completed successfully. Current version: ${verifiedInfo.currentVersion || 'unknown'}.`);
+        scheduleOpenClawUpdateSuccessAutoReset();
       } catch (error) {
         const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
         patchOpenClawUpdateSnapshot({
@@ -1118,25 +1221,36 @@ async function probeGatewayHealth(gatewayUrl: string): Promise<{ ok: boolean; me
     return { ok: false, message: 'Invalid gateway URL' };
   }
 
-  try {
-    const response = await axios.get(`${baseUrl}/health`, {
-      timeout: 1500,
-      validateStatus: () => true,
-    });
-    const statusText = normalizeCliText((response.data as any)?.status).toLowerCase();
-    const ok = response.status >= 200
-      && response.status < 300
-      && (((response.data as any)?.ok === true) || statusText === 'live' || statusText === 'ok');
+  let lastFailure = 'Gateway health probe failed';
+  for (let index = 0; index < OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS.length; index += 1) {
+    try {
+      const response = await axios.get(`${baseUrl}/health`, {
+        timeout: OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS[index],
+        validateStatus: () => true,
+      });
+      const statusText = normalizeCliText((response.data as any)?.status).toLowerCase();
+      const ok = response.status >= 200
+        && response.status < 300
+        && (((response.data as any)?.ok === true) || statusText === 'live' || statusText === 'ok');
 
-    return ok
-      ? { ok: true }
-      : { ok: false, message: `Gateway health probe returned HTTP ${response.status}` };
-  } catch (error: any) {
-    return {
-      ok: false,
-      message: readCliErrorDetail(error) || 'Gateway health probe failed',
-    };
+      if (ok) {
+        return { ok: true };
+      }
+
+      lastFailure = `Gateway health probe returned HTTP ${response.status}`;
+    } catch (error: any) {
+      lastFailure = readCliErrorDetail(error) || 'Gateway health probe failed';
+    }
+
+    if (index < OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS.length - 1) {
+      await sleep(250);
+    }
   }
+
+  return {
+    ok: false,
+    message: lastFailure,
+  };
 }
 
 function evaluateLocalGatewayCredentialMatch(
@@ -1557,19 +1671,18 @@ async function probeGatewayConnectionStatus(params: {
   requireAuth?: boolean;
 }): Promise<{ connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' }> {
   const gatewayTarget = parseGatewayUrlForStatusProbe(params.gatewayUrl);
+  let localHealthFailureMessage: string | null = null;
 
   if (gatewayTarget && isLoopbackHostname(gatewayTarget.hostname)) {
     const health = await probeGatewayHealth(params.gatewayUrl);
     if (!health.ok) {
-      return {
-        connected: false,
-        message: health.message || 'Local OpenClaw gateway is not responding',
-        source: 'local-runtime',
-      };
+      // Older OpenClaw builds may not respond to /health reliably.
+      // Fall back to auth probe before declaring disconnected.
+      localHealthFailureMessage = health.message || 'Local OpenClaw gateway is not responding';
     }
 
     const credentialMatches = evaluateLocalGatewayCredentialMatch(params, gatewayTarget);
-    if (credentialMatches === true) {
+    if (health.ok && credentialMatches === true) {
       return {
         connected: true,
         message: 'Local OpenClaw gateway runtime healthy',
@@ -1585,7 +1698,7 @@ async function probeGatewayConnectionStatus(params: {
       };
     }
 
-    if (!options?.requireAuth) {
+    if (health.ok && !options?.requireAuth) {
       return {
         connected: true,
         message: 'Local OpenClaw gateway runtime healthy',
@@ -1609,7 +1722,19 @@ async function probeGatewayConnectionStatus(params: {
         timeoutId = setTimeout(() => reject(new Error('Gateway connect probe timeout')), 3000);
       }),
     ]);
-    return { connected: true, source: 'auth-probe' };
+    return {
+      connected: true,
+      message: localHealthFailureMessage
+        ? 'Gateway auth probe succeeded after local health probe failed'
+        : undefined,
+      source: 'auth-probe',
+    };
+  } catch (error: any) {
+    return {
+      connected: false,
+      message: localHealthFailureMessage || readCliErrorDetail(error) || error?.message || 'Connection failed',
+      source: 'auth-probe',
+    };
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -2420,15 +2545,18 @@ async function restartClawUiService() {
     status: 'restarting',
     canCancel: false,
     serviceName,
-    message: `Restarting ${serviceName}.`,
+    message: `Restarting OpenClaw and ${serviceName}.`,
     rawDetail: null,
   });
-  appendUpdateLog(`Scheduling restart for ${serviceName}.`);
+  appendUpdateLog(`Scheduling restart for OpenClaw and ${serviceName}.`);
 
   setTimeout(() => {
-    execFilePromise('systemctl', ['--user', 'restart', serviceName, '--no-block'], {
-      maxBuffer: 1024 * 1024,
-    }).catch((error) => {
+    (async () => {
+      await scheduleGatewayRestart();
+      await execFilePromise('systemctl', ['--user', 'restart', serviceName, '--no-block'], {
+        maxBuffer: 1024 * 1024,
+      });
+    })().catch((error) => {
       const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
       patchUpdateSnapshot({
         status: 'restart_failed',
@@ -3411,9 +3539,15 @@ app.get('/api/openclaw/version/latest', async (_req, res) => {
 });
 
 app.get('/api/openclaw/update/status', requireAdminAuth, (_req, res) => {
-  res.json({
-    success: true,
-    update: buildOpenClawUpdateStatusResponse(),
+  (async () => {
+    const update = await buildOpenClawUpdateStatusResponseAsync();
+    res.json({
+      success: true,
+      update,
+    });
+  })().catch((error: any) => {
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(OPENCLAW_UPDATE_STATUS_FAILED_ERROR_CODE, detail));
   });
 });
 

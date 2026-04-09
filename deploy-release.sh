@@ -6,6 +6,8 @@ PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SKIP_SERVICE_RESTART=${CLAWUI_SKIP_SERVICE_RESTART:-0}
 
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 emit_phase() {
     echo "::clawui-update-phase::$1"
 }
@@ -45,10 +47,6 @@ emit_phase "patch-config"
 echo "Patching OpenClaw configuration for local backend connections..."
 node backend/patch-config.js || echo "Warning: Failed to patch OpenClaw config automatically."
 
-emit_phase "reconcile-openclaw-runtime"
-echo "Reconciling OpenClaw runtime after deploy..."
-node scripts/reconcile-openclaw-runtime.mjs
-
 emit_phase "setup-service"
 echo "Setting up systemd service..."
 mkdir -p "$SERVICE_DIR"
@@ -83,6 +81,14 @@ systemctl --user enable "$SERVICE_NAME.service"
 if [ "$SKIP_SERVICE_RESTART" = "1" ]; then
     echo "Skipping service restart because CLAWUI_SKIP_SERVICE_RESTART=1"
 else
+    emit_phase "restart-openclaw-runtime"
+    echo "Restarting OpenClaw gateway..."
+    if command -v openclaw >/dev/null 2>&1; then
+        openclaw gateway restart --json || openclaw gateway restart || echo "Warning: Failed to restart OpenClaw gateway automatically."
+    else
+        echo "Warning: openclaw command not found in PATH; skipped gateway restart."
+    fi
+
     emit_phase "service-restart"
     echo "Restarting service $SERVICE_NAME..."
     systemctl --user restart "$SERVICE_NAME.service"

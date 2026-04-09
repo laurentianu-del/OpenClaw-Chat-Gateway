@@ -588,6 +588,7 @@
       "updateProgressInstallingDependencies": "Preparing runtime dependencies",
       "updateProgressBuilding": "Building the new version",
       "updateProgressApplyingConfig": "Applying upgrade configuration",
+      "updateProgressRestartingOpenClaw": "Restarting the OpenClaw gateway",
       "updateProgressReconcilingRuntime": "Reconciling the OpenClaw runtime",
       "updateProgressRepairingDevice": "Restoring local device permissions",
       "updateProgressRecoveringBrowser": "Recovering the browser runtime",
