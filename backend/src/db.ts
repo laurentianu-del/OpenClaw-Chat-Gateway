@@ -334,7 +334,29 @@ export class DB {
   }
 
   deleteMessage(id: number) {
-    return this.db.prepare('DELETE FROM chat_messages WHERE id = ?').run(id);
+    const selectDescendantIds = this.db.prepare(`
+      WITH RECURSIVE subtree(id) AS (
+        SELECT ?
+        UNION ALL
+        SELECT child.id
+        FROM chat_messages child
+        JOIN subtree ON child.parent_id = subtree.id
+      )
+      SELECT id FROM subtree
+    `);
+
+    const deleteMany = this.db.transaction((messageId: number) => {
+      const ids = (selectDescendantIds.all(messageId) as Array<{ id: number }>).map((row) => row.id);
+      if (ids.length === 0) {
+        return [];
+      }
+
+      const placeholders = ids.map(() => '?').join(', ');
+      this.db.prepare(`DELETE FROM chat_messages WHERE id IN (${placeholders})`).run(...ids);
+      return ids;
+    });
+
+    return deleteMany(id);
   }
 
   private getCursorPage<T extends { id?: number }>(options: {

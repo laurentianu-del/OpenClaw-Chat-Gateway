@@ -56,6 +56,7 @@ app.use(express.json());
 
 const dataDir = process.env.CLAWUI_DATA_DIR || '.clawui';
 const uploadDir = path.join(process.env.HOME || '.', dataDir, 'uploads');
+const browserWarmupMarkerPath = path.join(process.env.HOME || '.', dataDir, 'browser-warmup.pending');
 fs.mkdirSync(uploadDir, { recursive: true });
 
 // OpenClaw media directory (screenshots, inbound files, etc.)
@@ -162,6 +163,8 @@ const BROWSER_HEALTH_SNAPSHOT_TIMEOUT_MS = 45000;
 const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
 const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
 const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
+const BROWSER_POST_RESTART_WARMUP_DELAY_MS = 8000;
+const BROWSER_POST_RESTART_WARMUP_MARKER_MAX_AGE_MS = 30 * 60 * 1000;
 const UPDATE_SCRIPT_URL = 'https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh';
 const UPDATE_PHASE_MARKER_PREFIX = '::clawui-update-phase::';
 const UPDATE_LOG_LIMIT = 200;
@@ -1331,6 +1334,7 @@ let browserTaskSnapshot: BrowserTaskSnapshot = {
   rawDetail: null,
   updatedAt: null,
 };
+let browserWarmupTask: Promise<void> | null = null;
 
 function getBrowserTaskSnapshot(): BrowserTaskSnapshot {
   return { ...browserTaskSnapshot };
@@ -1356,6 +1360,30 @@ function resetBrowserTaskSnapshot() {
 function ensureBrowserTaskIdle() {
   if (browserTaskSnapshot.status !== 'idle') {
     throw new StructuredRequestError(409, BROWSER_TASK_BUSY_ERROR_CODE, 'Another browser task is already running.');
+  }
+}
+
+function markBrowserWarmupRequested() {
+  try {
+    fs.mkdirSync(path.dirname(browserWarmupMarkerPath), { recursive: true });
+    fs.writeFileSync(browserWarmupMarkerPath, `${Date.now()}\n`);
+  } catch (error) {
+    console.warn('[BrowserWarmup] Failed to persist warmup marker:', error);
+  }
+}
+
+function consumeBrowserWarmupRequest() {
+  try {
+    if (!fs.existsSync(browserWarmupMarkerPath)) {
+      return false;
+    }
+
+    const stat = fs.statSync(browserWarmupMarkerPath);
+    fs.unlinkSync(browserWarmupMarkerPath);
+    return (Date.now() - stat.mtimeMs) <= BROWSER_POST_RESTART_WARMUP_MARKER_MAX_AGE_MS;
+  } catch (error) {
+    console.warn('[BrowserWarmup] Failed to consume warmup marker:', error);
+    return false;
   }
 }
 
@@ -2171,6 +2199,59 @@ async function waitForBrowserHealth(timeoutMs: number, reportProgress?: BrowserT
   return runBrowserHealthCheck(reportProgress);
 }
 
+async function runDeferredBrowserWarmupOnce() {
+  const reportProgress = (phase: string, rawDetail?: string | null) => {
+    updateBrowserTaskSnapshot({
+      status: 'checking',
+      phase,
+      rawDetail: normalizeCliText(rawDetail) || null,
+    });
+  };
+
+  reportProgress('read-config');
+  const readiness = await runBrowserRuntimeReadinessCheck(reportProgress);
+  if (readiness.ready) {
+    reportProgress('finalize');
+    console.log('[BrowserWarmup] Browser runtime is ready after restart.');
+    return;
+  }
+
+  const detail = readiness.detail
+    || readiness.diagnostics.rawDetail
+    || readiness.diagnostics.detectError
+    || 'Browser warmup did not complete.';
+  reportProgress('finalize', detail);
+  console.warn(`[BrowserWarmup] Browser warmup finished without readiness: ${detail}`);
+}
+
+function scheduleDeferredBrowserWarmup() {
+  if (browserWarmupTask) {
+    return browserWarmupTask;
+  }
+
+  browserWarmupTask = (async () => {
+    await sleep(BROWSER_POST_RESTART_WARMUP_DELAY_MS);
+
+    if (browserTaskSnapshot.status !== 'idle') {
+      console.log('[BrowserWarmup] Skipping deferred warmup because another browser task is running.');
+      return;
+    }
+
+    try {
+      await runDeferredBrowserWarmupOnce();
+    } catch (error: any) {
+      const detail = readCliErrorDetail(error) || error?.message || 'Deferred browser warmup failed';
+      console.warn(`[BrowserWarmup] ${detail}`);
+    } finally {
+      resetBrowserTaskSnapshot();
+    }
+  })().finally(() => {
+    browserWarmupTask = null;
+  });
+
+  return browserWarmupTask;
+}
+
 async function readBrowserHealthDiagnostics(
   browserConfig = readBrowserConfigState(),
   checkedAt = Date.now(),
@@ -2540,6 +2621,7 @@ async function restartClawUiService() {
   await execFilePromise('systemctl', ['--user', 'show', serviceName, '--property', 'LoadState'], {
     maxBuffer: 1024 * 1024,
   });
+  markBrowserWarmupRequested();
 
   patchUpdateSnapshot({
     status: 'restarting',
@@ -4745,8 +4827,8 @@ app.put('/api/messages/:id', (req, res) => {
 app.delete('/api/messages/:id', (req, res) => {
   const { id } = req.params;
   try {
-    db.deleteMessage(Number(id));
-    res.json({ success: true });
+    const deletedIds = db.deleteMessage(Number(id));
+    res.json({ success: true, deletedIds });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -6473,4 +6555,8 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 const PORT = Number(process.env.PORT) || 3100;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`ClawUI backend listening on http://0.0.0.0:${PORT}`);
+  if (consumeBrowserWarmupRequest()) {
+    console.log('[BrowserWarmup] Scheduling deferred browser warmup after restart.');
+    void scheduleDeferredBrowserWarmup();
+  }
 });

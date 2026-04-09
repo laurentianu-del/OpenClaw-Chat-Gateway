@@ -5,6 +5,7 @@ set -e
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_DIR="$HOME/.config/systemd/user"
 SKIP_SERVICE_RESTART=${CLAWUI_SKIP_SERVICE_RESTART:-0}
+BROWSER_WARMUP_MARKER="$HOME/${CLAWUI_DATA_DIR:-.clawui}/browser-warmup.pending"
 
 export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
@@ -91,6 +92,8 @@ else
 
     emit_phase "service-restart"
     echo "Restarting service $SERVICE_NAME..."
+    mkdir -p "$(dirname "$BROWSER_WARMUP_MARKER")"
+    touch "$BROWSER_WARMUP_MARKER"
     systemctl --user restart "$SERVICE_NAME.service"
 fi
 

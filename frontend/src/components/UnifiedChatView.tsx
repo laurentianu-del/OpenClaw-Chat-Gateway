@@ -2488,7 +2488,13 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       clearNewerHistoryWindowTrail();
       if (isChat) {
         const res = await fetch(`/api/messages/${messageToDelete}`, { method: 'DELETE' });
-        if (res.ok) setMessages(prev => prev.filter(m => m.id !== messageToDelete));
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          const deletedIds = Array.isArray(data?.deletedIds)
+            ? new Set<string>(data.deletedIds.map((id: number | string) => String(id)))
+            : new Set<string>([messageToDelete]);
+          setMessages(prev => prev.filter(m => !deletedIds.has(m.id)));
+        }
       } else if (isGroup && currentGroup) {
         await fetch(`/api/groups/${currentGroup.id}/messages/${messageToDelete}`, { method: 'DELETE' });
       }
