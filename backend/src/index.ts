@@ -165,6 +165,8 @@ const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
 const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
 const BROWSER_POST_RESTART_WARMUP_DELAY_MS = 8000;
 const BROWSER_POST_RESTART_WARMUP_MARKER_MAX_AGE_MS = 30 * 60 * 1000;
+const BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS = 3 * 60 * 1000;
+const BROWSER_HEADED_MODE_RESTART_POLL_INTERVAL_MS = 1500;
 const UPDATE_SCRIPT_URL = 'https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh';
 const UPDATE_PHASE_MARKER_PREFIX = '::clawui-update-phase::';
 const UPDATE_LOG_LIMIT = 200;
@@ -218,6 +220,11 @@ type BrowserRuntimeState = {
 type BrowserHeadedModeConfig = {
   headless: boolean;
   headedModeEnabled: boolean;
+};
+
+type PendingGatewayRuntimeConfig = {
+  maxPermissionsEnabled?: boolean;
+  browserHeadedModeEnabled?: boolean;
 };
 
 type BrowserHealthDiagnostics = Omit<BrowserHealthSnapshot, 'healthy' | 'issue' | 'validationSucceeded' | 'validationDetail'>;
@@ -2413,6 +2420,82 @@ async function restartGatewayService() {
   await execFilePromise(executablePath, ['gateway', 'restart']);
 }
 
+async function readOpenClawGatewayServiceRuntimeState() {
+  try {
+    const { stdout } = await execFilePromise(
+      'systemctl',
+      ['--user', 'show', 'openclaw-gateway.service', '-p', 'ExecMainPID', '-p', 'ActiveState', '-p', 'SubState', '--value'],
+      {
+        timeout: 15000,
+        maxBuffer: 1024 * 1024,
+      }
+    );
+    const [pidRaw = '', activeStateRaw = '', subStateRaw = ''] = stdout.split(/\r?\n/);
+    const parsedPid = Number.parseInt(normalizeCliText(pidRaw), 10);
+
+    return {
+      execMainPid: Number.isFinite(parsedPid) && parsedPid > 0 ? parsedPid : null,
+      activeState: normalizeCliText(activeStateRaw) || null,
+      subState: normalizeCliText(subStateRaw) || null,
+    };
+  } catch {
+    return {
+      execMainPid: null,
+      activeState: null,
+      subState: null,
+    };
+  }
+}
+
+function buildGatewayStatusProbeParams() {
+  const appConfig = configManager.getConfig();
+  const localGatewayConfig = readLocalGatewayRuntimeConfig();
+  const localPort = localGatewayConfig?.port ?? 18789;
+
+  return {
+    gatewayUrl: normalizeCliText(appConfig.gatewayUrl) || `ws://127.0.0.1:${localPort}`,
+    token: normalizeCliText(appConfig.token) || localGatewayConfig?.token || undefined,
+    password: normalizeCliText(appConfig.password) || localGatewayConfig?.password || undefined,
+  };
+}
+
+async function waitForGatewayRestartAfterBrowserModeChange(previousPid: number | null) {
+  const deadline = Date.now() + BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS;
+  const restartObservationDeadline = Date.now() + 12000;
+  let restartObserved = false;
+  let stableConnectedChecks = 0;
+  let lastFailure = 'OpenClaw restart in progress';
+
+  while (Date.now() < deadline) {
+    const runtimeState = await readOpenClawGatewayServiceRuntimeState();
+    if (previousPid !== null && runtimeState.execMainPid !== null && runtimeState.execMainPid !== previousPid) {
+      restartObserved = true;
+    }
+
+    if (runtimeState.activeState === 'failed') {
+      throw new Error('OpenClaw gateway service failed to restart.');
+    }
+
+    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    if (!probe.connected) {
+      restartObserved = true;
+      stableConnectedChecks = 0;
+      lastFailure = probe.message || lastFailure;
+    } else if (restartObserved) {
+      stableConnectedChecks += 1;
+      if (stableConnectedChecks >= 2) {
+        return;
+      }
+    } else if (Date.now() >= restartObservationDeadline) {
+      return;
+    }
+
+    await sleep(BROWSER_HEADED_MODE_RESTART_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(lastFailure || 'Timed out waiting for OpenClaw to restart.');
+}
+
 function scheduleGatewayRestart() {
   gatewayRestartQueued = true;
   if (gatewayRestartTask) {
@@ -4009,26 +4092,33 @@ app.post('/api/config/browser-headed-mode', (req, res) => {
     ));
   }
 
-  try {
-    const config = setBrowserHeadedModeEnabled(headedModeEnabled);
-    res.json({
-      success: true,
-      config,
-      restartQueued: true,
-    });
+  void (async () => {
+    try {
+      const currentConfig = readBrowserHeadedModeConfig();
+      if (currentConfig.headedModeEnabled === headedModeEnabled) {
+        return res.json({
+          success: true,
+          config: currentConfig,
+          restartCompleted: false,
+        });
+      }
 
-    void (async () => {
-      await stopOpenClawBrowserBestEffort();
-      await scheduleGatewayRestart();
-    })().catch((error: any) => {
-      console.error('[BrowserHeadedMode] Failed to apply browser mode update:', error?.message || error);
-    });
-  } catch (error: any) {
-    res.status(500).json(buildStructuredApiError(
-      BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
-      error?.message || 'Failed to update browser headed mode config'
-    ));
-  }
+      const previousRuntimeState = await readOpenClawGatewayServiceRuntimeState();
+      const config = setBrowserHeadedModeEnabled(headedModeEnabled);
+      await waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState.execMainPid);
+
+      res.json({
+        success: true,
+        config,
+        restartCompleted: true,
+      });
+    } catch (error: any) {
+      res.status(500).json(buildStructuredApiError(
+        BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
+        error?.message || 'Failed to update browser headed mode config'
+      ));
+    }
+  })();
 });
 
 app.post('/api/config/browser-health/self-heal', async (_req, res) => {
@@ -4093,11 +4183,7 @@ app.post('/api/config/max-permissions', (req, res) => {
   (async () => {
     const { enabled } = req.body;
     setMaxPermissionsEnabled(Boolean(enabled));
-    res.json({ success: true, enabled: Boolean(enabled) });
-
-    void scheduleGatewayRestart().catch((error: any) => {
-      console.error('[MaxPermissions] Failed to restart gateway after config update:', error?.message || error);
-    });
+    res.json({ success: true, enabled: Boolean(enabled), restartRequired: true });
   })().catch((error: any) => {
     res.status(500).json({ success: false, message: error.message });
   });
@@ -4105,19 +4191,9 @@ app.post('/api/config/max-permissions', (req, res) => {
 
 app.post('/api/config/restart', async (_req, res) => {
   try {
-    // Disconnect all active clients first
-    for (const [sessionId, client] of connections.entries()) {
-      try {
-        client.disconnect();
-      } catch (err) {
-        console.error(`Error disconnecting client ${sessionId}:`, err);
-      }
-    }
-    connections.clear();
-
-    // Execute the actual restart command on the system
-    const executablePath = await ensureResolvedOpenClawExecutablePath();
-    await execFilePromise(executablePath, ['gateway', 'restart']);
+    const previousRuntimeState = await readOpenClawGatewayServiceRuntimeState();
+    await restartGatewayService();
+    await waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState.execMainPid);
 
     res.json({ success: true, message: 'Gateway connections reset and service restarted' });
   } catch (error: any) {

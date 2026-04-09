@@ -110,10 +110,15 @@ type BrowserHealthNotice = {
   message: string;
 };
 
+type GatewayRestartNoticeSource = 'permissions' | 'browser' | null;
+
 type BrowserHeadedModeConfig = {
   headless: boolean;
   headedModeEnabled: boolean;
 };
+
+type RestartFlowModalStage = 'confirm' | 'restarting' | 'success' | 'failure' | null;
+type BrowserHeadedModeModalStage = RestartFlowModalStage;
 
 type BrowserTaskStatus = 'idle' | 'checking' | 'repairing';
 
@@ -256,6 +261,7 @@ const OPENCLAW_UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
 };
 
 const CONNECTION_STATUS_REFRESH_EVENT = 'clawui:refresh-connection-status';
+const UPDATE_RESTART_MODAL_TIMEOUT_MS = 5 * 60 * 1000;
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
@@ -293,7 +299,7 @@ function joinDistinctLines(values: Array<string | null | undefined>) {
   return lines.join('\n');
 }
 
-export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
+export default function SettingsView({ isConnected, settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
   const { t, i18n } = useTranslation();
 
   const openSettingsErrorModal = (message: string, detail = '') => {
@@ -325,12 +331,18 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [browserHealth, setBrowserHealth] = useState<BrowserHealthSnapshot | null>(null);
   const [browserHealthError, setBrowserHealthError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [browserHealthNotice, setBrowserHealthNotice] = useState<BrowserHealthNotice | null>(null);
+  const [gatewayRestartNoticeSource, setGatewayRestartNoticeSource] = useState<GatewayRestartNoticeSource>(null);
   const [isCheckingBrowserHealth, setIsCheckingBrowserHealth] = useState(false);
   const [isSelfHealingBrowser, setIsSelfHealingBrowser] = useState(false);
   const [browserTaskInfo, setBrowserTaskInfo] = useState<BrowserTaskInfo | null>(null);
   const [browserHeadedModeEnabled, setBrowserHeadedModeEnabled] = useState<boolean | null>(null);
   const [isLoadingBrowserHeadedMode, setIsLoadingBrowserHeadedMode] = useState(false);
   const [isTogglingBrowserHeadedMode, setIsTogglingBrowserHeadedMode] = useState(false);
+  const [browserHeadedModePendingEnabled, setBrowserHeadedModePendingEnabled] = useState<boolean | null>(null);
+  const [browserHeadedModeModalStage, setBrowserHeadedModeModalStage] = useState<BrowserHeadedModeModalStage>(null);
+  const [browserHeadedModeModalDetail, setBrowserHeadedModeModalDetail] = useState('');
+  const [gatewayRestartModalStage, setGatewayRestartModalStage] = useState<RestartFlowModalStage>(null);
+  const [gatewayRestartModalDetail, setGatewayRestartModalDetail] = useState('');
   const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
   const [appVersionError, setAppVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isLoadingAppVersion, setIsLoadingAppVersion] = useState(false);
@@ -345,8 +357,11 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
   const [updateStatusInfo, setUpdateStatusInfo] = useState<UpdateStatusInfo | null>(null);
+  const [updateRestartModalStage, setUpdateRestartModalStage] = useState<RestartFlowModalStage>(null);
+  const [updateRestartModalDetail, setUpdateRestartModalDetail] = useState('');
   const [isUpdateCancelModalOpen, setIsUpdateCancelModalOpen] = useState(false);
   const [isCancellingUpdate, setIsCancellingUpdate] = useState(false);
+  const updateRestartModalStartedAtRef = useRef<number | null>(null);
 
   // --- General settings state ---
   const [aiName, setAiName] = useState(() => t('settings.general.aiNamePlaceholder'));
@@ -899,7 +914,25 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
-  const handleRestartUpdatedService = async () => {
+  const handleRestartUpdatedService = () => {
+    if (updateRestartModalStage || updateStatusInfo?.status !== 'update_succeeded') {
+      return;
+    }
+    setUpdateRestartModalDetail('');
+    setUpdateRestartModalStage('confirm');
+  };
+
+  const closeUpdateRestartModal = () => {
+    if (updateRestartModalStage === 'restarting') return;
+    setUpdateRestartModalStage(null);
+    setUpdateRestartModalDetail('');
+    updateRestartModalStartedAtRef.current = null;
+  };
+
+  const handleConfirmRestartUpdatedService = async () => {
+    setUpdateRestartModalDetail('');
+    setUpdateRestartModalStage('restarting');
+    updateRestartModalStartedAtRef.current = Date.now();
     try {
       const res = await fetch('/api/update/restart-service', {
         method: 'POST',
@@ -909,13 +942,21 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const display = resolveStructuredErrorDisplay(data, t, 'settings.about.restartServiceFailed');
-        openSettingsErrorModal(display.message, display.detail);
+        setUpdateRestartModalDetail(joinDistinctLines([
+          display.message !== t('settings.about.restartServiceFailed') ? display.message : '',
+          display.detail,
+        ]));
+        setUpdateRestartModalStage('failure');
+        updateRestartModalStartedAtRef.current = null;
         return;
       }
       setUpdateStatusInfo(data.update as UpdateStatusInfo);
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
     } catch (error) {
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
-      openSettingsErrorModal(t('settings.about.restartServiceFailed'), detail);
+      setUpdateRestartModalDetail(detail);
+      setUpdateRestartModalStage('failure');
+      updateRestartModalStartedAtRef.current = null;
     }
   };
 
@@ -930,7 +971,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
 
     if (updateStatusInfo?.status === 'update_succeeded') {
-      void handleRestartUpdatedService();
+      handleRestartUpdatedService();
       return;
     }
 
@@ -1099,6 +1140,67 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       setIsCancellingOpenClawUpdate(false);
     }
   }, [openClawUpdateStatusInfo?.status]);
+
+  useEffect(() => {
+    if (updateRestartModalStage !== 'restarting') {
+      return;
+    }
+
+    if (updateStatusInfo?.status === 'restart_failed') {
+      setUpdateRestartModalDetail(joinDistinctLines([
+        updateStatusInfo.message,
+        updateStatusInfo.rawDetail,
+      ]));
+      setUpdateRestartModalStage('failure');
+      updateRestartModalStartedAtRef.current = null;
+      return;
+    }
+
+    if (updateStatusInfo?.status !== 'idle' || !isConnected) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      await fetchCurrentVersionInfo({ silent: true });
+      if (cancelled) return;
+      setUpdateRestartModalDetail('');
+      setUpdateRestartModalStage('success');
+      updateRestartModalStartedAtRef.current = null;
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isConnected,
+    updateRestartModalStage,
+    updateStatusInfo?.message,
+    updateStatusInfo?.rawDetail,
+    updateStatusInfo?.status,
+  ]);
+
+  useEffect(() => {
+    if (updateRestartModalStage !== 'restarting') {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      const startedAt = updateRestartModalStartedAtRef.current;
+      if (!startedAt) return;
+      if (Date.now() - startedAt < UPDATE_RESTART_MODAL_TIMEOUT_MS) {
+        return;
+      }
+
+      setUpdateRestartModalDetail(t('settings.about.restartServiceWaitTimeoutDetail'));
+      setUpdateRestartModalStage('failure');
+      updateRestartModalStartedAtRef.current = null;
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [t, updateRestartModalStage]);
 
   const fetchModels = async () => {
     try {
@@ -1486,28 +1588,50 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     return true;
   };
 
-  const handleRestartGateway = async () => {
+  const handleRestartGateway = () => {
+    if (!testResult?.success || isRestarting || gatewayRestartModalStage) {
+      return;
+    }
+    setRestartSuccess(false);
+    setGatewayRestartModalDetail('');
+    setGatewayRestartModalStage('confirm');
+  };
+
+  const closeGatewayRestartModal = () => {
+    if (gatewayRestartModalStage === 'restarting') return;
+    setGatewayRestartModalStage(null);
+    setGatewayRestartModalDetail('');
+  };
+
+  const handleConfirmRestartGateway = async () => {
     setIsRestarting(true);
     setRestartSuccess(false);
+    setGatewayRestartModalDetail('');
+    setGatewayRestartModalStage('restarting');
     try {
       const res = await fetch('/api/config/restart', { method: 'POST' });
       if (res.ok) {
         setRestartSuccess(true);
+        setGatewayRestartNoticeSource(null);
+        setGatewayRestartModalStage('success');
         setTimeout(() => setRestartSuccess(false), 3000);
       } else {
         const data = await res.json().catch(() => ({}));
         const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.restartFailed');
-        setGatewayErrorMessage(display.message);
-        setGatewayErrorDetail(display.detail);
-        setGatewayErrorModalOpen(true);
+        setGatewayRestartModalDetail(joinDistinctLines([
+          display.message !== t('settings.gateway.restartFailed') ? display.message : '',
+          display.detail,
+        ]));
+        setGatewayRestartModalStage('failure');
       }
     } catch (err) {
       console.error(err);
-      setGatewayErrorMessage(t('settings.gateway.restartNetworkError'));
-      setGatewayErrorDetail('');
-      setGatewayErrorModalOpen(true);
+      const detail = err instanceof Error && err.message.trim() ? err.message.trim() : '';
+      setGatewayRestartModalDetail(detail);
+      setGatewayRestartModalStage('failure');
     } finally {
       setIsRestarting(false);
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
     }
   };
 
@@ -1576,6 +1700,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     setMaxPermissions(nextEnabled);
     setIsTogglingPermissions(true);
     setBrowserHealthNotice(null);
+    setGatewayRestartNoticeSource(null);
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     try {
       const res = await fetch('/api/config/max-permissions', {
@@ -1587,6 +1712,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       if (res.ok && data.success) {
         setMaxPermissions(!!data.enabled);
         setBrowserHealth(null);
+        setGatewayRestartNoticeSource('permissions');
       } else {
         await fetchMaxPermissionsState().catch(() => {
           setMaxPermissions(!nextEnabled);
@@ -1663,35 +1789,59 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
   const handleToggleBrowserHeadedMode = async () => {
     if (browserHeadedModeEnabled === null) return;
+    setBrowserHeadedModePendingEnabled(!browserHeadedModeEnabled);
+    setBrowserHeadedModeModalDetail('');
+    setBrowserHeadedModeModalStage('confirm');
+  };
 
-    const nextHeadedModeEnabled = !browserHeadedModeEnabled;
-    setBrowserHeadedModeEnabled(nextHeadedModeEnabled);
+  const closeBrowserHeadedModeModal = () => {
+    if (browserHeadedModeModalStage === 'restarting') return;
+    setBrowserHeadedModeModalStage(null);
+    setBrowserHeadedModePendingEnabled(null);
+    setBrowserHeadedModeModalDetail('');
+  };
+
+  const handleConfirmBrowserHeadedModeToggle = async () => {
+    if (browserHeadedModePendingEnabled === null) return;
+
     setIsTogglingBrowserHeadedMode(true);
+    setBrowserHeadedModeModalDetail('');
+    setBrowserHeadedModeModalStage('restarting');
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
+    setGatewayRestartNoticeSource(null);
+    setBrowserHealth(null);
 
     try {
       const res = await fetch('/api/config/browser-headed-mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ headedModeEnabled: nextHeadedModeEnabled }),
+        body: JSON.stringify({ headedModeEnabled: browserHeadedModePendingEnabled }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success && data.config) {
         applyBrowserHeadedModeConfig(data.config as BrowserHeadedModeConfig);
-        setBrowserHealth(null);
+        await fetchBrowserHeadedModeState().catch(() => {});
+        setBrowserHeadedModeModalStage('success');
       } else {
-        await fetchBrowserHeadedModeState();
-        setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHeadedModeUpdateFailed'));
+        await fetchBrowserHeadedModeState().catch(() => {});
+        const display = resolveStructuredErrorDisplay(data, t, 'gateway.browserHeadedModeUpdateFailed');
+        setBrowserHealthError(display);
+        setBrowserHeadedModeModalDetail(display.detail);
+        setBrowserHeadedModeModalStage('failure');
       }
     } catch (err) {
-      await fetchBrowserHeadedModeState();
+      await fetchBrowserHeadedModeState().catch(() => {});
+      const detail = err instanceof Error && err.message.trim() ? err.message.trim() : '';
       setBrowserHealthError({
         message: t('gateway.browserHeadedModeUpdateFailed'),
-        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+        detail,
       });
+      setBrowserHeadedModeModalDetail(detail);
+      setBrowserHeadedModeModalStage('failure');
     } finally {
       setIsTogglingBrowserHeadedMode(false);
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
     }
   };
 
@@ -2722,6 +2872,69 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const openClawUpdateCancelModalMessage = openClawUpdateStatusInfo?.canCancel
     ? t('settings.openclawUpdate.updateCancelConfirmMessage')
     : t('settings.openclawUpdate.updateCancelUnavailableMessage');
+  const browserHeadedModeConfirmingEnable = browserHeadedModePendingEnabled === true;
+  const browserHeadedModeModalTitle = browserHeadedModeModalStage === 'confirm'
+    ? browserHeadedModeConfirmingEnable
+      ? t('settings.gateway.browserHeadedModeConfirmEnableTitle')
+      : t('settings.gateway.browserHeadedModeConfirmDisableTitle')
+    : browserHeadedModeModalStage === 'restarting'
+      ? t('settings.gateway.browserHeadedModeRestartingTitle')
+      : browserHeadedModeModalStage === 'success'
+        ? t('settings.gateway.browserHeadedModeRestartSuccessTitle')
+        : browserHeadedModeModalStage === 'failure'
+          ? t('settings.gateway.browserHeadedModeRestartFailedTitle')
+          : '';
+  const browserHeadedModeModalMessage = browserHeadedModeModalStage === 'confirm'
+    ? browserHeadedModeConfirmingEnable
+      ? t('settings.gateway.browserHeadedModeConfirmEnableMessage')
+      : t('settings.gateway.browserHeadedModeConfirmDisableMessage')
+    : browserHeadedModeModalStage === 'restarting'
+      ? t('settings.gateway.browserHeadedModeRestartingMessage')
+      : browserHeadedModeModalStage === 'success'
+        ? browserHeadedModeConfirmingEnable
+          ? t('settings.gateway.browserHeadedModeRestartSuccessEnableMessage')
+          : t('settings.gateway.browserHeadedModeRestartSuccessDisableMessage')
+        : browserHeadedModeModalStage === 'failure'
+          ? browserHeadedModeConfirmingEnable
+            ? t('settings.gateway.browserHeadedModeRestartFailedEnableMessage')
+            : t('settings.gateway.browserHeadedModeRestartFailedDisableMessage')
+          : '';
+  const gatewayRestartModalTitle = gatewayRestartModalStage === 'confirm'
+    ? t('settings.gateway.restartGatewayConfirmTitle')
+    : gatewayRestartModalStage === 'restarting'
+      ? t('settings.gateway.restartGatewayRestartingTitle')
+      : gatewayRestartModalStage === 'success'
+        ? t('settings.gateway.restartGatewayRestartSuccessTitle')
+        : gatewayRestartModalStage === 'failure'
+          ? t('settings.gateway.restartGatewayRestartFailedTitle')
+          : '';
+  const gatewayRestartModalMessage = gatewayRestartModalStage === 'confirm'
+    ? t('settings.gateway.restartGatewayConfirmMessage')
+    : gatewayRestartModalStage === 'restarting'
+      ? t('settings.gateway.restartGatewayRestartingMessage')
+      : gatewayRestartModalStage === 'success'
+        ? t('settings.gateway.restartGatewayRestartSuccessMessage')
+        : gatewayRestartModalStage === 'failure'
+          ? t('settings.gateway.restartGatewayRestartFailedMessage')
+          : '';
+  const updateRestartModalTitle = updateRestartModalStage === 'confirm'
+    ? t('settings.about.restartServiceConfirmTitle')
+    : updateRestartModalStage === 'restarting'
+      ? t('settings.about.restartServiceRestartingTitle')
+      : updateRestartModalStage === 'success'
+        ? t('settings.about.restartServiceRestartSuccessTitle')
+        : updateRestartModalStage === 'failure'
+          ? t('settings.about.restartServiceRestartFailedTitle')
+          : '';
+  const updateRestartModalMessage = updateRestartModalStage === 'confirm'
+    ? t('settings.about.restartServiceConfirmMessage')
+    : updateRestartModalStage === 'restarting'
+      ? t('settings.about.restartServiceRestartingMessage')
+      : updateRestartModalStage === 'success'
+        ? t('settings.about.restartServiceRestartSuccessMessage')
+        : updateRestartModalStage === 'failure'
+          ? t('settings.about.restartServiceRestartFailedMessage')
+          : '';
   const resolveProgressToneClasses = (tone: UpdateProgressTone) => (
     tone === 'success'
       ? {
@@ -3076,6 +3289,11 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                         />
                       </button>
                     </div>
+                    {gatewayRestartNoticeSource === 'permissions' && (
+                      <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+                        {t('settings.gateway.restartRequiredNotice')}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -3091,7 +3309,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                         role="switch"
                         aria-checked={browserHeadedModeEnabled === true}
                         aria-label={t('settings.gateway.browserHeadedModeLabel')}
-                        disabled={isLoadingBrowserHeadedMode || isTogglingBrowserHeadedMode || isLoading}
+                        disabled={isLoadingBrowserHeadedMode || isTogglingBrowserHeadedMode || isLoading || browserHeadedModeModalStage !== null || gatewayRestartModalStage === 'restarting' || updateRestartModalStage === 'restarting'}
                         onClick={handleToggleBrowserHeadedMode}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60 ${browserHeadedModeEnabled ? 'bg-blue-600' : 'bg-gray-200'}`}
                       >
@@ -3129,6 +3347,12 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                     {browserHealthNotice && (
                       <div className={`p-3 rounded-xl border text-sm ${browserHealthNotice.tone === 'success' ? 'bg-green-50 text-green-700 border-green-200' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
                         {browserHealthNotice.message}
+                      </div>
+                    )}
+
+                    {gatewayRestartNoticeSource === 'browser' && (
+                      <div className="p-3 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-700">
+                        {t('settings.gateway.restartRequiredNotice')}
                       </div>
                     )}
 
@@ -3262,7 +3486,7 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                 <div className="flex gap-2 sm:gap-3 items-center">
                   <button
                     onClick={handleRestartGateway}
-                    disabled={!testResult?.success || isRestarting}
+                    disabled={!testResult?.success || isRestarting || gatewayRestartModalStage !== null || browserHeadedModeModalStage === 'restarting' || updateRestartModalStage === 'restarting'}
                     className={`inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 text-sm font-medium rounded-xl transition-all ${ testResult?.success ? 'text-orange-600 bg-orange-50 hover:bg-orange-100 border border-orange-200' : 'text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed' }`}
                   >
                     {isRestarting ? <Loader2 className="w-4 h-4 animate-spin sm:block hidden" /> : <Loader2 className="w-4 h-4 sm:block hidden" />}
@@ -4081,6 +4305,203 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
         </div>
       </div>
+
+      {browserHeadedModeModalStage && (
+        <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full ${
+                browserHeadedModeModalStage === 'confirm'
+                  ? 'bg-amber-100'
+                  : browserHeadedModeModalStage === 'success'
+                    ? 'bg-emerald-100'
+                    : browserHeadedModeModalStage === 'failure'
+                      ? 'bg-red-100'
+                      : 'bg-blue-100'
+              }`}>
+                {browserHeadedModeModalStage === 'confirm' ? (
+                  <Activity className="h-6 w-6 text-amber-600" />
+                ) : browserHeadedModeModalStage === 'success' ? (
+                  <Check className="h-6 w-6 text-emerald-600" />
+                ) : browserHeadedModeModalStage === 'failure' ? (
+                  <X className="h-6 w-6 text-red-600" />
+                ) : (
+                  <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+                )}
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">{browserHeadedModeModalTitle}</h3>
+              <p className="text-sm text-gray-500 whitespace-pre-wrap">{browserHeadedModeModalMessage}</p>
+              {browserHeadedModeModalDetail && browserHeadedModeModalStage === 'failure' ? (
+                <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>
+                  <p className="whitespace-pre-wrap break-all text-xs text-gray-500">{browserHeadedModeModalDetail}</p>
+                </div>
+              ) : null}
+            </div>
+            {browserHeadedModeModalStage === 'confirm' ? (
+              <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeBrowserHeadedModeModal}
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmBrowserHeadedModeToggle()}
+                  className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {browserHeadedModeConfirmingEnable
+                    ? t('settings.gateway.browserHeadedModeConfirmEnableAction')
+                    : t('settings.gateway.browserHeadedModeConfirmDisableAction')}
+                </button>
+              </div>
+            ) : browserHeadedModeModalStage === 'success' || browserHeadedModeModalStage === 'failure' ? (
+              <div className="border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeBrowserHeadedModeModal}
+                  className="w-full rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {t('common.gotIt')}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {gatewayRestartModalStage && (
+        <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full ${
+                gatewayRestartModalStage === 'confirm'
+                  ? 'bg-amber-100'
+                  : gatewayRestartModalStage === 'success'
+                    ? 'bg-emerald-100'
+                    : gatewayRestartModalStage === 'failure'
+                      ? 'bg-red-100'
+                      : 'bg-blue-100'
+              }`}>
+                {gatewayRestartModalStage === 'confirm' ? (
+                  <Activity className="h-6 w-6 text-amber-600" />
+                ) : gatewayRestartModalStage === 'success' ? (
+                  <Check className="h-6 w-6 text-emerald-600" />
+                ) : gatewayRestartModalStage === 'failure' ? (
+                  <X className="h-6 w-6 text-red-600" />
+                ) : (
+                  <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+                )}
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">{gatewayRestartModalTitle}</h3>
+              <p className="text-sm text-gray-500 whitespace-pre-wrap">{gatewayRestartModalMessage}</p>
+              {gatewayRestartModalDetail && gatewayRestartModalStage === 'failure' ? (
+                <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>
+                  <p className="whitespace-pre-wrap break-all text-xs text-gray-500">{gatewayRestartModalDetail}</p>
+                </div>
+              ) : null}
+            </div>
+            {gatewayRestartModalStage === 'confirm' ? (
+              <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeGatewayRestartModal}
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmRestartGateway()}
+                  className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {t('settings.gateway.restartGatewayConfirmAction')}
+                </button>
+              </div>
+            ) : gatewayRestartModalStage === 'success' || gatewayRestartModalStage === 'failure' ? (
+              <div className="border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeGatewayRestartModal}
+                  className="w-full rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {t('common.gotIt')}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
+
+      {updateRestartModalStage && (
+        <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full ${
+                updateRestartModalStage === 'confirm'
+                  ? 'bg-amber-100'
+                  : updateRestartModalStage === 'success'
+                    ? 'bg-emerald-100'
+                    : updateRestartModalStage === 'failure'
+                      ? 'bg-red-100'
+                      : 'bg-blue-100'
+              }`}>
+                {updateRestartModalStage === 'confirm' ? (
+                  <Activity className="h-6 w-6 text-amber-600" />
+                ) : updateRestartModalStage === 'success' ? (
+                  <Check className="h-6 w-6 text-emerald-600" />
+                ) : updateRestartModalStage === 'failure' ? (
+                  <X className="h-6 w-6 text-red-600" />
+                ) : (
+                  <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+                )}
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">{updateRestartModalTitle}</h3>
+              <p className="text-sm text-gray-500 whitespace-pre-wrap">{updateRestartModalMessage}</p>
+              {updateRestartModalDetail && updateRestartModalStage === 'failure' ? (
+                <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>
+                  <p className="whitespace-pre-wrap break-all text-xs text-gray-500">{updateRestartModalDetail}</p>
+                </div>
+              ) : null}
+            </div>
+            {updateRestartModalStage === 'confirm' ? (
+              <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeUpdateRestartModal}
+                  className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50"
+                >
+                  {t('common.cancel')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmRestartUpdatedService()}
+                  className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {t('settings.about.restartServiceConfirmAction')}
+                </button>
+              </div>
+            ) : updateRestartModalStage === 'success' || updateRestartModalStage === 'failure' ? (
+              <div className="border-t border-gray-100 bg-gray-50 p-4">
+                <button
+                  type="button"
+                  onClick={closeUpdateRestartModal}
+                  className="w-full rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700"
+                >
+                  {t('common.gotIt')}
+                </button>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      )}
 
       {isOpenClawUpdateCancelModalOpen && (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
