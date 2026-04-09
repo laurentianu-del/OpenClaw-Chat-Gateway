@@ -209,6 +209,7 @@
     "installLibreOffice": "服务端未安装 LibreOffice，无法预览",
     "loadingPreview": "加载预览中...",
     "loadPdfFail": "加载 PDF 失败",
+    "loadEpubFail": "加载 EPUB 失败",
     "networkFail": "网络错误或跨域失败",
     "renderingDoc": "文档渲染中...",
     "unsupportedType": "该文件类型暂不支持预览",
@@ -217,6 +218,7 @@
     "loadFailStatus": "加载文件失败，状态码 {{status}}",
     "previewWordFail": "预览 Word 文件失败：{{message}}",
     "previewExcelFail": "预览 Excel 文件失败：{{message}}",
+    "previewEpubFail": "预览 EPUB 文件失败：{{message}}",
     "previewTextFail": "预览文本文件失败：{{message}}",
     "viewSource": "源码",
     "viewRendered": "渲染"

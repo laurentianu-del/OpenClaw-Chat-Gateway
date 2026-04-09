@@ -1,6 +1,6 @@
 {
   "name": "clawui",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "appName": "OpenClaw Chat Gateway",
   "description": "OpenClaw Web Client",
   "private": true,

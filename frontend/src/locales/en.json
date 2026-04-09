@@ -209,6 +209,7 @@
     "installLibreOffice": "LibreOffice is not installed on the server, preview is unavailable",
     "loadingPreview": "Loading preview...",
     "loadPdfFail": "Failed to load PDF",
+    "loadEpubFail": "Failed to load EPUB",
     "networkFail": "Network or cross-origin request failed",
     "renderingDoc": "Rendering document...",
     "unsupportedType": "This file type is not supported for preview",
@@ -217,6 +218,7 @@
     "loadFailStatus": "Failed to load file, status {{status}}",
     "previewWordFail": "Failed to preview Word file: {{message}}",
     "previewExcelFail": "Failed to preview Excel file: {{message}}",
+    "previewEpubFail": "Failed to preview EPUB file: {{message}}",
     "previewTextFail": "Failed to preview text file: {{message}}",
     "viewSource": "Source",
     "viewRendered": "Rendered"

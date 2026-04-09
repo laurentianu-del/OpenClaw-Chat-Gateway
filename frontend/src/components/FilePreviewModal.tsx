@@ -8,6 +8,7 @@ import remarkBreaks from 'remark-breaks';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
 import * as pdfjsLib from 'pdfjs-dist';
+import type { Book, Rendition } from 'epubjs';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
 import { getFileIconInfo } from '../utils/fileUtils';
 
@@ -65,7 +66,7 @@ function buildRenderedHtmlDocument(content: string): string {
 
 type PreviewState = 
   | { status: 'loading' }
-  | { status: 'ready'; type: 'image' | 'video' | 'audio' | 'pdf' | 'html' | 'text' | 'code' | 'unsupported'; content?: string; pdfUrl?: string; pdfData?: Uint8Array }
+  | { status: 'ready'; type: 'image' | 'video' | 'audio' | 'pdf' | 'html' | 'text' | 'code' | 'epub' | 'unsupported'; content?: string; pdfUrl?: string; pdfData?: Uint8Array; epubData?: ArrayBuffer }
   | { status: 'error'; message: string };
 
 // Cache capabilities result
@@ -84,7 +85,7 @@ async function getCapabilities(): Promise<{ libreoffice: boolean }> {
 }
 
 function getFileType(filename: string): string {
-  const cleanName = filename.replace(/[\uff08（(].*$/, '').trim();
+  const cleanName = filename.split(/[?#]/, 1)[0].trim();
   const ext = cleanName.split('.').pop()?.toLowerCase() || '';
   if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico'].includes(ext)) return 'image';
   if (['mp4', 'webm', 'ogg', 'mov', 'avi'].includes(ext)) return 'video';
@@ -94,13 +95,18 @@ function getFileType(filename: string): string {
   if (['xls', 'xlsx'].includes(ext)) return 'xlsx';
   if (ext === 'csv') return 'csv';
   if (['ppt', 'pptx'].includes(ext)) return 'pptx';
+  if (ext === 'epub') return 'epub';
   if (['txt', 'md', 'log', 'json', 'xml', 'yaml', 'yml', 'ini', 'cfg', 'conf'].includes(ext)) return 'text';
   if (['js', 'ts', 'jsx', 'tsx', 'py', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'rb', 'php', 'html', 'css', 'scss', 'less', 'sql', 'sh', 'bash', 'zsh'].includes(ext)) return 'code';
   return 'unknown';
 }
 
+function isLibreOfficeHintRelevant(fileType: string): boolean {
+  return ['docx', 'xlsx', 'csv', 'pptx'].includes(fileType);
+}
+
 function getFileExtension(filename: string): string {
-  const cleanName = filename.replace(/[\uff08（(].*$/, '').trim();
+  const cleanName = filename.split(/[?#]/, 1)[0].trim();
   return cleanName.split('.').pop()?.toLowerCase() || '';
 }
 
@@ -330,6 +336,118 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
   );
 }
 
+function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const bookRef = useRef<Book | null>(null);
+  const renditionRef = useRef<Rendition | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const { t } = useTranslation();
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadEpub = async () => {
+      if (!epubData) {
+        setError(t('filePreview.loadEpubFail'));
+        setLoading(false);
+        return;
+      }
+
+      try {
+        setLoading(true);
+        setError('');
+
+        const container = containerRef.current;
+        if (!container) return;
+        container.innerHTML = '';
+
+        const { default: createEpub } = await import('epubjs');
+        const book = createEpub(epubData);
+        bookRef.current = book;
+        await book.ready;
+        if (cancelled) return;
+
+        const rendition = book.renderTo(container, {
+          width: '100%',
+          height: '100%',
+          manager: 'continuous',
+          flow: 'scrolled-doc',
+          spread: 'none',
+        });
+        renditionRef.current = rendition;
+        rendition.themes.default({
+          body: {
+            margin: '0 auto',
+            padding: '24px 20px 40px',
+            color: '#1f2937',
+            background: '#ffffff',
+            'font-size': '16px',
+            'line-height': '1.85',
+            'word-break': 'break-word',
+          },
+          p: {
+            margin: '0 0 1em',
+          },
+          'img, svg, video': {
+            'max-width': '100%',
+            height: 'auto',
+          },
+          a: {
+            color: '#2563eb',
+          },
+        });
+        await rendition.display();
+        if (cancelled) return;
+
+        setLoading(false);
+      } catch (err: any) {
+        if (cancelled) return;
+        setError(t('filePreview.previewEpubFail', { message: err?.message || filename }));
+        setLoading(false);
+      }
+    };
+
+    void loadEpub();
+
+    return () => {
+      cancelled = true;
+      renditionRef.current?.destroy();
+      renditionRef.current = null;
+      bookRef.current?.destroy();
+      bookRef.current = null;
+      if (containerRef.current) {
+        containerRef.current.innerHTML = '';
+      }
+    };
+  }, [epubData, filename, t]);
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center gap-4 bg-white p-8 rounded-2xl max-w-md text-center">
+        <div className="w-16 h-16 rounded-2xl bg-red-100 flex items-center justify-center">
+          <X className="w-8 h-8 text-red-500" />
+        </div>
+        <p className="text-sm font-medium text-gray-600">{error}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[420px] h-full overflow-hidden">
+      {loading && (
+        <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
+          <div className="flex flex-col items-center gap-3 text-gray-500">
+            <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+            <span className="text-sm font-medium">{t('filePreview.renderingDoc')}</span>
+          </div>
+        </div>
+      )}
+      <div ref={containerRef} className="h-full w-full overflow-auto" />
+    </div>
+  );
+}
+
  export default function FilePreviewModal({ url, filename, onClose }: FilePreviewModalProps) {
   const [preview, setPreview] = useState<PreviewState>({ status: 'loading' });
   const [viewMode, setViewMode] = useState<'source' | 'render'>(() => getDefaultViewMode(filename));
@@ -410,6 +528,9 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
       case 'csv':
       case 'pptx':
         await loadOfficeFile(fileType);
+        return;
+      case 'epub':
+        await loadEpub();
         return;
       case 'text':
       case 'code':
@@ -530,6 +651,20 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
 
   }
 
+  async function loadEpub() {
+    try {
+      const response = await fetch(previewUrl);
+      if (!response.ok) {
+        throw new Error(response.status === 404 ? t('filePreview.fileNotFound') : t('filePreview.loadFailStatus', { status: response.status }));
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      setPreview({ status: 'ready', type: 'epub', epubData: arrayBuffer });
+    } catch (err: any) {
+      setPreview({ status: 'error', message: t('filePreview.previewEpubFail', { message: err.message }) });
+    }
+  }
+
   function handleDownload() {
     const link = document.createElement('a');
     link.href = url;
@@ -545,6 +680,7 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
   const isMarkdownFile = ['md', 'markdown'].includes(normalizedExt);
   const isHtmlFile = ['html', 'htm'].includes(normalizedExt);
   const isRenderedMode = supportsRenderToggle && viewMode === 'render';
+  const fileType = getFileType(filename);
   const renderedHtmlDocument = buildRenderedHtmlDocument(preview.status === 'ready' ? (preview.content || '') : '');
   const { Icon, typeText, bgColor } = getFileIconInfo(filename);
 
@@ -690,6 +826,12 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
           </ZoomableWrapper>
         )}
 
+        {preview.status === 'ready' && preview.type === 'epub' && (
+          <div className="w-full h-full overflow-hidden px-0 sm:px-0 py-0">
+            <EpubViewer epubData={preview.epubData} filename={filename} />
+          </div>
+        )}
+
         {preview.status === 'ready' && preview.type === 'html' && !isHtmlFile && (
           <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
             <div
@@ -744,9 +886,9 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
               <Icon className={`w-10 h-10 ${bgColor.replace('bg-', 'text-')}`} />
             </div>
              <div>
-              <p className="text-gray-900 font-bold text-xl mb-1">{filename}</p>
+             <p className="text-gray-900 font-bold text-xl mb-1">{filename}</p>
               <p className="text-gray-500 text-sm">{t('filePreview.unsupportedType')}</p>
-              {ext !== 'PDF' && (
+              {isLibreOfficeHintRelevant(fileType) && (
                 <p className="text-blue-500/60 text-xs mt-2 font-medium bg-blue-50 py-1 px-3 rounded-full inline-block">
                   {t('filePreview.installLibreOffice')}
                 </p>
