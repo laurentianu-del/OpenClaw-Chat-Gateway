@@ -5207,23 +5207,24 @@ function getLatestChatRegenerateTarget(sessionId: string): {
   latestReplyMessage: ChatRow | null;
 } {
   const recentHistory = db.getMessages(sessionId, CHAT_REGENERATE_LOOKBACK_LIMIT);
-  let latestReplyMessage: ChatRow | null = null;
-
-  for (let index = recentHistory.length - 1; index >= 0; index -= 1) {
-    const message = recentHistory[index];
-    if (message.role === 'assistant' || message.role === 'system') {
-      if (!latestReplyMessage) latestReplyMessage = message;
-      continue;
-    }
-
+  const latestUserMessage = [...recentHistory].reverse().find((message) => message.role === 'user') ?? null;
+  const latestUserId = typeof latestUserMessage?.id === 'number' ? latestUserMessage.id : null;
+  if (!latestUserMessage || latestUserId === null) {
     return {
-      latestUserMessage: message,
-      latestReplyMessage,
+      latestUserMessage: null,
+      latestReplyMessage: null,
     };
   }
 
+  const latestReplyMessage = [...recentHistory].reverse().find((message) => (
+    (message.role === 'assistant' || message.role === 'system')
+    && typeof message.id === 'number'
+    && message.id > latestUserId
+    && Number(message.parent_id) === latestUserId
+  )) ?? null;
+
   return {
-    latestUserMessage: null,
+    latestUserMessage,
     latestReplyMessage,
   };
 }
@@ -5380,17 +5381,11 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const { latestUserMessage, latestReplyMessage } = getLatestChatRegenerateTarget(sessionId);
     const latestUserId = Number(latestUserMessage?.id);
     const latestReplyParentId = Number(latestReplyMessage?.parent_id);
-    const hasConflictingLatestReply =
-      !!latestReplyMessage
-      && Number.isFinite(latestUserId)
-      && Number.isFinite(latestReplyParentId)
-      && latestReplyParentId !== numericParentId;
 
     if (
       !Number.isFinite(numericParentId)
       || !latestUserMessage
       || latestUserId !== numericParentId
-      || hasConflictingLatestReply
     ) {
       return res.status(409).json(buildStructuredChatHttpError('Regenerate is only allowed for the latest assistant reply.'));
     }
