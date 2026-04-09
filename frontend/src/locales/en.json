@@ -133,6 +133,17 @@
     "lookupFailed": "Failed to check the latest GitHub release",
     "directUpgradeUnsupported": "Direct browser upgrade is not available for this deployment. Upgrading requires a controlled server-side deploy script, dependency install, and service restart on the host machine."
   },
+  "openclawVersion": {
+    "lookupFailed": "Failed to check the latest OpenClaw version"
+  },
+  "openclawUpdate": {
+    "startFailed": "Failed to start the OpenClaw update",
+    "alreadyRunning": "An OpenClaw update task is already running",
+    "noNewVersion": "There is no newer OpenClaw version available",
+    "cancelFailed": "Failed to stop the OpenClaw update",
+    "notRunning": "There is no running OpenClaw update task to stop",
+    "resetFailed": "Failed to reset the OpenClaw update state"
+  },
   "agents": {
     "idRequired": "Agent ID is required",
     "idContainsWhitespace": "Agent ID cannot contain spaces",
@@ -509,6 +520,38 @@
         "rerank": "Rerank",
         "embed": "Embedding"
       }
+    },
+    "openclawUpdate": {
+      "title": "OpenClaw",
+      "checkNewVersion": "Check for Updates",
+      "checkUpdateAvailableButton": "New version found: {{version}}. Click to update.",
+      "checkUpToDateButton": "OpenClaw is already up to date.",
+      "checkRetryButton": "Check failed. Click to retry.",
+      "progressChecking": "Checking OpenClaw updates",
+      "progressDownloading": "Downloading the OpenClaw package",
+      "progressInstalling": "Installing the OpenClaw package",
+      "progressSwitchingEntrypoint": "Switching the OpenClaw command entrypoint",
+      "progressFinalizingPackage": "Finalizing the OpenClaw package files",
+      "progressUpdating": "Updating OpenClaw",
+      "progressClickToStopSuffix": ", click to stop",
+      "progressStopping": "Stopping the OpenClaw update",
+      "progressRepairingEntrypoint": "Repairing the OpenClaw command entrypoint",
+      "progressVerifying": "Verifying the OpenClaw version",
+      "progressFinishing": "Finalizing the OpenClaw update",
+      "updateSucceededButton": "OpenClaw updated successfully",
+      "updateFailedButton": "OpenClaw update failed. Click to retry.",
+      "updateStoppingButton": "Stopping the OpenClaw update",
+      "updateCancelConfirmTitle": "Stop this OpenClaw update?",
+      "updateCancelConfirmMessage": "The OpenClaw update is still running. Confirm to ask the server to stop this update flow.",
+      "updateCancelUnavailableTitle": "This stage cannot be stopped yet",
+      "updateCancelUnavailableMessage": "The current OpenClaw update stage cannot be stopped safely right now. Please wait for the current step to finish before trying again.",
+      "updateCancelConfirmAction": "Stop Update",
+      "updateCancelKeepRunning": "Keep Updating",
+      "latestVersionLoadFailed": "Failed to check the latest OpenClaw version",
+      "statusLoadFailed": "Failed to load the OpenClaw update status",
+      "updateStartFailed": "Failed to start the OpenClaw update",
+      "updateCancelFailed": "Failed to stop the OpenClaw update",
+      "updateResetFailed": "Failed to reset the OpenClaw update state"
     },
     "about": {
       "headerTitle": "Settings - About",

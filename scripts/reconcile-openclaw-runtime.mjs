@@ -69,6 +69,81 @@ function isExecutableFile(filePath) {
   }
 }
 
+function collectOpenClawPackageRoots() {
+  const moduleBaseDirs = [
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules'),
+  ];
+  const roots = [];
+  const seen = new Set();
+
+  const pushRoot = (candidate) => {
+    const normalized = normalizeText(candidate);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    roots.push(normalized);
+  };
+
+  for (const moduleBaseDir of moduleBaseDirs) {
+    pushRoot(path.join(moduleBaseDir, 'openclaw'));
+    try {
+      const stagedRoots = fs.readdirSync(moduleBaseDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && /^\.openclaw-/i.test(entry.name))
+        .map((entry) => {
+          const fullPath = path.join(moduleBaseDir, entry.name);
+          let mtimeMs = 0;
+          try {
+            mtimeMs = fs.statSync(fullPath).mtimeMs;
+          } catch {}
+          return { fullPath, mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      for (const stagedRoot of stagedRoots) {
+        pushRoot(stagedRoot.fullPath);
+      }
+    } catch {}
+  }
+
+  const globalBinPath = path.join(os.homedir(), '.npm-global', 'bin', OPENCLAW_EXECUTABLE);
+  try {
+    const resolvedFromBin = fs.realpathSync(globalBinPath);
+    pushRoot(path.dirname(resolvedFromBin));
+  } catch {}
+
+  return roots;
+}
+
+function collectOpenClawPackageEntryCandidates() {
+  const candidates = [];
+  const seen = new Set();
+
+  const pushCandidate = (candidate) => {
+    const normalized = normalizeText(candidate);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+
+  for (const packageRoot of collectOpenClawPackageRoots()) {
+    const packageJsonPath = path.join(packageRoot, 'package.json');
+    try {
+      if (fs.existsSync(packageJsonPath)) {
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+        if (typeof packageJson.bin === 'string') {
+          pushCandidate(path.join(packageRoot, packageJson.bin));
+        } else if (packageJson.bin && typeof packageJson.bin === 'object' && typeof packageJson.bin.openclaw === 'string') {
+          pushCandidate(path.join(packageRoot, packageJson.bin.openclaw));
+        }
+      }
+    } catch {}
+
+    pushCandidate(path.join(packageRoot, 'openclaw.mjs'));
+  }
+
+  return candidates;
+}
+
 function findOpenClawExecutable() {
   const candidates = [
     normalizeText(process.env.OPENCLAW_BIN),
@@ -81,6 +156,7 @@ function findOpenClawExecutable() {
     path.join(os.homedir(), '.local', 'bin', OPENCLAW_EXECUTABLE),
     '/usr/local/bin/openclaw',
     '/usr/bin/openclaw',
+    ...collectOpenClawPackageEntryCandidates(),
   ].filter(Boolean);
 
   const seen = new Set();
@@ -93,6 +169,134 @@ function findOpenClawExecutable() {
   }
 
   throw new Error(`OpenClaw CLI not found. Checked: ${Array.from(seen).join(', ')}`);
+}
+
+function findShellResolvedOpenClawCommand() {
+  const seen = new Set();
+  const pathEntries = normalizeText(process.env.PATH)
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const entry of pathEntries) {
+    const candidate = path.join(entry, OPENCLAW_EXECUTABLE);
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getPreferredOpenClawShellEntrypointPath() {
+  const homeDir = os.homedir();
+  const preferredDirs = [
+    path.join(homeDir, '.npm-global', 'bin'),
+    path.join(homeDir, '.local', 'bin'),
+  ];
+  const pathEntries = normalizeText(process.env.PATH)
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const preferredDir of preferredDirs) {
+    if (pathEntries.includes(preferredDir)) {
+      return path.join(preferredDir, OPENCLAW_EXECUTABLE);
+    }
+  }
+
+  return path.join(preferredDirs[0], OPENCLAW_EXECUTABLE);
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function buildOpenClawShellWrapperScript(resolvedExecutablePath) {
+  const preferredCandidates = [
+    normalizeText(resolvedExecutablePath),
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', 'openclaw', 'openclaw.mjs'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules', 'openclaw', 'openclaw.mjs'),
+  ].filter(Boolean);
+  const preferredCandidateLines = preferredCandidates
+    .map((candidate) => `  ${shellQuote(candidate)}`)
+    .join('\n');
+  const stagedBaseDirLines = [
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules'),
+  ].map((candidate) => `  ${shellQuote(candidate)}`).join('\n');
+
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+preferred_candidates=(
+${preferredCandidateLines}
+)
+
+staged_base_dirs=(
+${stagedBaseDirLines}
+)
+
+for candidate in "\${preferred_candidates[@]}"; do
+  if [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+for base_dir in "\${staged_base_dirs[@]}"; do
+  if [ ! -d "$base_dir" ]; then
+    continue
+  fi
+
+  while IFS= read -r candidate; do
+    if [ -x "$candidate" ]; then
+      exec "$candidate" "$@"
+    fi
+  done < <(ls -dt "$base_dir"/.openclaw-*/openclaw.mjs 2>/dev/null || true)
+done
+
+echo "OpenClaw CLI not found." >&2
+exit 127
+`;
+}
+
+async function canRunOpenClawExecutable(executablePath) {
+  try {
+    await runCommand(executablePath, ['--version'], {
+      timeout: 15000,
+      label: `${executablePath} --version`,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureOpenClawShellEntrypoint(executablePath) {
+  if (process.platform === 'win32') {
+    return null;
+  }
+
+  const shellResolvedPath = findShellResolvedOpenClawCommand();
+  if (shellResolvedPath && await canRunOpenClawExecutable(shellResolvedPath)) {
+    log(`OpenClaw shell entrypoint is healthy: ${shellResolvedPath}`);
+    return shellResolvedPath;
+  }
+
+  const shellEntrypointPath = getPreferredOpenClawShellEntrypointPath();
+  fs.mkdirSync(path.dirname(shellEntrypointPath), { recursive: true });
+  fs.rmSync(shellEntrypointPath, { force: true });
+  fs.writeFileSync(shellEntrypointPath, buildOpenClawShellWrapperScript(executablePath), { mode: 0o755 });
+  fs.chmodSync(shellEntrypointPath, 0o755);
+
+  if (!await canRunOpenClawExecutable(shellEntrypointPath)) {
+    throw new Error(`Failed to repair the OpenClaw shell entrypoint at ${shellEntrypointPath}.`);
+  }
+
+  log(`Repaired OpenClaw shell entrypoint: ${shellEntrypointPath}`);
+  return shellEntrypointPath;
 }
 
 function parseJsonPayload(text) {
@@ -405,6 +609,7 @@ async function main() {
 
   const executablePath = findOpenClawExecutable();
   log(`Using OpenClaw CLI: ${executablePath}`);
+  await ensureOpenClawShellEntrypoint(executablePath);
 
   await ensureGatewayServiceAligned(executablePath);
   await reconcileLocalDeviceRepairs(executablePath);

@@ -153,6 +153,17 @@ type LatestVersionInfo = {
   upgradeReason: string | null;
 };
 
+type OpenClawLatestVersionInfo = {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  status: 'update_available' | 'up_to_date';
+  channel: string | null;
+  channelLabel: string | null;
+  installKind: string | null;
+  packageManager: string | null;
+};
+
 type UpdateStatus =
   | 'idle'
   | 'has_update'
@@ -176,6 +187,27 @@ type UpdateStatusInfo = {
   startedAt: string | null;
   updatedAt: string | null;
   serviceName: string | null;
+};
+
+type OpenClawUpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'updating'
+  | 'stopping'
+  | 'update_succeeded'
+  | 'update_failed';
+
+type OpenClawUpdateStatusInfo = {
+  status: OpenClawUpdateStatus;
+  phase: string | null;
+  canCancel: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+  message: string | null;
+  rawDetail: string | null;
+  logs: string[];
+  startedAt: string | null;
+  updatedAt: string | null;
 };
 
 const EMPTY_INLINE_ERROR: InlineErrorState = { message: '', detail: '' };
@@ -207,6 +239,19 @@ const UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
   'setup-service': { progress: 96, labelKey: 'settings.about.updateProgressSettingUpService' },
   'service-restart': { progress: 98, labelKey: 'settings.about.updateProgressSettingUpService' },
   'complete': { progress: 100, labelKey: 'settings.about.updateProgressFinishing' },
+};
+
+const OPENCLAW_UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
+  'checking-status': { progress: 12, labelKey: 'settings.openclawUpdate.progressChecking' },
+  'download-package': { progress: 28, labelKey: 'settings.openclawUpdate.progressDownloading' },
+  'install-package': { progress: 52, labelKey: 'settings.openclawUpdate.progressInstalling' },
+  'switch-command-entrypoint': { progress: 72, labelKey: 'settings.openclawUpdate.progressInstalling' },
+  'finalize-update': { progress: 84, labelKey: 'settings.openclawUpdate.progressInstalling' },
+  'running-update': { progress: 52, labelKey: 'settings.openclawUpdate.progressInstalling' },
+  'stopping-update': { progress: 72, labelKey: 'settings.openclawUpdate.progressStopping' },
+  'repair-command-entrypoint': { progress: 92, labelKey: 'settings.openclawUpdate.progressRepairingEntrypoint' },
+  'verifying-version': { progress: 96, labelKey: 'settings.openclawUpdate.progressVerifying' },
+  'complete': { progress: 100, labelKey: 'settings.openclawUpdate.progressFinishing' },
 };
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
@@ -286,6 +331,13 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
   const [appVersionError, setAppVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isLoadingAppVersion, setIsLoadingAppVersion] = useState(false);
+  const [openClawLatestVersionInfo, setOpenClawLatestVersionInfo] = useState<OpenClawLatestVersionInfo | null>(null);
+  const [openClawLatestVersionError, setOpenClawLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isCheckingOpenClawLatestVersion, setIsCheckingOpenClawLatestVersion] = useState(false);
+  const [openClawUpdateStatusInfo, setOpenClawUpdateStatusInfo] = useState<OpenClawUpdateStatusInfo | null>(null);
+  const [isStartingOpenClawUpdate, setIsStartingOpenClawUpdate] = useState(false);
+  const [isOpenClawUpdateCancelModalOpen, setIsOpenClawUpdateCancelModalOpen] = useState(false);
+  const [isCancellingOpenClawUpdate, setIsCancellingOpenClawUpdate] = useState(false);
   const [latestVersionInfo, setLatestVersionInfo] = useState<LatestVersionInfo | null>(null);
   const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
@@ -446,14 +498,18 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     fetchMaxPermissionsState().catch(console.error);
   }, []);
 
-  const fetchCurrentVersionInfo = async () => {
-    setIsLoadingAppVersion(true);
-    setAppVersionError(EMPTY_INLINE_ERROR);
+  const fetchCurrentVersionInfo = async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setIsLoadingAppVersion(true);
+      setAppVersionError(EMPTY_INLINE_ERROR);
+    }
     try {
       const res = await fetch('/api/version');
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setAppVersionError(resolveStructuredErrorDisplay(data, t, 'settings.about.currentVersionLoadFailed'));
+        if (!options?.silent) {
+          setAppVersionError(resolveStructuredErrorDisplay(data, t, 'settings.about.currentVersionLoadFailed'));
+        }
         setAppVersionInfo(null);
         return null;
       }
@@ -463,14 +519,18 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       return versionInfo;
     } catch (error) {
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
-      setAppVersionError({
-        message: t('settings.about.currentVersionLoadFailed'),
-        detail,
-      });
+      if (!options?.silent) {
+        setAppVersionError({
+          message: t('settings.about.currentVersionLoadFailed'),
+          detail,
+        });
+      }
       setAppVersionInfo(null);
       return null;
     } finally {
-      setIsLoadingAppVersion(false);
+      if (!options?.silent) {
+        setIsLoadingAppVersion(false);
+      }
     }
   };
 
@@ -511,6 +571,211 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         });
       }
       return null;
+    }
+  };
+
+  const fetchOpenClawUpdateStatus = async (options?: { quiet?: boolean }) => {
+    try {
+      const res = await fetch('/api/openclaw/update/status', {
+        headers: buildUpdateRequestHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (!options?.quiet) {
+          const display = resolveStructuredErrorDisplay(data, t, 'settings.openclawUpdate.statusLoadFailed');
+          setOpenClawLatestVersionError(display);
+        }
+        return null;
+      }
+      const nextUpdate = data.update as OpenClawUpdateStatusInfo;
+      setOpenClawUpdateStatusInfo(nextUpdate);
+      return nextUpdate;
+    } catch (error) {
+      if (!options?.quiet) {
+        const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+        setOpenClawLatestVersionError({
+          message: t('settings.openclawUpdate.statusLoadFailed'),
+          detail,
+        });
+      }
+      return null;
+    }
+  };
+
+  const fetchOpenClawLatestVersion = async (options?: { quiet?: boolean }) => {
+    try {
+      const res = await fetch('/api/openclaw/version/latest');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (!options?.quiet) {
+          setOpenClawLatestVersionError(resolveStructuredErrorDisplay(data, t, 'settings.openclawUpdate.latestVersionLoadFailed'));
+        }
+        return null;
+      }
+      const latestData = data as OpenClawLatestVersionInfo;
+      setOpenClawLatestVersionInfo(latestData);
+      return latestData;
+    } catch (error) {
+      if (!options?.quiet) {
+        const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+        setOpenClawLatestVersionError({
+          message: t('settings.openclawUpdate.latestVersionLoadFailed'),
+          detail,
+        });
+      }
+      return null;
+    }
+  };
+
+  const handleCheckOpenClawLatestVersion = async () => {
+    setIsCheckingOpenClawLatestVersion(true);
+    setOpenClawLatestVersionError(EMPTY_INLINE_ERROR);
+    try {
+      await fetchOpenClawLatestVersion();
+    } finally {
+      setIsCheckingOpenClawLatestVersion(false);
+    }
+  };
+
+  const handleStartOpenClawUpdate = async () => {
+    if (isStartingOpenClawUpdate || ['checking', 'updating', 'stopping'].includes(openClawUpdateStatusInfo?.status || '')) {
+      return;
+    }
+
+    const previousUpdateStatusInfo = openClawUpdateStatusInfo;
+    setIsStartingOpenClawUpdate(true);
+    setOpenClawLatestVersionError(EMPTY_INLINE_ERROR);
+    setOpenClawUpdateStatusInfo((current) => ({
+      status: 'updating',
+      phase: 'download-package',
+      canCancel: true,
+      currentVersion: current?.currentVersion || openClawLatestVersionInfo?.currentVersion || appVersionInfo?.openclawVersion || null,
+      latestVersion: current?.latestVersion || openClawLatestVersionInfo?.latestVersion || null,
+      message: t('settings.openclawUpdate.progressDownloading'),
+      rawDetail: null,
+      logs: current?.logs || [],
+      startedAt: current?.startedAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }));
+
+    try {
+      const res = await fetch('/api/openclaw/update/start', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if ((data as { errorCode?: string })?.errorCode === 'openclawUpdate.alreadyRunning') {
+          const runningStatus = await fetchOpenClawUpdateStatus({ quiet: true });
+          if (runningStatus) {
+            setOpenClawLatestVersionError(EMPTY_INLINE_ERROR);
+            return;
+          }
+        }
+        setOpenClawUpdateStatusInfo(previousUpdateStatusInfo);
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.openclawUpdate.updateStartFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return;
+      }
+      setOpenClawLatestVersionError(EMPTY_INLINE_ERROR);
+      setOpenClawUpdateStatusInfo(data.update as OpenClawUpdateStatusInfo);
+    } catch (error) {
+      setOpenClawUpdateStatusInfo(previousUpdateStatusInfo);
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.openclawUpdate.updateStartFailed'), detail);
+    } finally {
+      setIsStartingOpenClawUpdate(false);
+    }
+  };
+
+  const handleCancelOpenClawUpdate = async () => {
+    setIsCancellingOpenClawUpdate(true);
+    try {
+      const res = await fetch('/api/openclaw/update/cancel', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.openclawUpdate.updateCancelFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return false;
+      }
+      setOpenClawUpdateStatusInfo(data.update as OpenClawUpdateStatusInfo);
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.openclawUpdate.updateCancelFailed'), detail);
+      return false;
+    } finally {
+      setIsCancellingOpenClawUpdate(false);
+    }
+  };
+
+  const handleResetOpenClawUpdateState = async () => {
+    try {
+      const res = await fetch('/api/openclaw/update/reset', {
+        method: 'POST',
+        headers: buildUpdateRequestHeaders(true),
+        body: '{}',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.openclawUpdate.updateResetFailed');
+        openSettingsErrorModal(display.message, display.detail);
+        return false;
+      }
+      setOpenClawUpdateStatusInfo(data.update as OpenClawUpdateStatusInfo);
+      return true;
+    } catch (error) {
+      const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
+      openSettingsErrorModal(t('settings.openclawUpdate.updateResetFailed'), detail);
+      return false;
+    }
+  };
+
+  const handleOpenClawLatestVersionAction = () => {
+    if (isStartingOpenClawUpdate) {
+      return;
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'checking' || openClawUpdateStatusInfo?.status === 'stopping') {
+      return;
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'updating') {
+      setIsOpenClawUpdateCancelModalOpen(true);
+      return;
+    }
+
+    if (openClawLatestVersionInfo?.status === 'update_available') {
+      void handleStartOpenClawUpdate();
+      return;
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'update_failed') {
+      void (async () => {
+        const reset = await handleResetOpenClawUpdateState();
+        if (reset) {
+          await handleCheckOpenClawLatestVersion();
+        }
+      })();
+      return;
+    }
+
+    void handleCheckOpenClawLatestVersion();
+  };
+
+  const handleConfirmCancelOpenClawUpdate = async () => {
+    if (!openClawUpdateStatusInfo?.canCancel || openClawUpdateStatusInfo.status !== 'updating') {
+      return;
+    }
+
+    const cancelled = await handleCancelOpenClawUpdate();
+    if (cancelled) {
+      setIsOpenClawUpdateCancelModalOpen(false);
     }
   };
 
@@ -696,6 +961,11 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   }, [settingsTab]);
 
   useEffect(() => {
+    if (settingsTab !== 'about') return;
+    void fetchOpenClawUpdateStatus({ quiet: true });
+  }, [settingsTab]);
+
+  useEffect(() => {
     if (settingsTab !== 'gateway') return;
     void fetchBrowserHeadedModeState();
     void fetchBrowserTaskStatus({ quiet: true });
@@ -741,6 +1011,53 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   }, [settingsTab, updateStatusInfo?.status]);
 
   useEffect(() => {
+    if (settingsTab !== 'about') return;
+    const activeStatus = openClawUpdateStatusInfo?.status;
+    if (isStartingOpenClawUpdate) {
+      return;
+    }
+    if (activeStatus === 'update_succeeded') {
+      void (async () => {
+        await fetchCurrentVersionInfo({ silent: true });
+        const latest = await fetchOpenClawLatestVersion({ quiet: true });
+        if (latest) {
+          setOpenClawLatestVersionInfo(latest);
+        }
+        await handleResetOpenClawUpdateState();
+      })();
+      return;
+    }
+    if (!activeStatus || !['checking', 'updating', 'stopping'].includes(activeStatus)) {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      const nextUpdate = await fetchOpenClawUpdateStatus({ quiet: true });
+      if (cancelled || !nextUpdate) return;
+
+      if (activeStatus === 'stopping' && nextUpdate.status === 'idle') {
+        await fetchCurrentVersionInfo({ silent: true });
+        const latest = await fetchOpenClawLatestVersion({ quiet: true });
+        if (latest) {
+          setOpenClawLatestVersionInfo(latest);
+        }
+        return;
+      }
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [settingsTab, openClawUpdateStatusInfo?.status, isStartingOpenClawUpdate]);
+
+  useEffect(() => {
     if (settingsTab !== 'gateway') return;
     const activeStatus = browserTaskInfo?.status;
     if (!activeStatus || !['checking', 'repairing'].includes(activeStatus)) {
@@ -770,6 +1087,13 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       setIsCancellingUpdate(false);
     }
   }, [updateStatusInfo?.status]);
+
+  useEffect(() => {
+    if (openClawUpdateStatusInfo?.status !== 'updating') {
+      setIsOpenClawUpdateCancelModalOpen(false);
+      setIsCancellingOpenClawUpdate(false);
+    }
+  }, [openClawUpdateStatusInfo?.status]);
 
   const fetchModels = async () => {
     try {
@@ -1123,10 +1447,11 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     }
   };
 
-  const handleDetectAll = async () => {
+  const detectGatewayConfig = async (options?: { silent?: boolean }) => {
     setIsDetectingAll(true);
-    setDetectError('');
-    setDetectedOpenClawVersion('');
+    if (!options?.silent) {
+      setDetectError('');
+    }
     try {
       const res = await fetch('/api/config/detect-all');
       const data = await res.json();
@@ -1136,6 +1461,9 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
         if (data.data.password) setPassword(data.data.password);
         setDetectedOpenClawVersion(typeof data.data.openclawVersion === 'string' ? data.data.openclawVersion : '');
       } else {
+        if (options?.silent) {
+          return false;
+        }
         const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.detectFailed');
         setDetectError(display.message);
         if (display.detail) {
@@ -1144,10 +1472,13 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       }
     } catch (err) {
       console.error(err);
-      setDetectError(t('settings.gateway.detectNetworkError'));
+      if (!options?.silent) {
+        setDetectError(t('settings.gateway.detectNetworkError'));
+      }
     } finally {
       setIsDetectingAll(false);
     }
+    return true;
   };
 
   const handleRestartGateway = async () => {
@@ -1979,19 +2310,66 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
   const currentPrimaryModelId = models.find((model) => model.primary)?.id || '';
 
   const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
+  const openClawCurrentVersion = detectedOpenClawVersion
+    || appVersionInfo?.openclawVersion
+    || openClawLatestVersionInfo?.currentVersion
+    || '';
+  const isAppUpdateFlowActive = isCheckingLatestVersion
+    || ['checking', 'updating', 'stopping', 'restarting'].includes(updateStatusInfo?.status || '');
+  const isOpenClawUpdateFlowActive = isCheckingOpenClawLatestVersion
+    || isStartingOpenClawUpdate
+    || ['checking', 'updating', 'stopping'].includes(openClawUpdateStatusInfo?.status || '');
+  const isAppUpdateBlockedByOpenClaw = !isAppUpdateFlowActive && isOpenClawUpdateFlowActive;
+  const isOpenClawUpdateBlockedByApp = !isOpenClawUpdateFlowActive && isAppUpdateFlowActive;
+  const openClawEffectiveLatestVersion = openClawLatestVersionInfo?.latestVersion || openClawUpdateStatusInfo?.latestVersion || null;
   const effectiveLatestVersion = latestVersionInfo?.latestVersion || updateStatusInfo?.latestVersion || null;
   const updatePhaseVisual = updateStatusInfo?.phase && UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
     ? UPDATE_PHASE_VISUALS[updateStatusInfo.phase]
     : { progress: 8, labelKey: 'settings.about.updateProgressPreparing' };
+  const openClawPhaseVisual = openClawUpdateStatusInfo?.phase && OPENCLAW_UPDATE_PHASE_VISUALS[openClawUpdateStatusInfo.phase]
+    ? OPENCLAW_UPDATE_PHASE_VISUALS[openClawUpdateStatusInfo.phase]
+    : { progress: 8, labelKey: 'settings.openclawUpdate.progressChecking' };
   const updateFailureDetail = joinDistinctLines([
     updateStatusInfo?.rawDetail,
     updateStatusInfo?.message,
   ]);
+  const openClawUpdateFailureDetail = joinDistinctLines([
+    openClawUpdateStatusInfo?.rawDetail,
+    openClawUpdateStatusInfo?.message,
+  ]);
+  const openClawUpdateLatestLog = openClawUpdateStatusInfo?.logs?.length
+    ? openClawUpdateStatusInfo.logs[openClawUpdateStatusInfo.logs.length - 1]
+    : '';
+  const openClawUpdateActiveDetail = ['checking', 'updating', 'stopping'].includes(openClawUpdateStatusInfo?.status || '')
+    ? joinDistinctLines([
+      openClawUpdateLatestLog,
+      openClawUpdateStatusInfo?.message,
+    ])
+    : '';
   const updateCheckDetail = joinDistinctLines([
     latestVersionError.detail,
     latestVersionError.message,
   ]);
-  const updateProgressVisual = (() => {
+  const openClawCheckDetail = joinDistinctLines([
+    openClawLatestVersionError.detail,
+    openClawLatestVersionError.message,
+  ]);
+  const applyMutualExclusionToVisual = <T extends {
+    clickable: boolean;
+    muted?: boolean;
+  }>(visual: T, blocked: boolean): T => (
+    blocked
+      ? {
+        ...visual,
+        clickable: false,
+        muted: true,
+      }
+      : {
+        ...visual,
+        muted: false,
+      }
+  );
+  const updateProgressVisual = applyMutualExclusionToVisual((() => {
     const baseProgress = updatePhaseVisual.progress;
     const clickableIdle = !isCheckingLatestVersion;
 
@@ -2163,42 +2541,155 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
       showSpinner: false,
       icon: 'activity' as const,
     };
-  })();
-  const updateProgressToneClasses = updateProgressVisual.tone === 'success'
-    ? {
-      container: 'border-emerald-200 bg-emerald-50',
-      hover: 'hover:bg-emerald-100',
-      text: 'text-emerald-700',
-      icon: 'text-emerald-600',
-      fill: 'bg-emerald-200/90',
-      detail: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+  })(), isAppUpdateBlockedByOpenClaw);
+  const openClawUpdateProgressVisual = applyMutualExclusionToVisual((() => {
+    if (isStartingOpenClawUpdate) {
+      return {
+        progress: Math.max(openClawPhaseVisual.progress, 18),
+        label: t(openClawPhaseVisual.labelKey),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
     }
-    : updateProgressVisual.tone === 'error'
-      ? {
-        container: 'border-red-200 bg-red-50',
-        hover: 'hover:bg-red-100',
-        text: 'text-red-700',
-        icon: 'text-red-600',
-        fill: 'bg-red-200/90',
-        detail: 'border-red-200 bg-red-50 text-red-700',
-      }
-      : updateProgressVisual.tone === 'brand'
-        ? {
-          container: 'border-blue-200 bg-blue-50',
-          hover: 'hover:bg-blue-100',
-          text: 'text-[#2563eb]',
-          icon: 'text-[#2563eb]',
-          fill: 'bg-blue-200/90',
-          detail: 'border-blue-200 bg-blue-50 text-[#2563eb]',
-        }
-        : {
-          container: 'border-blue-200 bg-blue-50',
-          hover: 'hover:bg-blue-100',
-          text: 'text-[#2563eb]',
-          icon: 'text-[#2563eb]',
-          fill: 'bg-blue-200/90',
-          detail: 'border-blue-200 bg-blue-50 text-[#2563eb]',
-        };
+
+    if (openClawUpdateStatusInfo?.status === 'checking') {
+      return {
+        progress: Math.max(openClawPhaseVisual.progress, 18),
+        label: openClawUpdateStatusInfo.canCancel
+          ? `${t(openClawPhaseVisual.labelKey)}${t('settings.openclawUpdate.progressClickToStopSuffix')}`
+          : t(openClawPhaseVisual.labelKey),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: openClawUpdateStatusInfo.canCancel,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'updating') {
+      return {
+        progress: Math.max(openClawPhaseVisual.progress, 18),
+        label: openClawUpdateStatusInfo.canCancel
+          ? `${t(openClawPhaseVisual.labelKey)}${t('settings.openclawUpdate.progressClickToStopSuffix')}`
+          : t(openClawPhaseVisual.labelKey),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: openClawUpdateStatusInfo.canCancel,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'stopping') {
+      return {
+        progress: Math.max(openClawPhaseVisual.progress, 24),
+        label: t('settings.openclawUpdate.progressStopping'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'update_succeeded') {
+      return {
+        progress: 100,
+        label: t('settings.openclawUpdate.updateSucceededButton'),
+        detail: '',
+        tone: 'success' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: false,
+        icon: 'success' as const,
+      };
+    }
+
+    if (openClawUpdateStatusInfo?.status === 'update_failed') {
+      return {
+        progress: Math.max(openClawPhaseVisual.progress, 12),
+        label: t('settings.openclawUpdate.updateFailedButton'),
+        detail: openClawUpdateFailureDetail,
+        tone: 'error' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'error' as const,
+      };
+    }
+
+    if (isCheckingOpenClawLatestVersion) {
+      return {
+        progress: 12,
+        label: t('settings.openclawUpdate.progressChecking'),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: false,
+        showSpinner: true,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (openClawLatestVersionInfo?.status === 'update_available') {
+      return {
+        progress: 0,
+        label: t('settings.openclawUpdate.checkUpdateAvailableButton', {
+          version: openClawEffectiveLatestVersion || t('settings.about.unavailable'),
+        }),
+        detail: '',
+        tone: 'brand' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'activity' as const,
+      };
+    }
+
+    if (openClawLatestVersionInfo?.status === 'up_to_date') {
+      return {
+        progress: 100,
+        label: t('settings.openclawUpdate.checkUpToDateButton'),
+        detail: '',
+        tone: 'success' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'success' as const,
+      };
+    }
+
+    if (openClawLatestVersionError.message) {
+      return {
+        progress: 0,
+        label: t('settings.openclawUpdate.checkRetryButton'),
+        detail: openClawCheckDetail,
+        tone: 'error' as UpdateProgressTone,
+        layout: 'expanded' as UpdateProgressLayout,
+        clickable: true,
+        showSpinner: false,
+        icon: 'error' as const,
+      };
+    }
+
+    return {
+      progress: 0,
+      label: t('settings.openclawUpdate.checkNewVersion'),
+      detail: '',
+      tone: 'neutral' as UpdateProgressTone,
+      layout: 'compact' as UpdateProgressLayout,
+      clickable: true,
+      showSpinner: false,
+      icon: 'activity' as const,
+    };
+  })(), isOpenClawUpdateBlockedByApp);
   const updateProgressTitle = updateProgressVisual.detail || updateFailureDetail || updateCheckDetail || undefined;
   const updateProgressWidthClass = updateProgressVisual.layout === 'expanded'
     ? 'w-full sm:w-[24rem]'
@@ -2210,13 +2701,115 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
     updateStatusInfo?.rawDetail,
     updateStatusInfo?.message,
   ]);
+  const openClawUpdateCancelUnsafeDetail = joinDistinctLines([
+    openClawUpdateStatusInfo?.rawDetail,
+    openClawUpdateStatusInfo?.message,
+  ]);
   const updateCancelModalTitle = updateStatusInfo?.canCancel
     ? t('settings.about.updateCancelConfirmTitle')
     : t('settings.about.updateCancelUnavailableTitle');
   const updateCancelModalMessage = updateStatusInfo?.canCancel
     ? t('settings.about.updateCancelConfirmMessage')
     : t('settings.about.updateCancelUnavailableMessage');
+  const openClawUpdateCancelModalTitle = openClawUpdateStatusInfo?.canCancel
+    ? t('settings.openclawUpdate.updateCancelConfirmTitle')
+    : t('settings.openclawUpdate.updateCancelUnavailableTitle');
+  const openClawUpdateCancelModalMessage = openClawUpdateStatusInfo?.canCancel
+    ? t('settings.openclawUpdate.updateCancelConfirmMessage')
+    : t('settings.openclawUpdate.updateCancelUnavailableMessage');
+  const resolveProgressToneClasses = (tone: UpdateProgressTone) => (
+    tone === 'success'
+      ? {
+        container: 'border-emerald-200 bg-emerald-50',
+        hover: 'hover:bg-emerald-100',
+        text: 'text-emerald-700',
+        icon: 'text-emerald-600',
+        fill: 'bg-emerald-200/90',
+        detail: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+      }
+      : tone === 'error'
+        ? {
+          container: 'border-red-200 bg-red-50',
+          hover: 'hover:bg-red-100',
+          text: 'text-red-700',
+          icon: 'text-red-600',
+          fill: 'bg-red-200/90',
+          detail: 'border-red-200 bg-red-50 text-red-700',
+        }
+        : {
+          container: 'border-blue-200 bg-blue-50',
+          hover: 'hover:bg-blue-100',
+          text: 'text-[#2563eb]',
+          icon: 'text-[#2563eb]',
+          fill: 'bg-blue-200/90',
+          detail: 'border-blue-200 bg-blue-50 text-[#2563eb]',
+        }
+  );
+  const updateProgressToneClasses = resolveProgressToneClasses(updateProgressVisual.tone);
+  const openClawUpdateProgressToneClasses = resolveProgressToneClasses(openClawUpdateProgressVisual.tone);
+  const openClawUpdateProgressTitle = openClawUpdateProgressVisual.detail || openClawUpdateFailureDetail || openClawUpdateActiveDetail || openClawCheckDetail || undefined;
+  const openClawUpdateProgressWidthClass = openClawUpdateProgressVisual.layout === 'expanded'
+    ? 'w-full sm:w-[24rem]'
+    : 'w-full sm:w-auto';
+  const openClawUpdateProgressButtonWidthClass = openClawUpdateProgressVisual.layout === 'expanded'
+    ? 'w-full sm:min-w-[24rem]'
+    : 'w-full sm:w-auto';
   const secondaryActionButtonClass = 'inline-flex items-center justify-center gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold leading-5 text-[#2563eb] text-center transition-colors hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60';
+  const renderProgressActionButton = (
+    visual: {
+      progress: number;
+      label: string;
+      detail: string;
+      clickable: boolean;
+      muted?: boolean;
+      showSpinner: boolean;
+      icon: 'activity' | 'success' | 'error';
+    },
+    toneClasses: {
+      container: string;
+      hover: string;
+      text: string;
+      icon: string;
+      fill: string;
+      detail: string;
+    },
+    onClick: () => void,
+    widthClass: string,
+    buttonWidthClass: string,
+    title?: string,
+  ) => (
+    <div className={widthClass}>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={!visual.clickable}
+        title={title}
+        className={`relative overflow-hidden rounded-xl border text-left transition-colors ${buttonWidthClass} ${toneClasses.container} ${visual.clickable ? toneClasses.hover : 'cursor-default'} ${visual.muted ? 'opacity-60 saturate-50' : !visual.clickable ? 'opacity-90' : ''}`}
+      >
+        <div
+          className={`absolute inset-y-0 left-0 rounded-l-xl transition-[width] duration-500 ease-out ${toneClasses.fill}`}
+          style={{ width: `${Math.min(Math.max(visual.progress, 0), 100)}%` }}
+        />
+        <div className="relative z-10 flex items-center justify-center gap-2 px-4 py-2.5 text-center">
+          {visual.showSpinner
+            ? <Loader2 className={`h-4 w-4 shrink-0 animate-spin ${toneClasses.icon}`} />
+            : visual.icon === 'success'
+              ? <Check className={`h-4 w-4 shrink-0 ${toneClasses.icon}`} />
+              : visual.icon === 'error'
+                ? <X className={`h-4 w-4 shrink-0 ${toneClasses.icon}`} />
+                : <Activity className={`h-4 w-4 shrink-0 ${toneClasses.icon}`} />}
+          <span className={`truncate whitespace-nowrap text-sm font-semibold leading-5 ${toneClasses.text}`}>
+            {visual.label}
+          </span>
+        </div>
+      </button>
+      {visual.detail ? (
+        <div className={`mt-2 whitespace-pre-wrap rounded-xl border px-4 py-3 text-sm ${toneClasses.detail}`}>
+          {visual.detail}
+        </div>
+      ) : null}
+    </div>
+  );
   const browserProgressToneClasses = {
     container: 'border-blue-200 bg-blue-50',
     text: 'text-[#2563eb]',
@@ -2385,32 +2978,28 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
                     <h3 className="text-lg font-semibold text-gray-900">
                       {t('settings.gateway.connectionTitle')}
                     </h3>
-                    {detectedOpenClawVersion && (
+                    {openClawCurrentVersion && (
                       <span className="text-sm font-normal text-gray-500">
-                        {t('settings.gateway.versionInline', { version: detectedOpenClawVersion })}
+                        {t('settings.gateway.versionInline', { version: openClawCurrentVersion })}
                       </span>
                     )}
                   </div>
-                  <div className="relative">
-                    <div className="flex flex-wrap items-center justify-end">
-                      <button
-                        type="button"
-                        onClick={handleDetectAll}
-                        disabled={isDetectingAll || isLoading}
-                        className={`${secondaryActionButtonClass} shrink-0`}
-                      >
-                        {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-                        {t('settings.gateway.autoDetect')}
-                      </button>
-                    </div>
-                    {detectError && (
-                      <div className="absolute top-full mt-2 right-0 w-80 text-xs bg-red-50 text-red-600 border border-red-200 p-2 rounded-lg z-10 break-words pointer-events-none">
-                        {detectError}
-                      </div>
-                    )}
+                  <div className="flex min-w-0 justify-end">
+                    <button
+                      type="button"
+                      onClick={() => { void detectGatewayConfig(); }}
+                      disabled={isDetectingAll || isLoading}
+                      className={`${secondaryActionButtonClass} shrink-0`}
+                    >
+                      {isDetectingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
+                      {t('settings.gateway.autoDetect')}
+                    </button>
                   </div>
                 </div>
                 <p className="text-sm text-gray-500 mb-6 mt-1">{t('settings.gateway.description')}</p>
+                {detectError ? (
+                  <p className="mb-4 text-sm text-red-600">{detectError}</p>
+                ) : null}
                 
                 <div className="space-y-5 sm:space-y-6 bg-white p-4 sm:p-6 rounded-2xl border border-gray-200">
                   <div>
@@ -3367,55 +3956,51 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
               <div className="space-y-6">
                 <div className="bg-white rounded-2xl border border-gray-200 p-4 sm:p-6 w-full">
                   <div className="flex w-full flex-col gap-6">
+                  <div className="flex w-full flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 items-baseline gap-3">
+                      <div className="text-2xl font-black text-gray-900 tracking-tighter leading-tight">{t('settings.openclawUpdate.title')}</div>
+                      <span className="text-[0.8rem] font-medium text-gray-500 leading-none">
+                        {isLoadingAppVersion
+                          ? t('settings.about.loadingVersion')
+                          : openClawCurrentVersion || t('settings.about.unavailable')}
+                      </span>
+                    </div>
+                    <div className="flex min-w-0 justify-end">
+                      {renderProgressActionButton(
+                        openClawUpdateProgressVisual,
+                        openClawUpdateProgressToneClasses,
+                        handleOpenClawLatestVersionAction,
+                        openClawUpdateProgressWidthClass,
+                        openClawUpdateProgressButtonWidthClass,
+                        openClawUpdateProgressTitle,
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="w-full border-t border-gray-200" />
                   
                   {/* Header */}
                   <div className="flex w-full flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
                     <div className="w-full text-left sm:w-auto">
                       <div className="text-2xl font-black text-gray-900 tracking-tighter leading-tight mb-1">OpenClaw</div>
-                      <div className="text-[1.15rem] font-bold text-gray-400 tracking-widest uppercase leading-tight">CHAT GATEWAY</div>
-                    </div>
-                    <div className="flex flex-col items-start gap-3 sm:items-end">
-                      <div className="flex items-baseline text-left text-sm text-gray-700 sm:text-right">
-                        <span className="font-normal">
-                          {t('settings.about.currentVersionLabel')}:&nbsp;
-                        </span>
-                        <span className="font-normal text-gray-900">
+                      <div className="flex items-baseline gap-2 whitespace-nowrap leading-none">
+                        <div className="text-[1.15rem] font-bold text-gray-400 tracking-widest uppercase leading-tight">CHAT GATEWAY</div>
+                        <div className="text-[0.8rem] font-medium text-gray-400 leading-none">
                           {isLoadingAppVersion
                             ? t('settings.about.loadingVersion')
                             : appVersionInfo?.version || t('settings.about.unavailable')}
-                        </span>
+                        </div>
                       </div>
-                      <div className={updateProgressWidthClass}>
-                        <button
-                          type="button"
-                          onClick={handleLatestVersionAction}
-                          disabled={!updateProgressVisual.clickable}
-                          title={updateProgressTitle}
-                          className={`relative overflow-hidden rounded-xl border text-left transition-colors ${updateProgressButtonWidthClass} ${updateProgressToneClasses.container} ${updateProgressVisual.clickable ? updateProgressToneClasses.hover : 'cursor-default'} ${!updateProgressVisual.clickable ? 'opacity-90' : ''}`}
-                        >
-                          <div
-                            className={`absolute inset-y-0 left-0 rounded-l-xl transition-[width] duration-500 ease-out ${updateProgressToneClasses.fill}`}
-                            style={{ width: `${Math.min(Math.max(updateProgressVisual.progress, 0), 100)}%` }}
-                          />
-                          <div className="relative z-10 flex items-center justify-center gap-2 px-4 py-2.5 text-center">
-                            {updateProgressVisual.showSpinner
-                              ? <Loader2 className={`h-4 w-4 shrink-0 animate-spin ${updateProgressToneClasses.icon}`} />
-                              : updateProgressVisual.icon === 'success'
-                                ? <Check className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />
-                                : updateProgressVisual.icon === 'error'
-                                  ? <X className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />
-                                  : <Activity className={`h-4 w-4 shrink-0 ${updateProgressToneClasses.icon}`} />}
-                            <span className={`truncate whitespace-nowrap text-sm font-semibold leading-5 ${updateProgressToneClasses.text}`}>
-                              {updateProgressVisual.label}
-                            </span>
-                          </div>
-                        </button>
-                        {updateProgressVisual.detail ? (
-                          <div className={`mt-2 whitespace-pre-wrap rounded-xl border px-4 py-3 text-sm ${updateProgressToneClasses.detail}`}>
-                            {updateProgressVisual.detail}
-                          </div>
-                        ) : null}
-                      </div>
+                    </div>
+                    <div className="flex min-w-0 justify-end">
+                      {renderProgressActionButton(
+                        updateProgressVisual,
+                        updateProgressToneClasses,
+                        handleLatestVersionAction,
+                        updateProgressWidthClass,
+                        updateProgressButtonWidthClass,
+                        updateProgressTitle,
+                      )}
                     </div>
                   </div>
 
@@ -3491,6 +4076,61 @@ export default function SettingsView({ settingsTab, onMenuClick, onModelsChanged
 
         </div>
       </div>
+
+      {isOpenClawUpdateCancelModalOpen && (
+        <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity"
+            onClick={() => {
+              if (!isCancellingOpenClawUpdate) {
+                setIsOpenClawUpdateCancelModalOpen(false);
+              }
+            }}
+          />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className={`mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full ${openClawUpdateStatusInfo?.canCancel ? 'bg-amber-100' : 'bg-blue-100'}`}>
+                <Activity className={`h-6 w-6 ${openClawUpdateStatusInfo?.canCancel ? 'text-amber-600' : 'text-blue-600'}`} />
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">{openClawUpdateCancelModalTitle}</h3>
+              <p className="text-sm text-gray-500">{openClawUpdateCancelModalMessage}</p>
+              {!openClawUpdateStatusInfo?.canCancel && openClawUpdateCancelUnsafeDetail ? (
+                <div className="mt-4 rounded-xl border border-gray-200 bg-gray-50 px-4 py-3 text-left">
+                  <p className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-gray-400">{t('common.details')}</p>
+                  <p className="whitespace-pre-wrap break-all text-xs text-gray-500">{openClawUpdateCancelUnsafeDetail}</p>
+                </div>
+              ) : null}
+            </div>
+            <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+              <button
+                type="button"
+                onClick={() => setIsOpenClawUpdateCancelModalOpen(false)}
+                disabled={isCancellingOpenClawUpdate}
+                className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {openClawUpdateStatusInfo?.canCancel ? t('settings.openclawUpdate.updateCancelKeepRunning') : t('common.gotIt')}
+              </button>
+              {openClawUpdateStatusInfo?.canCancel ? (
+                <button
+                  type="button"
+                  onClick={() => void handleConfirmCancelOpenClawUpdate()}
+                  disabled={isCancellingOpenClawUpdate}
+                  className="flex-1 rounded-xl bg-red-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isCancellingOpenClawUpdate ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      {t('settings.openclawUpdate.updateStoppingButton')}
+                    </span>
+                  ) : (
+                    t('settings.openclawUpdate.updateCancelConfirmAction')
+                  )}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
 
       {isUpdateCancelModalOpen && (
         <div className="fixed inset-0 z-[220] flex items-center justify-center p-4">

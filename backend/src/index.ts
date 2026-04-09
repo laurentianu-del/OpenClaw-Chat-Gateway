@@ -123,6 +123,7 @@ const ENDPOINT_TEST_FAILED_ERROR_CODE = 'endpoints.testFailed';
 const AUTH_LOGIN_REQUIRED_ERROR_CODE = 'auth.loginRequired';
 const VERSION_INFO_UNAVAILABLE_ERROR_CODE = 'version.infoUnavailable';
 const VERSION_LOOKUP_FAILED_ERROR_CODE = 'version.lookupFailed';
+const OPENCLAW_VERSION_LOOKUP_FAILED_ERROR_CODE = 'openclawVersion.lookupFailed';
 const UPDATE_START_FAILED_ERROR_CODE = 'update.startFailed';
 const UPDATE_ALREADY_RUNNING_ERROR_CODE = 'update.alreadyRunning';
 const UPDATE_NO_NEW_VERSION_ERROR_CODE = 'update.noNewVersion';
@@ -133,6 +134,12 @@ const UPDATE_RESET_FAILED_ERROR_CODE = 'update.resetFailed';
 const UPDATE_RESTART_FAILED_ERROR_CODE = 'update.restartFailed';
 const UPDATE_RESTART_NOT_READY_ERROR_CODE = 'update.restartNotReady';
 const UPDATE_SERVICE_NOT_FOUND_ERROR_CODE = 'update.serviceNotFound';
+const OPENCLAW_UPDATE_START_FAILED_ERROR_CODE = 'openclawUpdate.startFailed';
+const OPENCLAW_UPDATE_ALREADY_RUNNING_ERROR_CODE = 'openclawUpdate.alreadyRunning';
+const OPENCLAW_UPDATE_NO_NEW_VERSION_ERROR_CODE = 'openclawUpdate.noNewVersion';
+const OPENCLAW_UPDATE_CANCEL_FAILED_ERROR_CODE = 'openclawUpdate.cancelFailed';
+const OPENCLAW_UPDATE_NOT_RUNNING_ERROR_CODE = 'openclawUpdate.notRunning';
+const OPENCLAW_UPDATE_RESET_FAILED_ERROR_CODE = 'openclawUpdate.resetFailed';
 const DEFAULT_HISTORY_PAGE_LIMIT = 200;
 const MAX_HISTORY_PAGE_LIMIT = 200;
 const CHAT_STREAM_COMPLETION_PROBE_DELAY_MS = 400;
@@ -252,7 +259,52 @@ type ActiveUpdateProcess = {
   cancelTimer: NodeJS.Timeout | null;
 };
 
+type OpenClawLatestVersionInfo = {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  hasUpdate: boolean;
+  status: 'update_available' | 'up_to_date';
+  channel: string | null;
+  channelLabel: string | null;
+  installKind: string | null;
+  packageManager: string | null;
+};
+
+type OpenClawUpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'updating'
+  | 'stopping'
+  | 'update_succeeded'
+  | 'update_failed';
+
+type OpenClawUpdateSnapshot = {
+  status: OpenClawUpdateStatus;
+  phase: string | null;
+  canCancel: boolean;
+  currentVersion: string | null;
+  latestVersion: string | null;
+  message: string | null;
+  rawDetail: string | null;
+  logs: string[];
+  startedAt: string | null;
+  updatedAt: string | null;
+};
+
+type ActiveOpenClawUpdateProcess = {
+  child: ReturnType<typeof spawn>;
+  cancelRequested: boolean;
+  cancelTimer: NodeJS.Timeout | null;
+  phaseTimer: NodeJS.Timeout | null;
+};
+
 const appRepoRoot = path.resolve(__dirname, '..', '..');
+const OPENCLAW_LATEST_VERSION_CACHE_TTL_MS = 60 * 1000;
+const OPENCLAW_UPDATE_CANCELLABLE_PHASES = new Set([
+  'download-package',
+  'install-package',
+  'running-update',
+]);
 
 function createDefaultUpdateSnapshot(): UpdateSnapshot {
   return {
@@ -270,9 +322,28 @@ function createDefaultUpdateSnapshot(): UpdateSnapshot {
   };
 }
 
+function createDefaultOpenClawUpdateSnapshot(): OpenClawUpdateSnapshot {
+  return {
+    status: 'idle',
+    phase: null,
+    canCancel: false,
+    currentVersion: null,
+    latestVersion: null,
+    message: null,
+    rawDetail: null,
+    logs: [],
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 let updateSnapshot = createDefaultUpdateSnapshot();
 let activeUpdateProcess: ActiveUpdateProcess | null = null;
 let cachedLatestVersionInfo: AppLatestVersionInfo | null = null;
+let openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
+let activeOpenClawUpdateProcess: ActiveOpenClawUpdateProcess | null = null;
+let cachedOpenClawLatestVersionInfo: OpenClawLatestVersionInfo | null = null;
+let cachedOpenClawLatestVersionCheckedAt = 0;
 
 function appendUpdateLog(message: string) {
   const line = normalizeCliText(message);
@@ -451,6 +522,465 @@ function buildUpdateStatusResponse(): UpdateSnapshot {
   };
 }
 
+function appendOpenClawUpdateLog(message: string) {
+  const line = normalizeCliText(message);
+  if (!line) return;
+  openClawUpdateSnapshot.logs = [...openClawUpdateSnapshot.logs.slice(-(UPDATE_LOG_LIMIT - 1)), line];
+  openClawUpdateSnapshot.updatedAt = new Date().toISOString();
+}
+
+function patchOpenClawUpdateSnapshot(patch: Partial<OpenClawUpdateSnapshot>) {
+  openClawUpdateSnapshot = {
+    ...openClawUpdateSnapshot,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function resetOpenClawUpdateSnapshot() {
+  openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
+}
+
+function rememberOpenClawLatestVersionInfo(info: OpenClawLatestVersionInfo | null) {
+  cachedOpenClawLatestVersionInfo = info;
+  cachedOpenClawLatestVersionCheckedAt = info ? Date.now() : 0;
+}
+
+function getCachedOpenClawLatestVersionInfo(currentVersion?: string | null): OpenClawLatestVersionInfo | null {
+  if (!cachedOpenClawLatestVersionInfo || !cachedOpenClawLatestVersionCheckedAt) {
+    return null;
+  }
+
+  if ((Date.now() - cachedOpenClawLatestVersionCheckedAt) > OPENCLAW_LATEST_VERSION_CACHE_TTL_MS) {
+    rememberOpenClawLatestVersionInfo(null);
+    return null;
+  }
+
+  if (
+    currentVersion
+    && cachedOpenClawLatestVersionInfo.currentVersion
+    && cachedOpenClawLatestVersionInfo.currentVersion !== currentVersion
+  ) {
+    return null;
+  }
+
+  return cachedOpenClawLatestVersionInfo;
+}
+
+function getOpenClawUpdatePhaseMessage(phase: string) {
+  switch (phase) {
+    case 'checking-status':
+      return 'Checking the latest OpenClaw version.';
+    case 'download-package':
+      return 'Downloading the OpenClaw update package.';
+    case 'install-package':
+      return 'Installing the OpenClaw update package.';
+    case 'switch-command-entrypoint':
+      return 'Switching the OpenClaw command entrypoint.';
+    case 'finalize-update':
+      return 'Finalizing the OpenClaw package update.';
+    case 'running-update':
+      return 'Updating OpenClaw.';
+    case 'stopping-update':
+      return 'Stopping the OpenClaw update.';
+    case 'repair-command-entrypoint':
+      return 'Repairing the OpenClaw command entrypoint.';
+    case 'verifying-version':
+      return 'Verifying the upgraded OpenClaw version.';
+    case 'complete':
+      return 'OpenClaw update completed.';
+    default:
+      return null;
+  }
+}
+
+function patchOpenClawUpdatePhaseState(phase: string, patch: Partial<OpenClawUpdateSnapshot> = {}) {
+  patchOpenClawUpdateSnapshot({
+    phase,
+    canCancel: OPENCLAW_UPDATE_CANCELLABLE_PHASES.has(phase),
+    message: getOpenClawUpdatePhaseMessage(phase) || openClawUpdateSnapshot.message,
+    ...patch,
+  });
+}
+
+function buildOpenClawUpdateStatusResponse(): OpenClawUpdateSnapshot {
+  return {
+    ...openClawUpdateSnapshot,
+  };
+}
+
+function collectOpenClawUpdateTextFragments(value: unknown, fragments: string[] = [], seen = new Set<string>()) {
+  if (typeof value === 'string') {
+    const normalized = normalizeCliText(value);
+    if (normalized && !seen.has(normalized)) {
+      seen.add(normalized);
+      fragments.push(normalized);
+    }
+    return fragments;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      collectOpenClawUpdateTextFragments(entry, fragments, seen);
+    }
+    return fragments;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return fragments;
+  }
+
+  const objectValue = value as Record<string, unknown>;
+  for (const key of ['message', 'detail', 'summary', 'phase', 'stage', 'step', 'action', 'status', 'event']) {
+    if (key in objectValue) {
+      collectOpenClawUpdateTextFragments(objectValue[key], fragments, seen);
+    }
+  }
+
+  for (const key of ['data', 'payload', 'result', 'update']) {
+    if (key in objectValue) {
+      collectOpenClawUpdateTextFragments(objectValue[key], fragments, seen);
+    }
+  }
+
+  return fragments;
+}
+
+function inferOpenClawUpdatePhaseFromText(text: string) {
+  const normalized = normalizeCliText(text).toLowerCase();
+  if (!normalized) return null;
+
+  if (/(download|downloading|fetching|retriev|tarball|archive|artifact)/i.test(normalized)) {
+    return 'download-package';
+  }
+  if (/(extract|extracting|unpack|unpacking|install(?:ing|ed)?|apply(?:ing)?|copy(?:ing)? files?|prepar(?:e|ing).*package|node_modules)/i.test(normalized)) {
+    return 'install-package';
+  }
+  if (/(switch|switching|replace|replacing|activate|activating|link|symlink|launcher|entrypoint|bin\/openclaw|shell command)/i.test(normalized)) {
+    return 'switch-command-entrypoint';
+  }
+  if (/(cleanup|cleaning|clean up|finaliz|finishing|completed|postinstall)/i.test(normalized)) {
+    return 'finalize-update';
+  }
+  if (/(verif|confirming version|checking version|validate version)/i.test(normalized)) {
+    return 'verifying-version';
+  }
+  if (/(check|checking).*(update|version)|latest version/i.test(normalized)) {
+    return 'checking-status';
+  }
+
+  return null;
+}
+
+function inferOpenClawUpdatePhaseFromPayload(payload: unknown): string | null {
+  const fragments = collectOpenClawUpdateTextFragments(payload);
+  for (const fragment of fragments) {
+    const phase = inferOpenClawUpdatePhaseFromText(fragment);
+    if (phase) {
+      return phase;
+    }
+  }
+  return null;
+}
+
+function parseOpenClawUpdateOutputLine(line: string) {
+  const normalized = normalizeCliText(line);
+  if (!normalized) {
+    return {
+      logLine: '',
+      phase: null as string | null,
+    };
+  }
+
+  let logLine = normalized;
+  let phase = inferOpenClawUpdatePhaseFromText(normalized);
+
+  try {
+    const parsed = JSON.parse(normalized) as Record<string, unknown>;
+    const fragments = collectOpenClawUpdateTextFragments(parsed);
+    if (fragments.length > 0) {
+      logLine = fragments.join(' | ');
+    }
+    phase = inferOpenClawUpdatePhaseFromPayload(parsed) || phase;
+  } catch {}
+
+  return {
+    logLine,
+    phase,
+  };
+}
+
+function patchOpenClawUpdateRunningPhase(phase: string | null) {
+  if (!phase || openClawUpdateSnapshot.status !== 'updating') {
+    return;
+  }
+
+  if (openClawUpdateSnapshot.phase === phase) {
+    return;
+  }
+
+  patchOpenClawUpdatePhaseState(phase);
+}
+
+function attachOpenClawUpdateOutput(stream: NodeJS.ReadableStream | null, source: 'stdout' | 'stderr') {
+  if (!stream) return;
+  let buffer = '';
+  stream.on('data', (chunk) => {
+    buffer += chunk.toString();
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.trim()) {
+        const parsedLine = parseOpenClawUpdateOutputLine(line);
+        appendOpenClawUpdateLog(parsedLine.logLine || line);
+        patchOpenClawUpdateRunningPhase(parsedLine.phase);
+        if (source === 'stderr') {
+          patchOpenClawUpdateSnapshot({
+            rawDetail: parsedLine.logLine || line,
+          });
+        }
+      }
+      newlineIndex = buffer.indexOf('\n');
+    }
+  });
+  stream.on('end', () => {
+    const line = buffer.replace(/\r$/, '');
+    if (!line.trim()) return;
+    const parsedLine = parseOpenClawUpdateOutputLine(line);
+    appendOpenClawUpdateLog(parsedLine.logLine || line);
+    patchOpenClawUpdateRunningPhase(parsedLine.phase);
+    if (source === 'stderr') {
+      patchOpenClawUpdateSnapshot({
+        rawDetail: parsedLine.logLine || line,
+      });
+    }
+  });
+}
+
+async function getOpenClawLatestVersionInfo(): Promise<OpenClawLatestVersionInfo> {
+  const executablePath = await ensureResolvedOpenClawExecutablePath();
+  const { stdout } = await execFilePromise(executablePath, ['update', 'status', '--json'], {
+    maxBuffer: 1024 * 1024,
+  });
+  const parsed = JSON.parse(normalizeCliText(stdout) || '{}') as {
+    update?: { installKind?: string; packageManager?: string };
+    channel?: { value?: string; label?: string };
+    availability?: { available?: boolean; latestVersion?: string | null };
+  };
+  const currentVersion = await readOpenClawVersion();
+  const latestVersion = normalizeCliText(parsed?.availability?.latestVersion) || null;
+  const hasUpdate = Boolean(parsed?.availability?.available && latestVersion && currentVersion && latestVersion !== currentVersion);
+
+  const info: OpenClawLatestVersionInfo = {
+    currentVersion,
+    latestVersion,
+    hasUpdate,
+    status: hasUpdate ? 'update_available' : 'up_to_date',
+    channel: normalizeCliText(parsed?.channel?.value) || null,
+    channelLabel: normalizeCliText(parsed?.channel?.label) || null,
+    installKind: normalizeCliText(parsed?.update?.installKind) || null,
+    packageManager: normalizeCliText(parsed?.update?.packageManager) || null,
+  };
+  rememberOpenClawLatestVersionInfo(info);
+  return info;
+}
+
+async function startOpenClawUpdateTask() {
+  if (activeOpenClawUpdateProcess || ['checking', 'updating'].includes(openClawUpdateSnapshot.status)) {
+    throw new StructuredRequestError(409, OPENCLAW_UPDATE_ALREADY_RUNNING_ERROR_CODE, 'An OpenClaw update task is already running.');
+  }
+
+  const currentVersion = await readOpenClawVersion();
+  const cachedLatestInfo = getCachedOpenClawLatestVersionInfo(currentVersion);
+
+  if (!cachedLatestInfo) {
+    patchOpenClawUpdateSnapshot({
+      status: 'checking',
+      phase: 'checking-status',
+      canCancel: false,
+      currentVersion,
+      latestVersion: null,
+      message: getOpenClawUpdatePhaseMessage('checking-status'),
+      rawDetail: null,
+      logs: [],
+      startedAt: new Date().toISOString(),
+    });
+  }
+
+  const latestInfo = cachedLatestInfo || await getOpenClawLatestVersionInfo();
+  if (!latestInfo.hasUpdate || !latestInfo.latestVersion) {
+    resetOpenClawUpdateSnapshot();
+    throw new StructuredRequestError(409, OPENCLAW_UPDATE_NO_NEW_VERSION_ERROR_CODE, 'No newer OpenClaw version is available.');
+  }
+
+  const executablePath = await ensureResolvedOpenClawExecutablePath(latestInfo.latestVersion);
+  const child = spawn(executablePath, ['update', '--json', '--yes'], {
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+    },
+  });
+
+  activeOpenClawUpdateProcess = {
+    child,
+    cancelRequested: false,
+    cancelTimer: null,
+    phaseTimer: null,
+  };
+
+  patchOpenClawUpdatePhaseState('download-package', {
+    status: 'updating',
+    currentVersion: latestInfo.currentVersion,
+    latestVersion: latestInfo.latestVersion,
+    rawDetail: null,
+  });
+  appendOpenClawUpdateLog(`Starting OpenClaw update to ${latestInfo.latestVersion}.`);
+
+  activeOpenClawUpdateProcess.phaseTimer = setTimeout(() => {
+    if (
+      activeOpenClawUpdateProcess?.child.pid === child.pid
+      && openClawUpdateSnapshot.status === 'updating'
+      && openClawUpdateSnapshot.phase === 'download-package'
+    ) {
+      patchOpenClawUpdatePhaseState('install-package');
+    }
+  }, 1500);
+
+  attachOpenClawUpdateOutput(child.stdout, 'stdout');
+  attachOpenClawUpdateOutput(child.stderr, 'stderr');
+
+  child.once('error', (error) => {
+    if (activeOpenClawUpdateProcess?.phaseTimer) {
+      clearTimeout(activeOpenClawUpdateProcess.phaseTimer);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    patchOpenClawUpdateSnapshot({
+      status: 'update_failed',
+      phase: 'running-update',
+      canCancel: false,
+      message: 'OpenClaw update failed.',
+      rawDetail: detail,
+    });
+    appendOpenClawUpdateLog(`OpenClaw update failed to start: ${detail}`);
+    activeOpenClawUpdateProcess = null;
+  });
+
+  child.once('close', async (code, signal) => {
+    const activeProcess = activeOpenClawUpdateProcess;
+    activeOpenClawUpdateProcess = null;
+    if (activeProcess?.cancelTimer) {
+      clearTimeout(activeProcess.cancelTimer);
+    }
+    if (activeProcess?.phaseTimer) {
+      clearTimeout(activeProcess.phaseTimer);
+    }
+
+    if (activeProcess?.cancelRequested) {
+      resetOpenClawUpdateSnapshot();
+      appendOpenClawUpdateLog('OpenClaw update cancelled.');
+      return;
+    }
+
+    if (code === 0) {
+      try {
+        patchOpenClawUpdatePhaseState('repair-command-entrypoint');
+        const resolvedExecutablePath = await ensureResolvedOpenClawExecutablePath(latestInfo.latestVersion);
+        await ensureOpenClawShellEntrypoint(resolvedExecutablePath);
+        appendOpenClawUpdateLog('Verified and repaired the OpenClaw shell entrypoint.');
+        patchOpenClawUpdatePhaseState('verifying-version');
+        const verifiedInfo = await getOpenClawLatestVersionInfo();
+        patchOpenClawUpdateSnapshot({
+          status: 'update_succeeded',
+          phase: 'complete',
+          canCancel: false,
+          currentVersion: verifiedInfo.currentVersion,
+          latestVersion: verifiedInfo.latestVersion,
+          message: getOpenClawUpdatePhaseMessage('complete'),
+          rawDetail: null,
+        });
+        appendOpenClawUpdateLog(`OpenClaw update completed successfully. Current version: ${verifiedInfo.currentVersion || 'unknown'}.`);
+      } catch (error) {
+        const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+        patchOpenClawUpdateSnapshot({
+          status: 'update_failed',
+          phase: 'verifying-version',
+          canCancel: false,
+          message: 'OpenClaw update verification failed.',
+          rawDetail: detail,
+        });
+        appendOpenClawUpdateLog(`OpenClaw update completed, but verification failed: ${detail}`);
+      }
+      return;
+    }
+
+    const detail = openClawUpdateSnapshot.rawDetail
+      || `OpenClaw update exited with ${signal ? `signal ${signal}` : `code ${String(code)}`}.`;
+    patchOpenClawUpdateSnapshot({
+      status: 'update_failed',
+      phase: 'running-update',
+      canCancel: false,
+      message: 'OpenClaw update failed.',
+      rawDetail: detail,
+    });
+    appendOpenClawUpdateLog(`OpenClaw update failed: ${detail}`);
+  });
+
+  return buildOpenClawUpdateStatusResponse();
+}
+
+async function resetOpenClawUpdateTaskState() {
+  if (activeOpenClawUpdateProcess) {
+    throw new StructuredRequestError(409, OPENCLAW_UPDATE_ALREADY_RUNNING_ERROR_CODE, 'Cannot reset while an OpenClaw update task is running.');
+  }
+  resetOpenClawUpdateSnapshot();
+  return buildOpenClawUpdateStatusResponse();
+}
+
+async function cancelOpenClawUpdateTask() {
+  if (!activeOpenClawUpdateProcess || !['checking', 'updating', 'stopping'].includes(openClawUpdateSnapshot.status)) {
+    throw new StructuredRequestError(409, OPENCLAW_UPDATE_NOT_RUNNING_ERROR_CODE, 'There is no running OpenClaw update task to stop.');
+  }
+
+  if (openClawUpdateSnapshot.status === 'stopping') {
+    return buildOpenClawUpdateStatusResponse();
+  }
+
+  patchOpenClawUpdateSnapshot({
+    status: 'stopping',
+    phase: 'stopping-update',
+    canCancel: false,
+    message: getOpenClawUpdatePhaseMessage('stopping-update'),
+  });
+  appendOpenClawUpdateLog('Stopping OpenClaw update on user request.');
+
+  activeOpenClawUpdateProcess.cancelRequested = true;
+  try {
+    process.kill(-activeOpenClawUpdateProcess.child.pid!, 'SIGTERM');
+  } catch (error) {
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    patchOpenClawUpdateSnapshot({
+      status: 'update_failed',
+      phase: 'stopping-update',
+      canCancel: false,
+      message: 'Failed to stop the OpenClaw update.',
+      rawDetail: detail,
+    });
+    throw new StructuredRequestError(500, OPENCLAW_UPDATE_CANCEL_FAILED_ERROR_CODE, detail);
+  }
+
+  activeOpenClawUpdateProcess.cancelTimer = setTimeout(() => {
+    try {
+      if (activeOpenClawUpdateProcess?.cancelRequested) {
+        process.kill(-activeOpenClawUpdateProcess.child.pid!, 'SIGKILL');
+      }
+    } catch {}
+  }, UPDATE_CANCEL_KILL_TIMEOUT_MS);
+
+  return buildOpenClawUpdateStatusResponse();
+}
+
 function getCurrentClawUiPort() {
   return normalizeCliText(process.env.PORT) || '3115';
 }
@@ -516,6 +1046,123 @@ function normalizeCliText(value: unknown): string {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = normalizeCliText(hostname).toLowerCase();
+  return normalized === '127.0.0.1'
+    || normalized === 'localhost'
+    || normalized === '::1'
+    || normalized === '[::1]';
+}
+
+function parseGatewayUrlForStatusProbe(gatewayUrl: string): { hostname: string; port: number | null } | null {
+  const normalized = normalizeCliText(gatewayUrl);
+  if (!normalized) return null;
+
+  try {
+    const parsed = new URL(normalized.replace(/^ws/i, 'http'));
+    const port = parsed.port
+      ? Number(parsed.port)
+      : (parsed.protocol === 'https:' ? 443 : 80);
+
+    return {
+      hostname: parsed.hostname,
+      port: Number.isFinite(port) ? port : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildGatewayHttpBaseUrl(gatewayUrl: string): string | null {
+  const normalized = normalizeCliText(gatewayUrl);
+  if (!normalized) return null;
+
+  try {
+    const parsed = new URL(normalized.replace(/^ws/i, 'http'));
+    parsed.pathname = '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
+function readLocalGatewayRuntimeConfig(): {
+  port: number | null;
+  token: string;
+  password: string;
+} | null {
+  const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+  if (!fs.existsSync(configPath)) return null;
+
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    const gateway = raw?.gateway;
+    if (!gateway || typeof gateway !== 'object') return null;
+
+    const parsedPort = Number(gateway.port);
+    return {
+      port: Number.isFinite(parsedPort) ? parsedPort : null,
+      token: normalizeCliText(gateway.auth?.token),
+      password: normalizeCliText(gateway.auth?.password),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function probeGatewayHealth(gatewayUrl: string): Promise<{ ok: boolean; message?: string }> {
+  const baseUrl = buildGatewayHttpBaseUrl(gatewayUrl);
+  if (!baseUrl) {
+    return { ok: false, message: 'Invalid gateway URL' };
+  }
+
+  try {
+    const response = await axios.get(`${baseUrl}/health`, {
+      timeout: 1500,
+      validateStatus: () => true,
+    });
+    const statusText = normalizeCliText((response.data as any)?.status).toLowerCase();
+    const ok = response.status >= 200
+      && response.status < 300
+      && (((response.data as any)?.ok === true) || statusText === 'live' || statusText === 'ok');
+
+    return ok
+      ? { ok: true }
+      : { ok: false, message: `Gateway health probe returned HTTP ${response.status}` };
+  } catch (error: any) {
+    return {
+      ok: false,
+      message: readCliErrorDetail(error) || 'Gateway health probe failed',
+    };
+  }
+}
+
+function evaluateLocalGatewayCredentialMatch(
+  params: { gatewayUrl: string; token?: string; password?: string },
+  gatewayTarget: { hostname: string; port: number | null } | null,
+): boolean | null {
+  const localConfig = readLocalGatewayRuntimeConfig();
+  if (!localConfig) return null;
+
+  if (
+    gatewayTarget?.port != null
+    && localConfig.port != null
+    && gatewayTarget.port !== localConfig.port
+  ) {
+    return null;
+  }
+
+  if (!localConfig.token && !localConfig.password) {
+    return true;
+  }
+
+  const tokenMatches = !localConfig.token || normalizeCliText(params.token) === localConfig.token;
+  const passwordMatches = !localConfig.password || normalizeCliText(params.password) === localConfig.password;
+  return tokenMatches && passwordMatches;
+}
+
 function readCliErrorDetail(error: any): string {
   return [
     normalizeCliText(error?.stderr),
@@ -561,6 +1208,7 @@ function isExecutableFile(filePath: string) {
 }
 
 let cachedOpenClawExecutablePath: string | null = null;
+let openClawCliRepairInFlight: Promise<string> | null = null;
 let gatewayRestartTask: Promise<void> | null = null;
 let gatewayRestartQueued = false;
 let browserTaskSnapshot: BrowserTaskSnapshot = {
@@ -597,6 +1245,263 @@ function ensureBrowserTaskIdle() {
   }
 }
 
+function collectOpenClawPackageRoots() {
+  const moduleBaseDirs = [
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules'),
+  ];
+  const roots: string[] = [];
+  const seen = new Set<string>();
+
+  const pushRoot = (candidate: string) => {
+    const normalized = normalizeCliText(candidate);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    roots.push(normalized);
+  };
+
+  for (const moduleBaseDir of moduleBaseDirs) {
+    pushRoot(path.join(moduleBaseDir, 'openclaw'));
+    try {
+      const stagedRoots = fs.readdirSync(moduleBaseDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && /^\.openclaw-/i.test(entry.name))
+        .map((entry) => {
+          const fullPath = path.join(moduleBaseDir, entry.name);
+          let mtimeMs = 0;
+          try {
+            mtimeMs = fs.statSync(fullPath).mtimeMs;
+          } catch {}
+          return { fullPath, mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      for (const stagedRoot of stagedRoots) {
+        pushRoot(stagedRoot.fullPath);
+      }
+    } catch {}
+  }
+
+  const globalBinPath = path.join(os.homedir(), '.npm-global', 'bin', process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw');
+  try {
+    const resolvedFromBin = fs.realpathSync(globalBinPath);
+    pushRoot(path.dirname(resolvedFromBin));
+  } catch {}
+
+  return roots;
+}
+
+function collectOpenClawPackageEntryCandidates() {
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+
+  const pushCandidate = (candidate: string | null | undefined) => {
+    const normalized = normalizeCliText(candidate);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+
+  for (const packageRoot of collectOpenClawPackageRoots()) {
+    const packageJsonPath = path.join(packageRoot, 'package.json');
+    try {
+      if (fs.existsSync(packageJsonPath)) {
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')) as {
+          bin?: string | Record<string, string>;
+        };
+        if (typeof packageJson.bin === 'string') {
+          pushCandidate(path.join(packageRoot, packageJson.bin));
+        } else if (packageJson.bin && typeof packageJson.bin === 'object' && typeof packageJson.bin.openclaw === 'string') {
+          pushCandidate(path.join(packageRoot, packageJson.bin.openclaw));
+        }
+      }
+    } catch {}
+
+    pushCandidate(path.join(packageRoot, 'openclaw.mjs'));
+  }
+
+  return candidates;
+}
+
+function findShellResolvedOpenClawCommandPath() {
+  const executableName = process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw';
+  const seen = new Set<string>();
+  const pathEntries = normalizeCliText(process.env.PATH)
+    .split(path.delimiter)
+    .map(entry => entry.trim())
+    .filter(Boolean);
+
+  for (const entry of pathEntries) {
+    const candidate = path.join(entry, executableName);
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getPreferredOpenClawShellEntrypointPath() {
+  const executableName = process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw';
+  const preferredDirs = [
+    path.join(os.homedir(), '.npm-global', 'bin'),
+    path.join(os.homedir(), '.local', 'bin'),
+  ];
+  const pathEntries = normalizeCliText(process.env.PATH)
+    .split(path.delimiter)
+    .map(entry => entry.trim())
+    .filter(Boolean);
+
+  for (const preferredDir of preferredDirs) {
+    if (pathEntries.includes(preferredDir)) {
+      return path.join(preferredDir, executableName);
+    }
+  }
+
+  return path.join(preferredDirs[0], executableName);
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function buildOpenClawShellWrapperScript(resolvedExecutablePath: string) {
+  const preferredCandidates = [
+    normalizeCliText(resolvedExecutablePath),
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', 'openclaw', 'openclaw.mjs'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules', 'openclaw', 'openclaw.mjs'),
+  ].filter(Boolean);
+  const preferredCandidateLines = preferredCandidates
+    .map((candidate) => `  ${shellQuote(candidate)}`)
+    .join('\n');
+  const stagedBaseDirLines = [
+    path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
+    path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules'),
+  ].map((candidate) => `  ${shellQuote(candidate)}`).join('\n');
+
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+preferred_candidates=(
+${preferredCandidateLines}
+)
+
+staged_base_dirs=(
+${stagedBaseDirLines}
+)
+
+for candidate in "\${preferred_candidates[@]}"; do
+  if [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+for base_dir in "\${staged_base_dirs[@]}"; do
+  if [ ! -d "$base_dir" ]; then
+    continue
+  fi
+
+  while IFS= read -r candidate; do
+    if [ -x "$candidate" ]; then
+      exec "$candidate" "$@"
+    fi
+  done < <(ls -dt "$base_dir"/.openclaw-*/openclaw.mjs 2>/dev/null || true)
+done
+
+echo "OpenClaw CLI not found." >&2
+exit 127
+`;
+}
+
+async function canExecuteOpenClawCommand(filePath: string) {
+  try {
+    await execFilePromise(filePath, ['--version'], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureOpenClawShellEntrypoint(resolvedExecutablePath: string) {
+  if (process.platform === 'win32') {
+    return null;
+  }
+
+  const shellResolvedPath = findShellResolvedOpenClawCommandPath();
+  if (shellResolvedPath && await canExecuteOpenClawCommand(shellResolvedPath)) {
+    return shellResolvedPath;
+  }
+
+  const shellEntrypointPath = getPreferredOpenClawShellEntrypointPath();
+  fs.mkdirSync(path.dirname(shellEntrypointPath), { recursive: true });
+  fs.rmSync(shellEntrypointPath, { force: true });
+  fs.writeFileSync(shellEntrypointPath, buildOpenClawShellWrapperScript(resolvedExecutablePath), { mode: 0o755 });
+  fs.chmodSync(shellEntrypointPath, 0o755);
+
+  if (!await canExecuteOpenClawCommand(shellEntrypointPath)) {
+    throw new Error(`Failed to repair the OpenClaw shell entrypoint at ${shellEntrypointPath}.`);
+  }
+
+  cachedOpenClawExecutablePath = shellEntrypointPath;
+  return shellEntrypointPath;
+}
+
+async function readOpenClawGatewayServiceVersion() {
+  try {
+    const { stdout } = await execFilePromise('systemctl', ['--user', 'show', 'openclaw-gateway.service', '-p', 'Description', '--value'], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024,
+    });
+    const description = normalizeCliText(stdout);
+    const matched = description.match(/v?(\d{4}\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/i);
+    return matched?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function repairBrokenOpenClawCliInstall(preferredVersion?: string | null) {
+  if (openClawCliRepairInFlight) {
+    return openClawCliRepairInFlight;
+  }
+
+  openClawCliRepairInFlight = (async () => {
+    const gatewayReportedVersion = await readOpenClawGatewayServiceVersion();
+    const targetVersion = normalizeCliText(preferredVersion) || gatewayReportedVersion || 'latest';
+    const packageSpec = targetVersion === 'latest' ? 'openclaw@latest' : `openclaw@${targetVersion}`;
+
+    cachedOpenClawExecutablePath = null;
+    await execFilePromise('npm', ['install', '-g', packageSpec], {
+      timeout: 10 * 60 * 1000,
+      maxBuffer: 1024 * 1024 * 20,
+      env: process.env,
+    });
+
+    cachedOpenClawExecutablePath = null;
+    const resolvedExecutablePath = getOpenClawExecutablePath();
+    await ensureOpenClawShellEntrypoint(resolvedExecutablePath);
+    return cachedOpenClawExecutablePath || resolvedExecutablePath;
+  })();
+
+  try {
+    return await openClawCliRepairInFlight;
+  } finally {
+    openClawCliRepairInFlight = null;
+  }
+}
+
+async function ensureResolvedOpenClawExecutablePath(preferredRepairVersion?: string | null) {
+  try {
+    return getOpenClawExecutablePath();
+  } catch {
+    return repairBrokenOpenClawCliInstall(preferredRepairVersion);
+  }
+}
+
 function getOpenClawExecutablePath() {
   if (cachedOpenClawExecutablePath && isExecutableFile(cachedOpenClawExecutablePath)) {
     return cachedOpenClawExecutablePath;
@@ -614,6 +1519,7 @@ function getOpenClawExecutablePath() {
     path.join(os.homedir(), '.local', 'bin', executableName),
     '/usr/local/bin/openclaw',
     '/usr/bin/openclaw',
+    ...collectOpenClawPackageEntryCandidates(),
   ].filter(Boolean);
 
   const seen = new Set<string>();
@@ -633,12 +1539,82 @@ function getOpenClawExecutablePath() {
 
 async function readOpenClawVersion() {
   try {
-    const { stdout } = await execFilePromise(getOpenClawExecutablePath(), ['--version']);
+    const executablePath = await ensureResolvedOpenClawExecutablePath();
+    const { stdout } = await execFilePromise(executablePath, ['--version']);
     const raw = normalizeCliText(stdout);
     const matched = raw.match(/OpenClaw\s+([^\s(]+)/i);
     return matched?.[1] || raw || null;
   } catch {
     return null;
+  }
+}
+
+async function probeGatewayConnectionStatus(params: {
+  gatewayUrl: string;
+  token?: string;
+  password?: string;
+}, options?: {
+  requireAuth?: boolean;
+}): Promise<{ connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' }> {
+  const gatewayTarget = parseGatewayUrlForStatusProbe(params.gatewayUrl);
+
+  if (gatewayTarget && isLoopbackHostname(gatewayTarget.hostname)) {
+    const health = await probeGatewayHealth(params.gatewayUrl);
+    if (!health.ok) {
+      return {
+        connected: false,
+        message: health.message || 'Local OpenClaw gateway is not responding',
+        source: 'local-runtime',
+      };
+    }
+
+    const credentialMatches = evaluateLocalGatewayCredentialMatch(params, gatewayTarget);
+    if (credentialMatches === true) {
+      return {
+        connected: true,
+        message: 'Local OpenClaw gateway runtime healthy',
+        source: 'local-runtime',
+      };
+    }
+
+    if (credentialMatches === false) {
+      return {
+        connected: false,
+        message: 'Gateway credentials do not match local OpenClaw config',
+        source: 'local-runtime',
+      };
+    }
+
+    if (!options?.requireAuth) {
+      return {
+        connected: true,
+        message: 'Local OpenClaw gateway runtime healthy',
+        source: 'local-runtime',
+      };
+    }
+  }
+
+  const client = new OpenClawClient({
+    gatewayUrl: params.gatewayUrl,
+    token: params.token,
+    password: params.password,
+  });
+  client.on('error', () => {});
+  let timeoutId: NodeJS.Timeout | null = null;
+
+  try {
+    await Promise.race([
+      client.connect(),
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('Gateway connect probe timeout')), 3000);
+      }),
+    ]);
+    return { connected: true, source: 'auth-probe' };
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    client.disconnect();
   }
 }
 
@@ -915,7 +1891,8 @@ function setMaxPermissionsEnabled(enabled: boolean) {
 }
 
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
-  return execFilePromise(getOpenClawExecutablePath(), ['browser', ...args], {
+  const executablePath = await ensureResolvedOpenClawExecutablePath();
+  return execFilePromise(executablePath, ['browser', ...args], {
     timeout: timeoutMs,
     maxBuffer: 1024 * 1024,
   });
@@ -1226,7 +2203,8 @@ async function restartGatewayService() {
     }
   }
   connections.clear();
-  await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
+  const executablePath = await ensureResolvedOpenClawExecutablePath();
+  await execFilePromise(executablePath, ['gateway', 'restart']);
 }
 
 function scheduleGatewayRestart() {
@@ -2419,6 +3397,65 @@ app.get('/api/version/latest', async (_req, res) => {
   }
 });
 
+app.get('/api/openclaw/version/latest', async (_req, res) => {
+  try {
+    const latestInfo = await getOpenClawLatestVersionInfo();
+    res.json(latestInfo);
+  } catch (error: any) {
+    console.error('[OpenClawVersionCheck] Failed to fetch latest version:', error instanceof Error ? error.message : String(error));
+    res.status(502).json(buildStructuredApiError(
+      OPENCLAW_VERSION_LOOKUP_FAILED_ERROR_CODE,
+      error instanceof Error ? error.message : String(error),
+    ));
+  }
+});
+
+app.get('/api/openclaw/update/status', requireAdminAuth, (_req, res) => {
+  res.json({
+    success: true,
+    update: buildOpenClawUpdateStatusResponse(),
+  });
+});
+
+app.post('/api/openclaw/update/start', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await startOpenClawUpdateTask();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(OPENCLAW_UPDATE_START_FAILED_ERROR_CODE, detail));
+  });
+});
+
+app.post('/api/openclaw/update/cancel', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await cancelOpenClawUpdateTask();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(OPENCLAW_UPDATE_CANCEL_FAILED_ERROR_CODE, detail));
+  });
+});
+
+app.post('/api/openclaw/update/reset', requireAdminAuth, (_req, res) => {
+  (async () => {
+    const update = await resetOpenClawUpdateTaskState();
+    res.json({ success: true, update });
+  })().catch((error: any) => {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+    const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+    res.status(500).json(buildStructuredApiError(OPENCLAW_UPDATE_RESET_FAILED_ERROR_CODE, detail));
+  });
+});
+
 app.get('/api/update/status', requireAdminAuth, (_req, res) => {
   res.json({
     success: true,
@@ -2605,15 +3642,16 @@ app.get('/api/gateway/status', async (_req, res) => {
   }
 
   try {
-    const client = new OpenClawClient({ 
-      gatewayUrl: config.gatewayUrl, 
-      token: config.token, 
-      password: config.password 
+    const result = await probeGatewayConnectionStatus({
+      gatewayUrl: config.gatewayUrl,
+      token: config.token,
+      password: config.password,
     });
-    client.on('error', () => {});
-    await client.connect();
-    client.disconnect();
-    res.json({ connected: true });
+    res.json({
+      connected: result.connected,
+      message: result.message,
+      source: result.source,
+    });
   } catch (error: any) {
     res.json({ connected: false, message: error?.message || 'Connection failed' });
   }
@@ -2627,18 +3665,15 @@ app.post('/api/config/test', async (req, res) => {
   }
 
   try {
-    console.log('[API] /api/config/test - Creating client');
-    const client = new OpenClawClient({ gatewayUrl, token, password });
-    client.on('error', (err) => { console.error('[API] Client error:', err); });
-    
-    // Attempt to connect and authenticate
-    console.log('[API] /api/config/test - Connecting client');
-    await client.connect();
-    
-    // If we reach here, connection and authentication succeeded
-    console.log('[API] /api/config/test - Connection successful, disconnecting');
-    client.disconnect();
-    res.json({ success: true, message: 'Connection successful' });
+    const result = await probeGatewayConnectionStatus({ gatewayUrl, token, password }, { requireAuth: true });
+    if (result.connected) {
+      return res.json({ success: true, message: 'Connection successful', source: result.source });
+    }
+
+    res.json(buildStructuredApiError(
+      GATEWAY_TEST_FAILED_ERROR_CODE,
+      result.message || 'Connection failed',
+    ));
   } catch (error: any) {
     console.error('[API] /api/config/test - Connection failed:', error);
     res.json(buildStructuredApiError(GATEWAY_TEST_FAILED_ERROR_CODE, error?.message || 'Connection failed'));
@@ -2865,7 +3900,8 @@ app.post('/api/config/restart', async (_req, res) => {
     connections.clear();
 
     // Execute the actual restart command on the system
-    await execFilePromise(getOpenClawExecutablePath(), ['gateway', 'restart']);
+    const executablePath = await ensureResolvedOpenClawExecutablePath();
+    await execFilePromise(executablePath, ['gateway', 'restart']);
 
     res.json({ success: true, message: 'Gateway connections reset and service restarted' });
   } catch (error: any) {

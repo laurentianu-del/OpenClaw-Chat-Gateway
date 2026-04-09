@@ -133,6 +133,17 @@
     "lookupFailed": "檢查 GitHub 最新版本失敗",
     "directUpgradeUnsupported": "目前部署方式不支援瀏覽器端直接升級。升級需要在伺服器主機上執行受控部署腳本、安裝依賴並重新啟動服務。"
   },
+  "openclawVersion": {
+    "lookupFailed": "檢查 OpenClaw 最新版本失敗"
+  },
+  "openclawUpdate": {
+    "startFailed": "啟動 OpenClaw 更新失敗",
+    "alreadyRunning": "已有 OpenClaw 更新任務正在進行",
+    "noNewVersion": "目前沒有可更新的 OpenClaw 新版本",
+    "cancelFailed": "停止 OpenClaw 更新失敗",
+    "notRunning": "目前沒有可停止的 OpenClaw 更新任務",
+    "resetFailed": "重設 OpenClaw 更新狀態失敗"
+  },
   "agents": {
     "idRequired": "智能體 ID 不能為空",
     "idContainsWhitespace": "智能體 ID 不允許包含空格",
@@ -509,6 +520,38 @@
         "rerank": "重排",
         "embed": "嵌入"
       }
+    },
+    "openclawUpdate": {
+      "title": "OpenClaw",
+      "checkNewVersion": "檢查新版本",
+      "checkUpdateAvailableButton": "發現新版本: {{version}}，點擊進行更新",
+      "checkUpToDateButton": "OpenClaw 已是最新版本，無需更新",
+      "checkRetryButton": "檢查失敗，點擊重試",
+      "progressChecking": "正在檢查 OpenClaw 更新",
+      "progressDownloading": "正在下載 OpenClaw 更新包",
+      "progressInstalling": "正在安裝 OpenClaw 更新包",
+      "progressSwitchingEntrypoint": "正在切換 OpenClaw 命令入口",
+      "progressFinalizingPackage": "正在整理 OpenClaw 更新檔案",
+      "progressUpdating": "正在更新 OpenClaw",
+      "progressClickToStopSuffix": "，點擊停止",
+      "progressStopping": "正在停止 OpenClaw 更新",
+      "progressRepairingEntrypoint": "正在修復 OpenClaw 命令入口",
+      "progressVerifying": "正在確認 OpenClaw 版本",
+      "progressFinishing": "正在完成 OpenClaw 更新",
+      "updateSucceededButton": "OpenClaw 更新成功",
+      "updateFailedButton": "OpenClaw 更新失敗，點擊重試",
+      "updateStoppingButton": "正在停止 OpenClaw 更新",
+      "updateCancelConfirmTitle": "停止本次 OpenClaw 更新？",
+      "updateCancelConfirmMessage": "目前 OpenClaw 更新仍在進行中。確認後會要求後端停止這次更新流程。",
+      "updateCancelUnavailableTitle": "目前階段暫不可停止",
+      "updateCancelUnavailableMessage": "目前 OpenClaw 更新階段暫時不能安全停止，請等待當前步驟完成後再試。",
+      "updateCancelConfirmAction": "確認停止",
+      "updateCancelKeepRunning": "繼續更新",
+      "latestVersionLoadFailed": "檢查 OpenClaw 新版本失敗",
+      "statusLoadFailed": "讀取 OpenClaw 更新狀態失敗",
+      "updateStartFailed": "啟動 OpenClaw 更新失敗",
+      "updateCancelFailed": "停止 OpenClaw 更新失敗",
+      "updateResetFailed": "重設 OpenClaw 更新狀態失敗"
     },
     "about": {
       "headerTitle": "設定 - 關於",
