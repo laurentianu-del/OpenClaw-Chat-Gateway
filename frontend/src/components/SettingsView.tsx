@@ -52,6 +52,47 @@ function resolveStructuredErrorDisplay(
   };
 }
 
+function responseNeedsHostTakeoverPasswordPrompt(data: {
+  errorCode?: string;
+  errorDetail?: string | null;
+  error?: string;
+  message?: string;
+}) {
+  if (data.errorCode === 'gateway.hostTakeoverCredentialsRequired') {
+    return true;
+  }
+
+  const detail = [
+    typeof data.errorDetail === 'string' ? data.errorDetail : '',
+    typeof data.error === 'string' ? data.error : '',
+    typeof data.message === 'string' ? data.message : '',
+  ].join('\n').toLowerCase();
+
+  const sudoPromptDetected = detail.includes('sudo:') || detail.includes('sudo：') || detail.includes('[sudo]');
+  const passwordPromptDetected = detail.includes('password')
+    || detail.includes('密码')
+    || detail.includes('口令')
+    || detail.includes('passphrase');
+  const terminalPromptDetected = detail.includes('terminal') || detail.includes('终端');
+  const authPromptDetected = detail.includes('authentication') || detail.includes('认证');
+
+  return detail.includes('password is required')
+    || detail.includes('a terminal is required')
+    || detail.includes('no askpass program specified')
+    || detail.includes('authentication is required')
+    || detail.includes('需要密码')
+    || detail.includes('需要提供密码')
+    || detail.includes('需要输入密码')
+    || detail.includes('密码是必需的')
+    || detail.includes('必须输入密码')
+    || detail.includes('需要口令')
+    || detail.includes('需要终端')
+    || detail.includes('需要认证')
+    || (sudoPromptDetected && passwordPromptDetected)
+    || (sudoPromptDetected && terminalPromptDetected)
+    || (sudoPromptDetected && authPromptDetected);
+}
+
 type TestStatus = {
   status: 'testing' | 'success' | 'error';
   message?: string;
@@ -2041,7 +2082,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setPermissionsError(EMPTY_INLINE_ERROR);
         setBrowserHealth(null);
         setGatewayRestartNoticeSource('permissions');
-      } else if (nextEnabled && data.errorCode === 'gateway.hostTakeoverCredentialsRequired') {
+      } else if (nextEnabled && responseNeedsHostTakeoverPasswordPrompt(data)) {
         if (typeof data.enabled === 'boolean' || data.hostTakeover) {
           applyMaxPermissionsState(data);
         } else {

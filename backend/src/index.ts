@@ -1787,10 +1787,29 @@ function isHostTakeoverAutoInstallSupported() {
 
 function needsSudoPassword(detail: string) {
   const normalized = normalizeCliText(detail).toLowerCase();
+  const sudoPromptDetected = normalized.includes('sudo:') || normalized.includes('sudo：') || normalized.includes('[sudo]');
+  const passwordPromptDetected = normalized.includes('password')
+    || normalized.includes('密码')
+    || normalized.includes('口令')
+    || normalized.includes('passphrase');
+  const terminalPromptDetected = normalized.includes('terminal') || normalized.includes('终端');
+  const authPromptDetected = normalized.includes('authentication') || normalized.includes('认证');
+
   return normalized.includes('password is required')
     || normalized.includes('a terminal is required')
     || normalized.includes('no askpass program specified')
-    || normalized.includes('authentication is required');
+    || normalized.includes('authentication is required')
+    || normalized.includes('需要密码')
+    || normalized.includes('需要提供密码')
+    || normalized.includes('需要输入密码')
+    || normalized.includes('密码是必需的')
+    || normalized.includes('必须输入密码')
+    || normalized.includes('需要口令')
+    || normalized.includes('需要终端')
+    || normalized.includes('需要认证')
+    || (sudoPromptDetected && passwordPromptDetected)
+    || (sudoPromptDetected && terminalPromptDetected)
+    || (sudoPromptDetected && authPromptDetected);
 }
 
 function normalizePathEntries(pathValue: string | null | undefined) {
