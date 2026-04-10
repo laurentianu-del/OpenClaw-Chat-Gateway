@@ -126,3 +126,13 @@ export function rewriteMessageWithWorkspaceUploads(
     linkedUploads,
   };
 }
+
+export function buildImageUploadInspectionContext(linkedUploads: WorkspaceUploadLink[]): string {
+  const imageUploads = linkedUploads.filter((upload) => upload.kind === 'image' && upload.absolutePath);
+  if (imageUploads.length === 0) return '';
+
+  return [
+    '[System note: uploaded image files for this turn are also available at the absolute paths below. If native image input is unavailable or appears missing, you MUST inspect these files directly before answering and you must not claim the image was missing before checking them.]',
+    ...imageUploads.map((upload, index) => `${index + 1}. ${upload.absolutePath} (${upload.filename})`),
+  ].join('\n');
+}

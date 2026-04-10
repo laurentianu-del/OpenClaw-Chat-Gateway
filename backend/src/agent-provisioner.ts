@@ -49,6 +49,7 @@ export class AgentProvisioner {
 
   constructor() {
     this.openclawDir = path.join(os.homedir(), '.openclaw');
+    this.repairKnownModelCapabilities();
   }
 
   private readConfigFile(): any | null {
@@ -66,6 +67,94 @@ export class AgentProvisioner {
   private writeConfigFile(config: any): void {
     const configPath = path.join(this.openclawDir, 'openclaw.json');
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+  }
+
+  private readUiModelsFile(): Record<string, any> {
+    const uiModelsPath = path.join(this.openclawDir, 'clawui-models.json');
+    if (!fs.existsSync(uiModelsPath)) return {};
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(uiModelsPath, 'utf-8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (error) {
+      console.error('Failed to read clawui-models.json:', error);
+      return {};
+    }
+  }
+
+  private writeUiModelsFile(uiModels: Record<string, any>): void {
+    const uiModelsPath = path.join(this.openclawDir, 'clawui-models.json');
+    fs.writeFileSync(uiModelsPath, JSON.stringify(uiModels, null, 2));
+  }
+
+  private normalizeInputCapabilities(input: unknown): string[] {
+    if (!Array.isArray(input)) return [];
+
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const item of input) {
+      if (typeof item !== 'string') continue;
+      const trimmed = item.trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      normalized.push(trimmed);
+    }
+    return normalized;
+  }
+
+  private inferKnownModelInputCapabilities(modelId: string): string[] {
+    const slashIdx = modelId.indexOf('/');
+    const modelName = (slashIdx === -1 ? modelId : modelId.slice(slashIdx + 1)).trim().toLowerCase();
+
+    if (modelName === 'gpt-5.4') {
+      return ['text', 'image'];
+    }
+
+    return [];
+  }
+
+  private mergeKnownModelInputCapabilities(modelId: string, input: unknown): string[] {
+    const merged = this.normalizeInputCapabilities(input);
+    for (const inferred of this.inferKnownModelInputCapabilities(modelId)) {
+      if (!merged.includes(inferred)) {
+        merged.push(inferred);
+      }
+    }
+    return merged;
+  }
+
+  private repairKnownModelCapabilities(): void {
+    try {
+      const config = this.readConfigFile();
+      if (!config) return;
+
+      const configuredIds = Object.keys(config?.agents?.defaults?.models || {});
+      if (configuredIds.length === 0) return;
+
+      const uiModels = this.readUiModelsFile();
+      let changed = false;
+
+      for (const modelId of configuredIds) {
+        const currentInput = uiModels?.[modelId]?.input;
+        const repairedInput = this.mergeKnownModelInputCapabilities(modelId, currentInput);
+        const normalizedCurrentInput = this.normalizeInputCapabilities(currentInput);
+        if (JSON.stringify(repairedInput) === JSON.stringify(normalizedCurrentInput)) {
+          continue;
+        }
+
+        if (!uiModels[modelId] || typeof uiModels[modelId] !== 'object') {
+          uiModels[modelId] = {};
+        }
+        uiModels[modelId].input = repairedInput;
+        changed = true;
+      }
+
+      if (changed) {
+        this.writeUiModelsFile(uiModels);
+      }
+    } catch (error) {
+      console.error('Failed to repair inferred model capabilities:', error);
+    }
   }
 
   private normalizeModelId(value: unknown): string | null {
@@ -449,6 +538,7 @@ export class AgentProvisioner {
    */
   readAvailableModels(): { id: string; alias?: string; primary: boolean; input: string[] }[] {
     try {
+      this.repairKnownModelCapabilities();
       const config = this.readConfigFile();
       if (!config) return [];
       const modelsMap = config?.agents?.defaults?.models;
@@ -488,6 +578,8 @@ export class AgentProvisioner {
           }
         } catch(e) {}
 
+        input = this.mergeKnownModelInputCapabilities(id, input);
+
         return {
           id,
           alias: meta?.alias || undefined,
@@ -517,19 +609,21 @@ export class AgentProvisioner {
       return false;
     }
 
+    const normalizedInput = input !== undefined
+      ? this.mergeKnownModelInputCapabilities(modelId, input)
+      : undefined;
+
     const entry: Record<string, any> = {};
     if (alias && alias.trim()) entry.alias = alias.trim();
     config.agents.defaults.models[modelId] = entry;
 
     // Synchronize capabilities to clawui-models.json to avoid strict schema validation
-    if (input && input.length > 0) {
+    if (normalizedInput && normalizedInput.length > 0) {
       try {
-        const uiModelsPath = path.join(this.openclawDir, 'clawui-models.json');
-        let uiModels: any = {};
-        if (fs.existsSync(uiModelsPath)) uiModels = JSON.parse(fs.readFileSync(uiModelsPath, 'utf-8'));
+        const uiModels: any = this.readUiModelsFile();
         if (!uiModels[modelId]) uiModels[modelId] = {};
-        uiModels[modelId].input = input;
-        fs.writeFileSync(uiModelsPath, JSON.stringify(uiModels, null, 2));
+        uiModels[modelId].input = normalizedInput;
+        this.writeUiModelsFile(uiModels);
       } catch(e) { console.error('Failed to sync UI models:', e); }
     }
 
@@ -541,14 +635,16 @@ export class AgentProvisioner {
       const existingModel = provider.models.find((m: any) => m.id === modelName);
       if (existingModel) {
         existingModel.name = existingModel.name || `${modelName} (Custom Provider)`;
-        if (input && input.length > 0) existingModel.input = input;
+        if (normalizedInput && normalizedInput.length > 0) existingModel.input = normalizedInput;
       } else {
         provider.models.push({
           id: modelName,
           name: `${modelName} (Custom Provider)`,
           api: provider.api || 'openai-completions',
           reasoning: false,
-          input: input && input.some(i => i === 'text' || i === 'image') ? input.filter(i => i === 'text' || i === 'image') : ['text']
+          input: normalizedInput && normalizedInput.some(i => i === 'text' || i === 'image')
+            ? normalizedInput.filter(i => i === 'text' || i === 'image')
+            : ['text']
         });
       }
     }
@@ -670,6 +766,10 @@ export class AgentProvisioner {
       return false; // Model doesn't exist
     }
 
+    const normalizedInput = input !== undefined
+      ? this.mergeKnownModelInputCapabilities(modelId, input)
+      : undefined;
+
     const current = config.agents.defaults.models[modelId] || {};
     const updated: Record<string, any> = { ...current };
 
@@ -680,19 +780,17 @@ export class AgentProvisioner {
     }
 
     // Update input capabilities (in clawui-models.json instead of openclaw.json)
-    if (input !== undefined) {
+    if (normalizedInput !== undefined) {
       try {
-        const uiModelsPath = path.join(this.openclawDir, 'clawui-models.json');
-        let uiModels: any = {};
-        if (fs.existsSync(uiModelsPath)) uiModels = JSON.parse(fs.readFileSync(uiModelsPath, 'utf-8'));
+        let uiModels: any = this.readUiModelsFile();
         if (!uiModels[modelId]) uiModels[modelId] = {};
         
-        if (input.length > 0) {
-          uiModels[modelId].input = input;
+        if (normalizedInput.length > 0) {
+          uiModels[modelId].input = normalizedInput;
         } else {
           delete uiModels[modelId].input;
         }
-        fs.writeFileSync(uiModelsPath, JSON.stringify(uiModels, null, 2));
+        this.writeUiModelsFile(uiModels);
       } catch(e) { console.error('Failed to sync updated UI models:', e); }
     }
 

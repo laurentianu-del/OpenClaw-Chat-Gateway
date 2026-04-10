@@ -31,7 +31,7 @@ import { exec, execFile, spawn } from 'child_process';
 import util from 'util';
 import net from 'net';
 import sharp from 'sharp';
-import { rewriteMessageWithWorkspaceUploads } from './message-upload-rewrite';
+import { buildImageUploadInspectionContext, rewriteMessageWithWorkspaceUploads } from './message-upload-rewrite';
 import { rewriteVisibleFileLinks } from './file-link-rewrite';
 import {
   buildAudioTranscriptContext,
@@ -4470,11 +4470,12 @@ async function prepareOutgoingMessage(
   const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
   const rewritten = rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
+  const imageInspectionContext = buildImageUploadInspectionContext(rewritten.linkedUploads);
   const transcripts = await prepareAudioTranscriptsFromUploads(rewritten.linkedUploads, agentId);
   const audioTranscriptContext = buildAudioTranscriptContext(transcripts);
 
   return {
-    text: [rewritten.text, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
+    text: [rewritten.text, imageInspectionContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
     attachments: rewritten.attachments,
   };
 }

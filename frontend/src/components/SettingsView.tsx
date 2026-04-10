@@ -1613,7 +1613,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const guessCapabilities = (modelId: string): string[] => {
     const id = modelId.toLowerCase();
     const caps = new Set<string>(['text']);
-    if (/vision|4v|claude-3|claude-opus|claude-sonnet|claude-haiku|gpt-4o|gpt-4-turbo|gemini|llava|qwen.*vl|intern.*vl|glm-4v|minicpm.*v|cogvlm|pixtral|phi.*vision|qvq|kimi.*vl|chatglm.*vl/.test(id)) caps.add('image');
+    if (/vision|4v|claude-3|claude-opus|claude-sonnet|claude-haiku|gpt-4o|gpt-4-turbo|gemini|llava|qwen.*vl|intern.*vl|glm-4v|minicpm.*v|cogvlm|pixtral|phi.*vision|qvq|kimi.*vl|chatglm.*vl|(^|\/)gpt-5\.4$/.test(id)) caps.add('image');
     if (/o1|o3|o4|thinking|reasoning|deepthink|r1|r2/.test(id)) caps.add('reasoning');
     if (/embed|embedding|text-embedding|bge|e5-/.test(id)) caps.add('embed');
     if (/rerank|reranker|bce-reranker/.test(id)) caps.add('rerank');

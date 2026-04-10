@@ -18,6 +18,7 @@ import {
   prepareAudioTranscriptsFromUploads,
 } from './audio-transcription';
 import {
+  buildImageUploadInspectionContext,
   rewriteMessageWithWorkspaceUploads,
   type MessageAttachment,
   type WorkspaceUploadLink,
@@ -647,12 +648,15 @@ export class GroupChatEngine extends EventEmitter {
       const rewrittenTrigger = isResetCommand
         ? { text: triggerMsg, attachments: [] as MessageAttachment[], linkedUploads: [] as WorkspaceUploadLink[] }
         : rewriteMessageWithWorkspaceUploads(triggerMsg, runtimeContext.uploadsPath, { extractImageAttachments: true });
+      const imageInspectionContext = isResetCommand
+        ? ''
+        : buildImageUploadInspectionContext(rewrittenTrigger.linkedUploads);
       const audioTranscriptContext = isResetCommand
         ? ''
         : buildAudioTranscriptContext(
           await prepareAudioTranscriptsFromUploads(rewrittenTrigger.linkedUploads, runtimeContext.runtimeAgentId)
         );
-      const promptInput = [rewrittenTrigger.text, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
+      const promptInput = [rewrittenTrigger.text, imageInspectionContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
 
       const prompt = isResetCommand 
         ? triggerMsg
