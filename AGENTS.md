@@ -69,5 +69,14 @@
 - 新增配置项时，用户应可在界面中查看和配置；若暂时做不到，标记 `TODO` 并说明原因。
 - 只有在相关命令仍可执行、且剩余运行时风险已写明时，任务才算完成。
 
+## 发布关键步骤
+- 本仓库正式发布依赖两部分同时成功：`git tag` 推送成功，以及 GitHub Actions `Release Sync` 成功创建 GitHub Release；只有 tag 没有 Release，不算发布完成。
+- 发布前先把根 `package.json.version` 改到目标版本；`package-lock.json` 作为派生文件同步更新，但版本真值源仍然只有根 `package.json`。
+- 发布前必须新增对应的 release notes 文件，命名固定为 `docs/release-notes-vX.Y.Z.md`；内容可精简，但文件必须存在。GitHub Actions 会读取这个文件创建 Release，缺失时会导致 tag 已推送但 Release 失败。
+- 发布顺序固定为：更新版本号 -> 新增 `docs/release-notes-vX.Y.Z.md` -> 运行必要的 `npm run test` / `npm run build` -> 提交到 `main` -> 推送 `main` -> 执行 `npm run release:publish` 推送 tag。
+- `npm run release:publish` 只负责创建并推送 tag；GitHub Release 由 `.github/workflows/release-sync.yml` 在 tag push 后自动创建，不要每次都重新寻找手工发布方法。
+- 发布后必须显式核对四项一致：根 `package.json.version`、远端 `main` 对应 commit、远端 tag `vX.Y.Z^{}`、GitHub Release 页面；四项不一致时，不得宣称版本已发布完成。
+- 若 tag 已推送但 GitHub Release 缺失，第一检查项就是对应的 `docs/release-notes-vX.Y.Z.md` 是否随 tag 所指 commit 一起存在；如果缺失，应补文件、提交、将 tag 重新指向新提交并重新推送，再等待 `Release Sync` 重跑成功。
+
 ## 已知残余风险
 - 同一 `sessionId` 叠发多条请求时，旧 run 的 `cleanup` 仍可能影响新 run 的活动状态、SSE 附着或最终消息落库；这是独立的并发风险，不能与已解决的“单聊半句截断”问题混为同一根因，也不能按“长文本被短文本覆盖”处理。
