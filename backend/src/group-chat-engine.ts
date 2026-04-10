@@ -18,6 +18,12 @@ import {
   prepareAudioTranscriptsFromUploads,
 } from './audio-transcription';
 import {
+  buildDocumentToolingContext,
+  buildManagedDocumentToolingInstruction,
+  ensureManagedDocumentToolingReady,
+  hasDocumentUploads,
+} from './document-tooling';
+import {
   buildImageUploadInspectionContext,
   rewriteMessageWithWorkspaceUploads,
   type MessageAttachment,
@@ -96,6 +102,7 @@ function buildGroupHostTakeoverPrompt(): string {
     'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
     'Treat installed host tools as part of your execution environment: if a command-line tool exists on this machine, you should discover it from PATH and use it directly instead of claiming the product lacks that capability.',
     'For uploaded files or workspace files, use their absolute paths. When the model cannot natively understand a file type, first call the appropriate local tool to inspect, transcribe, convert, extract, or summarize it, then continue the task.',
+    buildManagedDocumentToolingInstruction(),
     `Immediate root entrypoint: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH}`,
     `Run a complex root shell with: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
     `To drop back to the normal user, run: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} --as-user ${currentUser} -- <command>`,
@@ -648,15 +655,25 @@ export class GroupChatEngine extends EventEmitter {
       const rewrittenTrigger = isResetCommand
         ? { text: triggerMsg, attachments: [] as MessageAttachment[], linkedUploads: [] as WorkspaceUploadLink[] }
         : rewriteMessageWithWorkspaceUploads(triggerMsg, runtimeContext.uploadsPath, { extractImageAttachments: true });
+      if (!isResetCommand && isGroupHostTakeoverEnabled() && hasDocumentUploads(rewrittenTrigger.linkedUploads)) {
+        try {
+          await ensureManagedDocumentToolingReady();
+        } catch (error) {
+          console.error('[GroupChatEngine] Failed to prepare managed document tooling runtime:', error);
+        }
+      }
       const imageInspectionContext = isResetCommand
         ? ''
         : buildImageUploadInspectionContext(rewrittenTrigger.linkedUploads);
+      const documentToolingContext = isResetCommand
+        ? ''
+        : buildDocumentToolingContext(rewrittenTrigger.linkedUploads);
       const audioTranscriptContext = isResetCommand
         ? ''
         : buildAudioTranscriptContext(
           await prepareAudioTranscriptsFromUploads(rewrittenTrigger.linkedUploads, runtimeContext.runtimeAgentId)
         );
-      const promptInput = [rewrittenTrigger.text, imageInspectionContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
+      const promptInput = [rewrittenTrigger.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
 
       const prompt = isResetCommand 
         ? triggerMsg
@@ -723,6 +740,7 @@ export class GroupChatEngine extends EventEmitter {
         let firstCompletionWaitResolvedAt: number | null = null;
         let finalEventGeneration = 0;
         let settledCalibrationGeneration = 0;
+        let pendingErrorDetail = '';
 
         const clearIdleTimeout = () => {
           if (idleTimeout) {
@@ -861,6 +879,11 @@ export class GroupChatEngine extends EventEmitter {
               return;
             }
 
+            if (!completedOutput.trim() && pendingErrorDetail) {
+              rejectOnce(new Error(pendingErrorDetail));
+              return;
+            }
+
             resolveOnce(completedOutput);
           } catch (error: any) {
             if (settled) return;
@@ -869,7 +892,7 @@ export class GroupChatEngine extends EventEmitter {
               scheduleCompletionProbe();
               return;
             }
-            rejectOnce(error instanceof Error ? error : new Error(detail || 'Failed waiting for group run completion.'));
+            rejectOnce(new Error(pendingErrorDetail || detail || 'Failed waiting for group run completion.'));
           } finally {
             completionProbeInFlight = false;
             if (!settled && completionProbePending && !completionProbeTimer) {
@@ -948,7 +971,9 @@ export class GroupChatEngine extends EventEmitter {
 
         const onError = (data: { sessionKey: string; runId: string; error: string }) => {
           if (data.sessionKey === finalSessionKey && data.runId === runId) {
-            rejectOnce(new Error(data.error));
+            pendingErrorDetail = (data.error || '').trim() || 'Unknown stream error';
+            resetIdleTimeout();
+            scheduleCompletionProbe(0);
           }
         };
 

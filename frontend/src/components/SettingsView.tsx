@@ -361,6 +361,13 @@ type UpdateRestartStep = {
   updatedAt: string | null;
 };
 
+type PersistedUpdateRestartModalState = {
+  stage: 'restarting';
+  detail: string;
+  stepSnapshot: UpdateRestartStep[] | null;
+  startedAtMs: number | null;
+};
+
 type BrowserTaskPhaseVisual = {
   progress: number;
   labelKey: string;
@@ -402,11 +409,97 @@ const OPENCLAW_UPDATE_PHASE_VISUALS: Record<string, UpdatePhaseVisual> = {
 
 const CONNECTION_STATUS_REFRESH_EVENT = 'clawui:refresh-connection-status';
 const UPDATE_RESTART_MODAL_TIMEOUT_MS = 5 * 60 * 1000;
+const UPDATE_RESTART_MODAL_STORAGE_KEY = 'clawui:update-restart-modal';
 const UPDATE_RESTART_STEP_IDS: UpdateRestartStepId[] = [
   'restart_openclaw',
   'restart_project',
   'warmup_browser',
 ];
+
+const normalizeUpdateRestartSteps = (raw: unknown): UpdateRestartStep[] | null => {
+  if (!Array.isArray(raw)) return null;
+
+  return UPDATE_RESTART_STEP_IDS.map((id) => {
+    const matched = raw.find((entry) => (
+      entry
+      && typeof entry === 'object'
+      && typeof (entry as { id?: unknown }).id === 'string'
+      && (entry as { id: string }).id.trim() === id
+    )) as { status?: unknown; detail?: unknown; updatedAt?: unknown } | undefined;
+
+    const status = typeof matched?.status === 'string' ? matched.status.trim() : '';
+    return {
+      id,
+      status: status === 'running' || status === 'completed' || status === 'failed' ? status : 'pending',
+      detail: typeof matched?.detail === 'string' && matched.detail.trim() ? matched.detail.trim() : null,
+      updatedAt: typeof matched?.updatedAt === 'string' && matched.updatedAt.trim() ? matched.updatedAt.trim() : null,
+    };
+  });
+};
+
+const deriveUpdateRestartStartedAtMs = (update: UpdateStatusInfo | null) => {
+  if (!update) return null;
+
+  const stepTimes = (normalizeUpdateRestartSteps(update.restartSteps) || [])
+    .filter((step) => step.status !== 'pending')
+    .map((step) => parseTimestampMs(step.updatedAt))
+    .filter((value): value is number => value !== null);
+
+  if (stepTimes.length) {
+    return Math.min(...stepTimes);
+  }
+
+  return parseTimestampMs(update.updatedAt);
+};
+
+const readPersistedUpdateRestartModalState = (): PersistedUpdateRestartModalState | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(UPDATE_RESTART_MODAL_STORAGE_KEY);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw) as Partial<PersistedUpdateRestartModalState>;
+    if (parsed.stage !== 'restarting') {
+      return null;
+    }
+
+    const startedAtMs = typeof parsed.startedAtMs === 'number' && Number.isFinite(parsed.startedAtMs)
+      ? parsed.startedAtMs
+      : null;
+    return {
+      stage: 'restarting',
+      detail: typeof parsed.detail === 'string' ? parsed.detail : '',
+      stepSnapshot: normalizeUpdateRestartSteps(parsed.stepSnapshot),
+      startedAtMs,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const writePersistedUpdateRestartModalState = (state: PersistedUpdateRestartModalState | null) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  if (!state) {
+    window.localStorage.removeItem(UPDATE_RESTART_MODAL_STORAGE_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(UPDATE_RESTART_MODAL_STORAGE_KEY, JSON.stringify(state));
+};
+
+const isPersistedUpdateRestartModalStateFresh = (state: PersistedUpdateRestartModalState | null) => {
+  if (!state?.startedAtMs) {
+    return true;
+  }
+
+  return Date.now() - state.startedAtMs <= UPDATE_RESTART_MODAL_TIMEOUT_MS + 60 * 1000;
+};
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
@@ -538,12 +631,13 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [latestVersionError, setLatestVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isCheckingLatestVersion, setIsCheckingLatestVersion] = useState(false);
   const [updateStatusInfo, setUpdateStatusInfo] = useState<UpdateStatusInfo | null>(null);
+  const [hasLoadedUpdateStatusOnce, setHasLoadedUpdateStatusOnce] = useState(false);
   const [updateRestartModalStage, setUpdateRestartModalStage] = useState<RestartFlowModalStage>(null);
   const [updateRestartModalDetail, setUpdateRestartModalDetail] = useState('');
   const [updateRestartStepSnapshot, setUpdateRestartStepSnapshot] = useState<UpdateRestartStep[] | null>(null);
+  const [updateRestartModalStartedAtMs, setUpdateRestartModalStartedAtMs] = useState<number | null>(null);
   const [isUpdateCancelModalOpen, setIsUpdateCancelModalOpen] = useState(false);
   const [isCancellingUpdate, setIsCancellingUpdate] = useState(false);
-  const updateRestartModalStartedAtRef = useRef<number | null>(null);
   const gatewayRestartTaskInfoRef = useRef<GatewayRestartTaskInfo | null>(null);
   const pendingGatewayRestartStartRef = useRef<{ trigger: GatewayRestartTrigger; startedAtMs: number } | null>(null);
 
@@ -765,6 +859,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        setHasLoadedUpdateStatusOnce(true);
         if (!options?.quiet) {
           const display = resolveStructuredErrorDisplay(data, t, 'settings.about.updateStatusLoadFailed');
           setLatestVersionError(display);
@@ -773,8 +868,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       }
       const nextUpdate = data.update as UpdateStatusInfo;
       setUpdateStatusInfo(nextUpdate);
+      setHasLoadedUpdateStatusOnce(true);
       return nextUpdate;
     } catch (error) {
+      setHasLoadedUpdateStatusOnce(true);
       if (!options?.quiet) {
         const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
         setLatestVersionError({
@@ -1122,13 +1219,21 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setUpdateRestartModalStage(null);
     setUpdateRestartModalDetail('');
     setUpdateRestartStepSnapshot(null);
-    updateRestartModalStartedAtRef.current = null;
+    setUpdateRestartModalStartedAtMs(null);
+    writePersistedUpdateRestartModalState(null);
   };
 
   const handleConfirmRestartUpdatedService = async () => {
+    const startedAtMs = Date.now();
     setUpdateRestartModalDetail('');
     setUpdateRestartModalStage('restarting');
-    updateRestartModalStartedAtRef.current = Date.now();
+    setUpdateRestartModalStartedAtMs(startedAtMs);
+    writePersistedUpdateRestartModalState({
+      stage: 'restarting',
+      detail: '',
+      stepSnapshot: null,
+      startedAtMs,
+    });
     try {
       const res = await fetch('/api/update/restart-service', {
         method: 'POST',
@@ -1143,7 +1248,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
           display.detail,
         ]));
         setUpdateRestartModalStage('failure');
-        updateRestartModalStartedAtRef.current = null;
+        setUpdateRestartModalStartedAtMs(null);
+        writePersistedUpdateRestartModalState(null);
         return;
       }
       setUpdateStatusInfo(data.update as UpdateStatusInfo);
@@ -1152,7 +1258,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       const detail = error instanceof Error && error.message.trim() ? error.message.trim() : '';
       setUpdateRestartModalDetail(detail);
       setUpdateRestartModalStage('failure');
-      updateRestartModalStartedAtRef.current = null;
+      setUpdateRestartModalStartedAtMs(null);
+      writePersistedUpdateRestartModalState(null);
     }
   };
 
@@ -1421,10 +1528,90 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   }, [updateStatusInfo?.status]);
 
   useEffect(() => {
-    if (updateStatusInfo?.restartSteps?.length) {
-      setUpdateRestartStepSnapshot(updateStatusInfo.restartSteps);
+    const nextSteps = normalizeUpdateRestartSteps(updateStatusInfo?.restartSteps);
+    if (nextSteps?.length) {
+      setUpdateRestartStepSnapshot(nextSteps);
     }
   }, [updateStatusInfo?.restartSteps]);
+
+  useEffect(() => {
+    if (settingsTab !== 'about' || !hasLoadedUpdateStatusOnce) {
+      return;
+    }
+
+    const persistedState = readPersistedUpdateRestartModalState();
+    const freshPersistedState = isPersistedUpdateRestartModalStateFresh(persistedState)
+      ? persistedState
+      : null;
+
+    if (persistedState && !freshPersistedState) {
+      writePersistedUpdateRestartModalState(null);
+    }
+
+    if (updateStatusInfo?.status === 'restarting') {
+      const startedAtMs = deriveUpdateRestartStartedAtMs(updateStatusInfo)
+        ?? freshPersistedState?.startedAtMs
+        ?? Date.now();
+
+      setUpdateRestartModalDetail('');
+      setUpdateRestartModalStage('restarting');
+      setUpdateRestartModalStartedAtMs(startedAtMs);
+      return;
+    }
+
+    if (updateStatusInfo?.status === 'restart_failed') {
+      setUpdateRestartModalDetail(joinDistinctLines([
+        updateStatusInfo.message,
+        updateStatusInfo.rawDetail,
+      ]));
+      setUpdateRestartModalStage('failure');
+      setUpdateRestartModalStartedAtMs(null);
+      return;
+    }
+
+    if (freshPersistedState && (updateStatusInfo?.status === 'idle' || !updateStatusInfo) && !isConnected) {
+      setUpdateRestartModalDetail(freshPersistedState.detail);
+      setUpdateRestartModalStage('restarting');
+      setUpdateRestartModalStartedAtMs(freshPersistedState.startedAtMs);
+      if (freshPersistedState.stepSnapshot?.length) {
+        setUpdateRestartStepSnapshot(freshPersistedState.stepSnapshot);
+      }
+      return;
+    }
+
+    if (freshPersistedState && isConnected) {
+      writePersistedUpdateRestartModalState(null);
+    }
+  }, [
+    hasLoadedUpdateStatusOnce,
+    isConnected,
+    settingsTab,
+    updateStatusInfo,
+  ]);
+
+  useEffect(() => {
+    if (!hasLoadedUpdateStatusOnce && updateRestartModalStage !== 'restarting') {
+      return;
+    }
+
+    if (updateRestartModalStage !== 'restarting') {
+      writePersistedUpdateRestartModalState(null);
+      return;
+    }
+
+    writePersistedUpdateRestartModalState({
+      stage: 'restarting',
+      detail: updateRestartModalDetail,
+      stepSnapshot: updateRestartStepSnapshot,
+      startedAtMs: updateRestartModalStartedAtMs,
+    });
+  }, [
+    hasLoadedUpdateStatusOnce,
+    updateRestartModalDetail,
+    updateRestartModalStage,
+    updateRestartModalStartedAtMs,
+    updateRestartStepSnapshot,
+  ]);
 
   useEffect(() => {
     if (openClawUpdateStatusInfo?.status !== 'updating') {
@@ -1435,16 +1622,6 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
   useEffect(() => {
     if (updateRestartModalStage !== 'restarting') {
-      return;
-    }
-
-    if (updateStatusInfo?.status === 'restart_failed') {
-      setUpdateRestartModalDetail(joinDistinctLines([
-        updateStatusInfo.message,
-        updateStatusInfo.rawDetail,
-      ]));
-      setUpdateRestartModalStage('failure');
-      updateRestartModalStartedAtRef.current = null;
       return;
     }
 
@@ -1467,7 +1644,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       if (cancelled) return;
       setUpdateRestartModalDetail('');
       setUpdateRestartModalStage('success');
-      updateRestartModalStartedAtRef.current = null;
+      setUpdateRestartModalStartedAtMs(null);
     })();
 
     return () => {
@@ -1476,32 +1653,28 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   }, [
     isConnected,
     updateRestartModalStage,
-    updateStatusInfo?.message,
-    updateStatusInfo?.rawDetail,
     updateStatusInfo?.status,
   ]);
 
   useEffect(() => {
-    if (updateRestartModalStage !== 'restarting') {
+    if (updateRestartModalStage !== 'restarting' || !updateRestartModalStartedAtMs) {
       return;
     }
 
     const timer = window.setInterval(() => {
-      const startedAt = updateRestartModalStartedAtRef.current;
-      if (!startedAt) return;
-      if (Date.now() - startedAt < UPDATE_RESTART_MODAL_TIMEOUT_MS) {
+      if (Date.now() - updateRestartModalStartedAtMs < UPDATE_RESTART_MODAL_TIMEOUT_MS) {
         return;
       }
 
       setUpdateRestartModalDetail(t('settings.about.restartServiceWaitTimeoutDetail'));
       setUpdateRestartModalStage('failure');
-      updateRestartModalStartedAtRef.current = null;
+      setUpdateRestartModalStartedAtMs(null);
     }, 1000);
 
     return () => {
       window.clearInterval(timer);
     };
-  }, [t, updateRestartModalStage]);
+  }, [t, updateRestartModalStage, updateRestartModalStartedAtMs]);
 
   const fetchModels = async () => {
     try {

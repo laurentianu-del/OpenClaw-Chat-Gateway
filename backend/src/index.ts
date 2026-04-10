@@ -38,6 +38,12 @@ import {
   ensureManagedLocalAudioRuntimeReady,
   prepareAudioTranscriptsFromUploads,
 } from './audio-transcription';
+import {
+  buildDocumentToolingContext,
+  buildManagedDocumentToolingInstruction,
+  ensureManagedDocumentToolingReady,
+  hasDocumentUploads,
+} from './document-tooling';
 import type { ChatRow, MessagePageInfo, MessageSearchMatch, StoredFileRow } from './db';
 import {
   type ChatHistorySnapshot,
@@ -2374,6 +2380,7 @@ function buildHostTakeoverChatInstruction() {
     'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
     'Treat installed host tools as part of your execution environment: if a command-line tool exists on this machine, you should discover it from PATH and use it directly instead of claiming the product lacks that capability.',
     'For uploaded files or workspace files, use their absolute paths. When the model cannot natively understand a file type, first call the appropriate local tool to inspect, transcribe, convert, extract, or summarize it, then continue the task.',
+    buildManagedDocumentToolingInstruction(),
     `Immediate root entrypoint: ${HOST_TAKEOVER_HOST_ROOT_PATH}`,
     `Run a single root command with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /usr/bin/id -u`,
     `Run a complex root shell with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
@@ -3193,9 +3200,7 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
     setMaxPermissionsEnabled(enabled);
 
     if (enabled) {
-      void ensureManagedLocalAudioRuntimeReady().catch((error) => {
-        console.error('Failed to prepare managed local audio transcription runtime:', error);
-      });
+      warmManagedHostToolingInBackground();
     }
 
     return {
@@ -3226,6 +3231,12 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
 
     throw error;
   }
+}
+
+if (readMaxPermissionsEnabled() === true) {
+  setImmediate(() => {
+    warmManagedHostToolingInBackground();
+  });
 }
 
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
@@ -4473,12 +4484,20 @@ async function prepareOutgoingMessage(
   const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
   const rewritten = rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
+  if (readMaxPermissionsEnabled() === true && hasDocumentUploads(rewritten.linkedUploads)) {
+    try {
+      await ensureManagedDocumentToolingReady();
+    } catch (error) {
+      console.error('Failed to prepare managed document tooling runtime for outgoing message:', error);
+    }
+  }
   const imageInspectionContext = buildImageUploadInspectionContext(rewritten.linkedUploads);
+  const documentToolingContext = buildDocumentToolingContext(rewritten.linkedUploads);
   const transcripts = await prepareAudioTranscriptsFromUploads(rewritten.linkedUploads, agentId);
   const audioTranscriptContext = buildAudioTranscriptContext(transcripts);
 
   return {
-    text: [rewritten.text, imageInspectionContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
+    text: [rewritten.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
     attachments: rewritten.attachments,
   };
 }
@@ -6520,6 +6539,7 @@ interface ActiveRun {
   finalEventGeneration: number;
   settledCalibrationGeneration: number;
   latestFinalEventAt?: number;
+  pendingErrorDetail?: string;
   clientRef?: OpenClawClient;
 }
 
@@ -6535,6 +6555,15 @@ interface PendingChatPreparation {
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
+}
+
+function warmManagedHostToolingInBackground() {
+  void ensureManagedLocalAudioRuntimeReady().catch((error) => {
+    console.error('Failed to prepare managed local audio transcription runtime:', error);
+  });
+  void ensureManagedDocumentToolingReady().catch((error) => {
+    console.error('Failed to prepare managed document tooling runtime:', error);
+  });
 }
 
 function isStreamingClientOpen(res: express.Response): boolean {
@@ -6716,6 +6745,7 @@ class ActiveRunManager {
       finalEventGeneration: 0,
       settledCalibrationGeneration: 0,
       latestFinalEventAt: undefined,
+      pendingErrorDetail: undefined,
       clientRef
     };
     this.runs.set(sessionId, run);
@@ -6766,7 +6796,9 @@ class ActiveRunManager {
 
     const onError = (data: { sessionKey: string; runId: string; error: string }) => {
       if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
-        this.failRun(run, data.error);
+        run.pendingErrorDetail = normalizeCliText(data.error) || 'Unknown stream error';
+        this.resetIdleTimeout(run);
+        this.scheduleCompletionProbe(run, 0);
       }
     };
 
@@ -6870,6 +6902,7 @@ class ActiveRunManager {
 
     run.completionProbeInFlight = true;
     const probeFinalGeneration = run.finalEventGeneration;
+    const pendingErrorDetail = normalizeCliText(run.pendingErrorDetail) || '';
 
     try {
       await run.clientRef.waitForRun(run.runId, CHAT_STREAM_COMPLETION_WAIT_TIMEOUT_MS);
@@ -6978,12 +7011,17 @@ class ActiveRunManager {
       }
 
       if (isAwaitingInitialTerminalEvidence) {
-        this.failRun(run, 'Run completed without a terminal assistant response.');
+        this.failRun(run, pendingErrorDetail || 'Run completed without a terminal assistant response.');
         return;
       }
 
       if (isAwaitingSettledFinalCalibration) {
-        this.failRun(run, 'Run completed but the final assistant response never settled.');
+        this.failRun(run, pendingErrorDetail || 'Run completed but the final assistant response never settled.');
+        return;
+      }
+
+      if (!completedOutput.trim() && pendingErrorDetail) {
+        this.failRun(run, pendingErrorDetail);
         return;
       }
 
@@ -6995,7 +7033,7 @@ class ActiveRunManager {
         this.scheduleCompletionProbe(run);
         return;
       }
-      this.failRun(run, detail || 'Failed waiting for run completion.');
+      this.failRun(run, pendingErrorDetail || detail || 'Failed waiting for run completion.');
     } finally {
       run.completionProbeInFlight = false;
       if (this.runs.has(run.sessionId) && run.completionProbePending && !run.completionProbeTimer) {
