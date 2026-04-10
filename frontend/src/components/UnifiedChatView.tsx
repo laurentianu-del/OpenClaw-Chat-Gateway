@@ -842,7 +842,7 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     }
     return Array.from(active);
   }, [groupRunState.active, groupRunState.agentId, isGroup, typingAgents]);
-  const isGroupBusy = isGroup && activeProcessingAgents.length > 0;
+  const isGroupBusy = isGroup && (groupRunState.active || activeProcessingAgents.length > 0);
 
   const formatMessageDate = useCallback((date: Date | string | number) => (
     new Date(date).toLocaleDateString(currentLocale, { year: 'numeric', month: 'long', day: 'numeric' })
@@ -2243,31 +2243,62 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
   }, [resolveNextLiveGroupLeafId]);
 
   const recoverGroupActiveRun = useCallback(async (signal?: AbortSignal) => {
-    if (!isGroup || !activeKey) return { ok: false as const, active: false as const };
+    if (!isGroup || !activeKey) return { ok: false as const, active: false as const, runState: null as GroupRunState | null };
 
     try {
       const response = await fetch(`/api/groups/${activeKey}/active-run`, { signal });
       const data = await response.json();
       if (!data?.success) {
-        return { ok: false as const, active: false as const };
+        return { ok: false as const, active: false as const, runState: null as GroupRunState | null };
       }
+
+      const runState: GroupRunState | null = data.runState && typeof data.runState === 'object'
+        ? {
+            active: !!data.runState.active,
+            agentId: typeof data.runState.agentId === 'string' ? data.runState.agentId : null,
+            runId: typeof data.runState.runId === 'string' ? data.runState.runId : null,
+            startedAt: typeof data.runState.startedAt === 'number' ? data.runState.startedAt : null,
+          }
+        : null;
 
       if (data.message) {
         upsertGroupStreamMessage(data.message);
       }
 
       if (!data.active) {
-        return { ok: true as const, active: false as const };
+        return { ok: true as const, active: false as const, runState };
       }
 
-      return { ok: true as const, active: true as const };
+      return { ok: true as const, active: true as const, runState };
     } catch (error: any) {
       if (error?.name === 'AbortError') {
-        return { ok: false as const, active: false as const };
+        return { ok: false as const, active: false as const, runState: null as GroupRunState | null };
       }
-      return { ok: false as const, active: false as const };
+      return { ok: false as const, active: false as const, runState: null as GroupRunState | null };
     }
   }, [activeKey, isGroup, upsertGroupStreamMessage]);
+
+  useEffect(() => {
+    if (!isGroup || !activeKey || isInitialLoading) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    void (async () => {
+      const recovery = await recoverGroupActiveRun(controller.signal);
+      if (controller.signal.aborted || !recovery.ok || !recovery.runState) return;
+
+      setGroupRunState(recovery.runState);
+      if (!recovery.runState.active) {
+        setTypingAgents(new Map());
+      }
+    })();
+
+    return () => {
+      controller.abort();
+    };
+  }, [activeKey, isGroup, isInitialLoading, recoverGroupActiveRun]);
 
   const recoverLatestGroupMessages = useCallback(async (focusLatest = false) => {
     if (!isGroup || !activeKey) return false;
@@ -2367,6 +2398,9 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       void (async () => {
         const recovery = await recoverGroupActiveRun();
         if (!recovery.ok) return;
+        if (recovery.runState) {
+          setGroupRunState(recovery.runState);
+        }
         if (!recovery.active) {
           setGroupRunState({ active: false, agentId: null, runId: null, startedAt: null });
           setTypingAgents(new Map());
@@ -2393,6 +2427,9 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       if (cancelled) return;
       const recovery = await recoverGroupActiveRun(controller.signal);
       if (cancelled) return;
+      if (recovery.runState) {
+        setGroupRunState(recovery.runState);
+      }
       if (recovery.ok && !recovery.active) {
         setGroupRunState({ active: false, agentId: null, runId: null, startedAt: null });
         setTypingAgents(new Map());
@@ -2436,7 +2473,10 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     const poll = async (focusLatest: boolean) => {
       if (cancelled || newerHistoryPagesRef.current.length > 0) return;
 
-      await recoverGroupActiveRun(controller.signal);
+      const recovery = await recoverGroupActiveRun(controller.signal);
+      if (recovery.runState) {
+        setGroupRunState(recovery.runState);
+      }
       if (cancelled || newerHistoryPagesRef.current.length > 0) return;
 
       await recoverLatestGroupMessages(focusLatest);
@@ -2505,16 +2545,33 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
   const handleSaveEdit = async () => {
     if (!editingMessageId) return;
     clearNewerHistoryWindowTrail();
-    
+
+    const serializeAttachmentMarkdown = (attachment: { name?: string; url: string; isImage?: boolean }) => {
+      const attachmentName = attachment.name?.trim() || t('common.file');
+      return `${attachment.isImage ? '!' : ''}[${attachmentName}](${attachment.url})`;
+    };
+
+    const existingAttachmentContent = editExistingAttachments
+      .map((attachment) => serializeAttachmentMarkdown(attachment))
+      .join('\n');
+    const uploadedAttachmentContent = editPendingFiles.length > 0
+      ? await uploadFiles(editPendingFiles)
+      : '';
+    const nextContent = [existingAttachmentContent, uploadedAttachmentContent, editContent.trim()]
+      .filter(Boolean)
+      .join('\n\n');
+
+    if (!nextContent) return;
+
     // Optimistic UI Update
-    setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, content: editContent } : m));
+    setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, content: nextContent } : m));
 
     const editedMsg = messages.find(m => m.id === editingMessageId);
 
     if (isChat) {
       try {
         await fetch(`/api/messages/${editingMessageId}`, {
-          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: editContent })
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: nextContent })
         });
         
         // Auto-regenerate if it's a user message
@@ -2524,13 +2581,13 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
             && message.parentId === editingMessageId
           );
           const regenerateTarget = latestReply ?? ({ id: `dummy-${Date.now()}`, role: 'assistant', parentId: editingMessageId } as ChatMessage);
-          handleRegenerate(regenerateTarget, editContent);
+          handleRegenerate(regenerateTarget, nextContent);
         }
       } catch {}
     } else if (isGroup && currentGroup) {
       try {
         await fetch(`/api/groups/${currentGroup.id}/messages/${editingMessageId}`, {
-          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: editContent })
+          method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: nextContent })
         });
       } catch {}
     }

@@ -176,7 +176,9 @@
     "groupSystemPrompt": "系統提示詞",
     "members": "成員",
     "runError": "執行失敗",
-    "gatewayDisconnected": "網關連線已中斷"
+    "gatewayDisconnected": "網關連線已中斷",
+    "audioTranscriptionUnavailable": "目前未設定可用的音訊轉寫能力",
+    "audioTranscriptionFailed": "音訊轉寫失敗"
   },
   "group": {
     "maxChainDepthReached": "鏈式轉發已達到最大深度 ({{maxDepth}} 輪)",

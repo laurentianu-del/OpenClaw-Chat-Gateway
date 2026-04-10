@@ -176,7 +176,9 @@
     "groupSystemPrompt": "System Prompt",
     "members": "Members",
     "runError": "Run failed",
-    "gatewayDisconnected": "Gateway connection lost"
+    "gatewayDisconnected": "Gateway connection lost",
+    "audioTranscriptionUnavailable": "No usable audio transcription capability is configured",
+    "audioTranscriptionFailed": "Audio transcription failed"
   },
   "group": {
     "maxChainDepthReached": "Chain forwarding reached the maximum depth ({{maxDepth}} rounds)",

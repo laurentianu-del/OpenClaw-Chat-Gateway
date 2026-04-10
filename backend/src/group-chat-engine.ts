@@ -12,7 +12,16 @@ import {
   shouldPreferSettledAssistantText,
 } from './chat-history-reconciliation';
 import { EventEmitter } from 'events';
-import { rewriteMessageWithWorkspaceUploads, type MessageAttachment } from './message-upload-rewrite';
+import {
+  AudioPreparationError,
+  buildAudioTranscriptContext,
+  prepareAudioTranscriptsFromUploads,
+} from './audio-transcription';
+import {
+  rewriteMessageWithWorkspaceUploads,
+  type MessageAttachment,
+  type WorkspaceUploadLink,
+} from './message-upload-rewrite';
 import { rewriteVisibleFileLinks } from './file-link-rewrite';
 import { getGroupRuntimeSessionKey } from './group-workspace';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
@@ -54,6 +63,18 @@ type ActiveGroupRun = {
   text: string;
 };
 
+type PendingGroupRun = {
+  groupId: string;
+  agentId: string | null;
+  agentName: string | null;
+  startedAt: number;
+  messageId?: number;
+  parentId?: number;
+  modelUsed?: string;
+  createdAt?: string;
+  text: string;
+};
+
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
 }
@@ -72,6 +93,8 @@ function buildGroupHostTakeoverPrompt(): string {
   return [
     '【Host takeover】',
     'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
+    'Treat installed host tools as part of your execution environment: if a command-line tool exists on this machine, you should discover it from PATH and use it directly instead of claiming the product lacks that capability.',
+    'For uploaded files or workspace files, use their absolute paths. When the model cannot natively understand a file type, first call the appropriate local tool to inspect, transcribe, convert, extract, or summarize it, then continue the task.',
     `Immediate root entrypoint: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH}`,
     `Run a complex root shell with: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
     `To drop back to the normal user, run: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} --as-user ${currentUser} -- <command>`,
@@ -152,6 +175,7 @@ export class GroupChatEngine extends EventEmitter {
       uploadsPath: string;
       outputPath: string;
   }>;
+  private pendingRuns = new Map<string, PendingGroupRun>();
   private activeRuns = new Map<string, ActiveGroupRun>();
 
   constructor(
@@ -174,16 +198,32 @@ export class GroupChatEngine extends EventEmitter {
 
   private emitRunState(groupId: string) {
     const activeRun = this.activeRuns.get(groupId);
+    const pendingRun = this.pendingRuns.get(groupId);
+    const currentRun = activeRun || pendingRun;
     this.emit('run_state', {
       groupId,
-      active: !!activeRun,
-      agentId: activeRun?.agentId || null,
+      active: this.processingGroups.has(groupId) || !!currentRun,
+      agentId: currentRun?.agentId || null,
       runId: activeRun?.runId || null,
-      startedAt: activeRun?.startedAt || null,
+      startedAt: currentRun?.startedAt || null,
     });
   }
 
+  private setPendingRun(pendingRun: PendingGroupRun) {
+    this.pendingRuns.set(pendingRun.groupId, pendingRun);
+    this.emitRunState(pendingRun.groupId);
+  }
+
+  private clearPendingRun(groupId: string, messageId?: number) {
+    const current = this.pendingRuns.get(groupId);
+    if (!current) return;
+    if (typeof messageId === 'number' && current.messageId !== messageId) return;
+    this.pendingRuns.delete(groupId);
+    this.emitRunState(groupId);
+  }
+
   private setActiveRun(activeRun: ActiveGroupRun) {
+    this.pendingRuns.delete(activeRun.groupId);
     this.activeRuns.set(activeRun.groupId, activeRun);
     this.emitRunState(activeRun.groupId);
   }
@@ -204,35 +244,37 @@ export class GroupChatEngine extends EventEmitter {
 
   getGroupRunState(groupId: string) {
     const activeRun = this.activeRuns.get(groupId);
+    const pendingRun = this.pendingRuns.get(groupId);
+    const currentRun = activeRun || pendingRun;
     return {
       groupId,
-      active: !!activeRun,
-      agentId: activeRun?.agentId || null,
+      active: this.processingGroups.has(groupId) || !!currentRun,
+      agentId: currentRun?.agentId || null,
       runId: activeRun?.runId || null,
-      startedAt: activeRun?.startedAt || null,
+      startedAt: currentRun?.startedAt || null,
     };
   }
 
   isGroupProcessing(groupId: string) {
-    return this.processingGroups.has(groupId) || this.activeRuns.has(groupId);
+    return this.processingGroups.has(groupId) || this.pendingRuns.has(groupId) || this.activeRuns.has(groupId);
   }
 
   getGroupActiveRunMessage(groupId: string) {
-    const activeRun = this.activeRuns.get(groupId);
-    if (!activeRun) {
+    const currentRun = this.activeRuns.get(groupId) || this.pendingRuns.get(groupId);
+    if (!currentRun || typeof currentRun.messageId !== 'number') {
       return null;
     }
 
     return {
       groupId,
-      id: activeRun.messageId,
-      parent_id: activeRun.parentId ?? null,
+      id: currentRun.messageId,
+      parent_id: currentRun.parentId ?? null,
       sender_type: 'agent',
-      sender_id: activeRun.agentId,
-      sender_name: activeRun.agentName,
-      content: activeRun.text,
-      model_used: activeRun.modelUsed,
-      created_at: activeRun.createdAt,
+      sender_id: currentRun.agentId,
+      sender_name: currentRun.agentName,
+      content: currentRun.text,
+      model_used: currentRun.modelUsed,
+      created_at: currentRun.createdAt || new Date(currentRun.startedAt).toISOString(),
     };
   }
 
@@ -408,6 +450,7 @@ export class GroupChatEngine extends EventEmitter {
     }
 
     this.processingGroups.add(groupId);
+    this.emitRunState(groupId);
 
     try {
       const group = this.db.getGroupChat(groupId);
@@ -460,6 +503,7 @@ export class GroupChatEngine extends EventEmitter {
       }
     } finally {
       this.processingGroups.delete(groupId);
+      this.emitRunState(groupId);
     }
   }
 
@@ -525,6 +569,8 @@ export class GroupChatEngine extends EventEmitter {
     let msgId: number | undefined;
     let activeRunId: string | null = null;
     let typingFinished = false;
+    const placeholderCreatedAt = new Date().toISOString();
+    const modelUsed = this.getAgentModel(agentId);
 
     const finishTyping = () => {
       if (typingFinished) return;
@@ -533,6 +579,40 @@ export class GroupChatEngine extends EventEmitter {
     };
 
     try {
+      msgId = this.db.saveGroupMessage({
+        group_id: groupId,
+        parent_id: parentId,
+        sender_type: 'agent',
+        sender_id: agentId,
+        sender_name: member.display_name,
+        content: '',
+        model_used: modelUsed,
+        created_at: placeholderCreatedAt,
+      });
+
+      this.emit('message', {
+        groupId,
+        id: msgId,
+        parent_id: parentId,
+        sender_type: 'agent',
+        sender_id: agentId,
+        sender_name: member.display_name,
+        content: '',
+        model_used: modelUsed,
+        created_at: placeholderCreatedAt
+      });
+      this.setPendingRun({
+        groupId,
+        agentId,
+        agentName: member.display_name,
+        startedAt: Date.now(),
+        messageId: msgId,
+        parentId,
+        modelUsed,
+        createdAt: placeholderCreatedAt,
+        text: '',
+      });
+
       const group = this.db.getGroupChat(groupId);
       const groupSysPrompt = group?.system_prompt || group?.description || '';
       const runtimeContext = await this.prepareGroupRuntime(groupId, agentId);
@@ -565,8 +645,14 @@ export class GroupChatEngine extends EventEmitter {
       const processStartTag = group?.process_start_tag || memberSessionConfig?.process_start_tag;
       const processEndTag = group?.process_end_tag || memberSessionConfig?.process_end_tag;
       const rewrittenTrigger = isResetCommand
-        ? { text: triggerMsg, attachments: [] as MessageAttachment[] }
+        ? { text: triggerMsg, attachments: [] as MessageAttachment[], linkedUploads: [] as WorkspaceUploadLink[] }
         : rewriteMessageWithWorkspaceUploads(triggerMsg, runtimeContext.uploadsPath, { extractImageAttachments: true });
+      const audioTranscriptContext = isResetCommand
+        ? ''
+        : buildAudioTranscriptContext(
+          await prepareAudioTranscriptsFromUploads(rewrittenTrigger.linkedUploads, runtimeContext.runtimeAgentId)
+        );
+      const promptInput = [rewrittenTrigger.text, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
 
       const prompt = isResetCommand 
         ? triggerMsg
@@ -576,7 +662,7 @@ export class GroupChatEngine extends EventEmitter {
           member,
           members,
           deltaMessages,
-          rewrittenTrigger.text,
+          promptInput,
           triggerSenderName,
           processStartTag,
           processEndTag,
@@ -596,34 +682,6 @@ export class GroupChatEngine extends EventEmitter {
       const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, GROUP_HISTORY_COMPLETION_PROBE_LIMIT)
         .then((history) => getHistorySnapshot(history))
         .catch(() => ({ length: 0, latestSignature: '' }));
-
-      // Parse mentions initially (won't find any since content is empty, but good for structure)
-      const initialMentionedIds = this.parseMentions('', members);
-      const placeholderCreatedAt = new Date().toISOString();
-      const modelUsed = this.getAgentModel(agentId);
-      msgId = this.db.saveGroupMessage({
-        group_id: groupId,
-        parent_id: parentId,
-        sender_type: 'agent',
-        sender_id: agentId,
-        sender_name: member.display_name,
-        content: '', // Empty initially for streaming
-        model_used: modelUsed,
-        mentions: initialMentionedIds.length > 0 ? JSON.stringify(initialMentionedIds) : undefined,
-        created_at: placeholderCreatedAt,
-      });
-
-      this.emit('message', { 
-        groupId, 
-        id: msgId, 
-        parent_id: parentId,
-        sender_type: 'agent', 
-        sender_id: agentId, 
-        sender_name: member.display_name, 
-        content: '',
-        model_used: modelUsed,
-        created_at: placeholderCreatedAt
-      });
 
       // Start streaming response
       const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
@@ -1005,7 +1063,16 @@ export class GroupChatEngine extends EventEmitter {
       }
       finishTyping();
       console.error(`[GroupChatEngine] sendToAgent Error. Group: ${groupId}, Agent: ${agentId}`, err);
-      const { content: errMsg, messageCode, messageParams, rawDetail } = createAgentResponseFailedMessage(member.display_name, err?.message);
+      const rawDetail = typeof err?.rawDetail === 'string'
+        ? err.rawDetail
+        : (typeof err?.message === 'string' ? err.message : '');
+      const messageCode = err instanceof AudioPreparationError
+        ? err.messageCode
+        : undefined;
+      const messageParams = messageCode ? undefined : { agentName: member.display_name };
+      const errMsg = messageCode
+        ? (rawDetail || messageCode)
+        : createAgentResponseFailedMessage(member.display_name, rawDetail).content;
       
       if (msgId !== undefined) {
         this.db.updateGroupMessage(msgId, errMsg, this.getAgentModel(agentId), null);
@@ -1018,7 +1085,7 @@ export class GroupChatEngine extends EventEmitter {
           sender_id: 'system',
           sender_name: '系统',
           content: errMsg,
-          messageCode,
+          messageCode: messageCode || AGENT_RESPONSE_FAILED_MESSAGE_CODE,
           messageParams,
           rawDetail,
           created_at: new Date().toISOString(),
@@ -1028,6 +1095,9 @@ export class GroupChatEngine extends EventEmitter {
     } finally {
       if (activeRunId) {
         this.clearActiveRun(groupId, activeRunId);
+      }
+      if (msgId !== undefined) {
+        this.clearPendingRun(groupId, msgId);
       }
       finishTyping();
     }

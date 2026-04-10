@@ -33,6 +33,11 @@ import net from 'net';
 import sharp from 'sharp';
 import { rewriteMessageWithWorkspaceUploads } from './message-upload-rewrite';
 import { rewriteVisibleFileLinks } from './file-link-rewrite';
+import {
+  buildAudioTranscriptContext,
+  ensureManagedLocalAudioRuntimeReady,
+  prepareAudioTranscriptsFromUploads,
+} from './audio-transcription';
 import type { ChatRow, MessagePageInfo, MessageSearchMatch, StoredFileRow } from './db';
 import {
   type ChatHistorySnapshot,
@@ -232,6 +237,7 @@ const CHAT_HISTORY_COMPLETION_PROBE_LIMIT = 60;
 const CHAT_REGENERATE_LOOKBACK_LIMIT = 60;
 const CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS = 30000;
 const CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS = 500;
+const CHAT_FINAL_EVENT_SETTLE_GRACE_MS = 1500;
 const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
@@ -2364,6 +2370,8 @@ function buildHostTakeoverChatInstruction() {
   return [
     '【Host takeover】',
     'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
+    'Treat installed host tools as part of your execution environment: if a command-line tool exists on this machine, you should discover it from PATH and use it directly instead of claiming the product lacks that capability.',
+    'For uploaded files or workspace files, use their absolute paths. When the model cannot natively understand a file type, first call the appropriate local tool to inspect, transcribe, convert, extract, or summarize it, then continue the task.',
     `Immediate root entrypoint: ${HOST_TAKEOVER_HOST_ROOT_PATH}`,
     `Run a single root command with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /usr/bin/id -u`,
     `Run a complex root shell with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
@@ -3181,6 +3189,12 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
     }
 
     setMaxPermissionsEnabled(enabled);
+
+    if (enabled) {
+      void ensureManagedLocalAudioRuntimeReady().catch((error) => {
+        console.error('Failed to prepare managed local audio transcription runtime:', error);
+      });
+    }
 
     return {
       enabled,
@@ -4241,6 +4255,21 @@ function createStructuredChatError(rawDetail?: string | null, forcedCode?: strin
   };
 }
 
+function resolveStructuredChatErrorInput(error: any): { rawDetail: string | null; messageCode?: string } {
+  const rawDetail = typeof error?.rawDetail === 'string' && error.rawDetail.trim()
+    ? error.rawDetail.trim()
+    : (typeof error?.message === 'string' && error.message.trim() ? error.message.trim() : null);
+
+  const messageCode = typeof error?.messageCode === 'string' && error.messageCode.trim()
+    ? error.messageCode.trim()
+    : undefined;
+
+  return {
+    rawDetail,
+    messageCode,
+  };
+}
+
 function buildStructuredChatHttpError(rawDetail?: string | null, forcedCode?: string) {
   const structured = createStructuredChatError(rawDetail, forcedCode);
   return {
@@ -4432,14 +4461,22 @@ app.use((req, res, next) => {
 });
 
 // Helper to rewrite outgoing messages: extract /uploads/ images as attachments for the Vision API,
-// and keep non-image file references as absolute paths in the message text.
-function rewriteOutgoingMessage(
+// keep non-image file references as absolute paths in the message text, and inject automatic
+// transcripts for referenced audio uploads when this host has a usable audio transcription provider.
+async function prepareOutgoingMessage(
   message: string,
   agentId: string
-): { text: string; attachments: { type: string; mimeType: string; content: string }[] } {
+): Promise<{ text: string; attachments: { type: string; mimeType: string; content: string }[] }> {
   const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
-  return rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
+  const rewritten = rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
+  const transcripts = await prepareAudioTranscriptsFromUploads(rewritten.linkedUploads, agentId);
+  const audioTranscriptContext = buildAudioTranscriptContext(transcripts);
+
+  return {
+    text: [rewritten.text, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
+    attachments: rewritten.attachments,
+  };
 }
 
 const connections = new Map<string, OpenClawClient>();
@@ -6477,11 +6514,100 @@ interface ActiveRun {
   finalEventText?: string;
   finalEventGeneration: number;
   settledCalibrationGeneration: number;
+  latestFinalEventAt?: number;
   clientRef?: OpenClawClient;
+}
+
+interface PendingChatPreparation {
+  sessionId: string;
+  messageId: number;
+  agentId: string;
+  agentName: string;
+  modelUsed: string;
+  startedAt: number;
+  clients: express.Response[];
 }
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
+}
+
+function isStreamingClientOpen(res: express.Response): boolean {
+  return !res.writableEnded && !res.destroyed;
+}
+
+class PendingChatPreparationManager {
+  private pending = new Map<string, PendingChatPreparation>();
+
+  get(sessionId: string): PendingChatPreparation | undefined {
+    return this.pending.get(sessionId);
+  }
+
+  start(preparation: Omit<PendingChatPreparation, 'clients'>): PendingChatPreparation {
+    const nextPreparation: PendingChatPreparation = {
+      ...preparation,
+      clients: [],
+    };
+    this.pending.set(preparation.sessionId, nextPreparation);
+    return nextPreparation;
+  }
+
+  attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean }): boolean {
+    const preparation = this.pending.get(sessionId);
+    if (!preparation || !isStreamingClientOpen(res)) return false;
+
+    preparation.clients.push(res);
+    res.on('close', () => {
+      const current = this.pending.get(sessionId);
+      if (!current) return;
+      current.clients = current.clients.filter((client) => client !== res);
+    });
+    if (options?.announceAttach) {
+      res.write(`data: ${JSON.stringify({
+        type: 'attached',
+        messageId: preparation.messageId,
+        agentId: preparation.agentId,
+        agentName: preparation.agentName,
+        modelUsed: preparation.modelUsed,
+      })}\n\n`);
+    }
+    return true;
+  }
+
+  promoteClients(sessionId: string): express.Response[] {
+    const preparation = this.pending.get(sessionId);
+    if (!preparation) return [];
+    this.pending.delete(sessionId);
+    return preparation.clients.filter((client) => isStreamingClientOpen(client));
+  }
+
+  fail(sessionId: string, payload: {
+    content: string;
+    messageCode?: string;
+    messageParams?: Record<string, any>;
+    rawDetail?: string | null;
+    role: string;
+  }) {
+    const preparation = this.pending.get(sessionId);
+    if (!preparation) return;
+
+    this.pending.delete(sessionId);
+    preparation.clients
+      .filter((client) => isStreamingClientOpen(client))
+      .forEach((res) => {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'error',
+            text: payload.content,
+            messageCode: payload.messageCode,
+            messageParams: payload.messageParams,
+            rawDetail: payload.rawDetail,
+            role: payload.role,
+          })}\n\n`);
+          res.end();
+        } catch {}
+      });
+  }
 }
 
 class ActiveRunManager {
@@ -6584,6 +6710,7 @@ class ActiveRunManager {
       firstCompletionWaitResolvedAt: undefined,
       finalEventGeneration: 0,
       settledCalibrationGeneration: 0,
+      latestFinalEventAt: undefined,
       clientRef
     };
     this.runs.set(sessionId, run);
@@ -6607,6 +6734,7 @@ class ActiveRunManager {
 
     const onFinal = (data: { sessionKey: string; runId: string; text: string; message: any }) => {
       if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
+        const finalEventObservedAt = Date.now();
         const terminalFinalText = resolveChatFinalTextSnapshot(data.text, data.message);
         if (terminalFinalText) {
           run.finalEventText = selectPreferredTextSnapshot(run.finalEventText, terminalFinalText);
@@ -6614,6 +6742,7 @@ class ActiveRunManager {
         } else if (data.text) {
           run.text = selectPreferredTextSnapshot(run.text, data.text);
         }
+        run.latestFinalEventAt = finalEventObservedAt;
         run.finalEventGeneration += 1;
         this.resetIdleTimeout(run);
         this.emitVisibleFinal(run, run.finalEventText || run.text);
@@ -6659,6 +6788,10 @@ class ActiveRunManager {
   }
 
   attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean }) {
+    if (!isStreamingClientOpen(res)) {
+      return false;
+    }
+
     const run = this.runs.get(sessionId);
     if (run) {
       run.clients.push(res);
@@ -6745,6 +6878,11 @@ class ActiveRunManager {
       let shouldRetryForEmptyCompletion = false;
       let sawSettledAssistantText = false;
       let bestSettledAssistantText = '';
+      const visibleFinalGraceDeadline = probeFinalGeneration > 0
+        && completedOutput.trim()
+        && run.latestFinalEventAt !== undefined
+        ? run.latestFinalEventAt + CHAT_FINAL_EVENT_SETTLE_GRACE_MS
+        : null;
       try {
         const historyProbeStartedAt = Date.now();
         while ((Date.now() - historyProbeStartedAt) < CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS) {
@@ -6766,6 +6904,16 @@ class ActiveRunManager {
               break;
             }
           }
+
+          if (visibleFinalGraceDeadline !== null) {
+            const remainingVisibleFinalGraceMs = visibleFinalGraceDeadline - Date.now();
+            if (remainingVisibleFinalGraceMs <= 0) {
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, Math.min(CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS, remainingVisibleFinalGraceMs)));
+            continue;
+          }
+
           await new Promise((resolve) => setTimeout(resolve, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS));
         }
 
@@ -6789,11 +6937,16 @@ class ActiveRunManager {
       completedOutput = selectPreferredTextSnapshot(completedOutput, run.finalEventText);
 
       const hasSettledAssistantText = bestSettledAssistantText.trim().length > 0;
+      const hasStableVisibleFinalText = probeFinalGeneration > 0
+        && probeFinalGeneration === run.finalEventGeneration
+        && completedOutput.trim().length > 0
+        && run.latestFinalEventAt !== undefined
+        && Date.now() >= (run.latestFinalEventAt + CHAT_FINAL_EVENT_SETTLE_GRACE_MS);
 
       if (
         probeFinalGeneration > 0
         && probeFinalGeneration === run.finalEventGeneration
-        && hasSettledAssistantText
+        && (hasSettledAssistantText || hasStableVisibleFinalText)
       ) {
         run.settledCalibrationGeneration = Math.max(run.settledCalibrationGeneration, probeFinalGeneration);
       }
@@ -6905,6 +7058,7 @@ class ActiveRunManager {
 }
 
 const activeRunManager = new ActiveRunManager(db);
+const pendingChatPreparationManager = new PendingChatPreparationManager();
 
 function getLatestChatRegenerateTarget(sessionId: string): {
   latestUserMessage: ChatRow | null;
@@ -6942,6 +7096,7 @@ app.post('/api/chat', async (req, res) => {
 
   let userMsgId: number | undefined;
   let assistantMsgId: number | undefined;
+  let pendingPreparationActive = false;
 
   try {
     const sessionInfo = sessionManager.getSession(sessionId);
@@ -6972,7 +7127,6 @@ app.post('/api/chat', async (req, res) => {
     }
 
     userMsgId = Number(db.saveMessage({ session_key: sessionId, parent_id: finalParentId, role: 'user', content: String(message) }));
-    const client = await getConnection(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
 
     const allCharacters = db.getCharacters();
@@ -6980,8 +7134,6 @@ app.post('/api/chat', async (req, res) => {
     const agentName = sessionInfo?.name || character?.name || agentId;
     const modelUsed = agentProvisioner.readAgentModel(agentId) ||
       agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
-
-    const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
 
     assistantMsgId = Number(db.saveMessage({
       session_key: sessionId,
@@ -7002,6 +7154,20 @@ app.post('/api/chat', async (req, res) => {
     // Notify frontend of the real DB IDs immediately
     res.write(':' + Array(2048).fill(' ').join('') + '\n\n');
     res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId, assistantMsgId })}\n\n`);
+
+    pendingChatPreparationManager.start({
+      sessionId,
+      messageId: assistantMsgId,
+      agentId,
+      agentName,
+      modelUsed,
+      startedAt: Date.now(),
+    });
+    pendingPreparationActive = true;
+    pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
+
+    const client = await getConnection(sessionId);
+    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
 
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
@@ -7029,11 +7195,18 @@ app.post('/api/chat', async (req, res) => {
       finalSessionKey,
       preRunHistorySnapshot
     );
-    
-    activeRunManager.attachClient(sessionId, res);
+    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId);
+    pendingPreparationActive = false;
+    pendingClients.forEach((clientRes) => {
+      activeRunManager.attachClient(sessionId, clientRes);
+    });
 
   } catch (error: any) {
-    const structuredError = createStructuredChatError(error?.message);
+    const structuredErrorInput = resolveStructuredChatErrorInput(error);
+    const structuredError = createStructuredChatError(
+      structuredErrorInput.rawDetail,
+      structuredErrorInput.messageCode
+    );
     const sessionInfo = db.getSession(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
     const character = db.getCharacters().find(c => c.agentId === agentId);
@@ -7059,17 +7232,25 @@ app.post('/api/chat', async (req, res) => {
     }
 
     if (!res.headersSent) {
-      res.status(500).json(buildStructuredChatHttpError(error?.message));
+      res.status(500).json(buildStructuredChatHttpError(
+        structuredErrorInput.rawDetail,
+        structuredErrorInput.messageCode
+      ));
     } else {
-      res.write(`data: ${JSON.stringify({
-        type: 'error',
-        text: structuredError.content,
-        messageCode: structuredError.messageCode,
-        messageParams: structuredError.messageParams,
-        rawDetail: structuredError.rawDetail,
-        role: structuredError.role,
-      })}\n\n`);
-      res.end();
+      if (pendingPreparationActive) {
+        pendingChatPreparationManager.fail(sessionId, structuredError);
+        pendingPreparationActive = false;
+      } else {
+        res.write(`data: ${JSON.stringify({
+          type: 'error',
+          text: structuredError.content,
+          messageCode: structuredError.messageCode,
+          messageParams: structuredError.messageParams,
+          rawDetail: structuredError.rawDetail,
+          role: structuredError.role,
+        })}\n\n`);
+        res.end();
+      }
     }
   }
 });
@@ -7082,6 +7263,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
   }
 
   let assistantMsgId: number | undefined;
+  let pendingPreparationActive = false;
 
   try {
     const numericParentId = Number(parentId);
@@ -7127,7 +7309,6 @@ app.post('/api/chat/regenerate', async (req, res) => {
       finalMessage = `${injectedInstructions}${finalMessage}`;
     }
 
-    const client = await getConnection(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
 
     const allCharacters = db.getCharacters();
@@ -7135,8 +7316,6 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const agentName = sessionInfo?.name || character?.name || agentId;
     const modelUsed = agentProvisioner.readAgentModel(agentId) ||
       agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
-
-    const outgoingMessage = rewriteOutgoingMessage(finalMessage, agentId);
 
     assistantMsgId = Number(db.saveMessage({
       session_key: sessionId,
@@ -7153,11 +7332,24 @@ app.post('/api/chat/regenerate', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
-    
+
     // Notify frontend immediately of the new assistant msg ID
     res.write(':' + Array(2048).fill(' ').join('') + '\n\n');
     res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId: numericParentId, assistantMsgId })}\n\n`);
 
+    pendingChatPreparationManager.start({
+      sessionId,
+      messageId: assistantMsgId,
+      agentId,
+      agentName,
+      modelUsed,
+      startedAt: Date.now(),
+    });
+    pendingPreparationActive = true;
+    pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
+
+    const client = await getConnection(sessionId);
+    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
       : `agent:${agentId}:chat:${sessionId}`;
@@ -7184,11 +7376,19 @@ app.post('/api/chat/regenerate', async (req, res) => {
       finalSessionKey,
       preRunHistorySnapshot
     );
-    
-    activeRunManager.attachClient(sessionId, res);
+
+    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId);
+    pendingPreparationActive = false;
+    pendingClients.forEach((clientRes) => {
+      activeRunManager.attachClient(sessionId, clientRes);
+    });
 
   } catch (error: any) {
-    const structuredError = createStructuredChatError(error?.message);
+    const structuredErrorInput = resolveStructuredChatErrorInput(error);
+    const structuredError = createStructuredChatError(
+      structuredErrorInput.rawDetail,
+      structuredErrorInput.messageCode
+    );
     const sessionInfo = db.getSession(sessionId);
     const agentId = sessionInfo?.agentId || 'main';
     const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
@@ -7213,26 +7413,34 @@ app.post('/api/chat/regenerate', async (req, res) => {
     }
 
     if (!res.headersSent) {
-      res.status(500).json(buildStructuredChatHttpError(error?.message));
+      res.status(500).json(buildStructuredChatHttpError(
+        structuredErrorInput.rawDetail,
+        structuredErrorInput.messageCode
+      ));
     } else {
-      res.write(`data: ${JSON.stringify({
-        type: 'error',
-        text: structuredError.content,
-        messageCode: structuredError.messageCode,
-        messageParams: structuredError.messageParams,
-        rawDetail: structuredError.rawDetail,
-        role: structuredError.role,
-      })}\n\n`);
-      res.end();
+      if (pendingPreparationActive) {
+        pendingChatPreparationManager.fail(sessionId, structuredError);
+        pendingPreparationActive = false;
+      } else {
+        res.write(`data: ${JSON.stringify({
+          type: 'error',
+          text: structuredError.content,
+          messageCode: structuredError.messageCode,
+          messageParams: structuredError.messageParams,
+          rawDetail: structuredError.rawDetail,
+          role: structuredError.role,
+        })}\n\n`);
+        res.end();
+      }
     }
   }
 });
 
 app.get('/api/chat/attach/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-  
+  const pendingPreparation = pendingChatPreparationManager.get(sessionId);
   const run = activeRunManager.getRun(sessionId);
-  if (!run) {
+  if (!run && !pendingPreparation) {
     // Return empty payload to indicate no active run
     return res.status(200).json({ active: false });
   }
@@ -7243,7 +7451,12 @@ app.get('/api/chat/attach/:sessionId', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  activeRunManager.attachClient(sessionId, res, { announceAttach: true });
+  if (run) {
+    activeRunManager.attachClient(sessionId, res, { announceAttach: true });
+    return;
+  }
+
+  pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
 });
 
 app.post('/api/chat/stop', async (req, res) => {
@@ -7926,8 +8139,9 @@ app.get('/api/groups/:id/active-run', async (req, res) => {
       return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
     }
 
+    const runState = groupChatEngine.getGroupRunState(req.params.id);
     const activeMessage = groupChatEngine.getGroupActiveRunMessage(req.params.id);
-    if (!activeMessage) {
+    if (!runState.active) {
       const actions = await reconcileInactiveGroupLatestMessage(req.params.id);
       if (actions.length > 0) {
         broadcastGroupReconciliationActions(req.params.id, actions);
@@ -7937,6 +8151,7 @@ app.get('/api/groups/:id/active-run', async (req, res) => {
       return res.json({
         success: true,
         active: false,
+        runState,
         message: latestMessage ? withStructuredGroupMessage(latestMessage, { groupId: req.params.id }) : null,
       });
     }
@@ -7944,7 +8159,8 @@ app.get('/api/groups/:id/active-run', async (req, res) => {
     res.json({
       success: true,
       active: true,
-      message: withStructuredGroupMessage(activeMessage, { groupId: req.params.id }),
+      runState,
+      message: activeMessage ? withStructuredGroupMessage(activeMessage, { groupId: req.params.id }) : null,
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

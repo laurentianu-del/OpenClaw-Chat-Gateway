@@ -176,7 +176,9 @@
     "groupSystemPrompt": "系统提示词",
     "members": "成员",
     "runError": "运行失败",
-    "gatewayDisconnected": "网关连接已断开"
+    "gatewayDisconnected": "网关连接已断开",
+    "audioTranscriptionUnavailable": "当前未配置可用的音频转写能力",
+    "audioTranscriptionFailed": "音频转写失败"
   },
   "group": {
     "maxChainDepthReached": "链式转发已达到最大深度 ({{maxDepth}} 轮)",
