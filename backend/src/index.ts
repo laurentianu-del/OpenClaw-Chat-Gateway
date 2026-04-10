@@ -118,6 +118,7 @@ function execFileWithInput(
       );
       error.code = code;
       error.signal = signal;
+      error.timedOut = timedOut;
       error.stdout = stdout;
       error.stderr = stderr;
       finalizeError(error);
@@ -191,6 +192,7 @@ const GATEWAY_MAX_PERMISSIONS_UPDATE_FAILED_ERROR_CODE = 'gateway.maxPermissions
 const GATEWAY_HOST_TAKEOVER_CREDENTIALS_REQUIRED_ERROR_CODE = 'gateway.hostTakeoverCredentialsRequired';
 const GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE = 'gateway.hostTakeoverInstallFailed';
 const GATEWAY_HOST_TAKEOVER_SERVICE_NOT_FOUND_ERROR_CODE = 'gateway.hostTakeoverServiceNotFound';
+const FILE_PREVIEW_CONVERSION_TIMED_OUT_ERROR_CODE = 'filePreview.conversionTimedOut';
 const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
 const AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'agents.idContainsWhitespace';
 const AGENT_ID_ALREADY_EXISTS_ERROR_CODE = 'agents.idAlreadyExists';
@@ -4427,6 +4429,7 @@ for (const group of db.getGroupChats()) {
 // LibreOffice detection
 let hasLibreOffice = false;
 const previewCacheDir = path.join(process.env.HOME || '.', '.clawui_preview_cache');
+const previewConversionPromises = new Map<string, Promise<string>>();
 fs.mkdirSync(previewCacheDir, { recursive: true });
 
 (async () => {
@@ -5355,6 +5358,7 @@ app.get('/api/config', (_req, res) => {
     loginPassword: config.loginPassword || '123456',
     allowedHosts: config.allowedHosts || [],
     historyPageRounds: config.historyPageRounds || 30,
+    previewConversionTimeoutSeconds: config.previewConversionTimeoutSeconds || 60,
   });
 });
 
@@ -7720,24 +7724,62 @@ async function ensureConvertedPreviewPdf(absolutePath: string): Promise<string> 
     return cachedPdf;
   }
 
-  const tmpDir = path.join(previewCacheDir, cacheKey);
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  await execPromise(
-    `libreoffice --headless --convert-to pdf --outdir "${tmpDir}" "${absolutePath}"`,
-    { timeout: 30000 }
-  );
-
-  const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.pdf'));
-  if (files.length === 0) {
-    throw new Error('LibreOffice conversion produced no PDF output');
+  const inFlight = previewConversionPromises.get(cacheKey);
+  if (inFlight) {
+    return inFlight;
   }
 
-  const outputPdf = path.join(tmpDir, files[0]);
-  fs.renameSync(outputPdf, cachedPdf);
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  const conversionPromise = (async () => {
+    const tmpDir = fs.mkdtempSync(path.join(previewCacheDir, `${cacheKey}-`));
+    const startedAt = Date.now();
+    const timeoutSeconds = configManager.getConfig().previewConversionTimeoutSeconds || 60;
+    const timeoutMs = timeoutSeconds * 1000;
 
-  return cachedPdf;
+    try {
+      await execFileWithInput(
+        'libreoffice',
+        ['--headless', '--convert-to', 'pdf', '--outdir', tmpDir, absolutePath],
+        '',
+        { timeout: timeoutMs }
+      );
+
+      const files = fs.readdirSync(tmpDir).filter(f => f.endsWith('.pdf'));
+      if (files.length === 0) {
+        throw new Error('LibreOffice conversion produced no PDF output');
+      }
+
+      const outputPdf = path.join(tmpDir, files[0]);
+      fs.renameSync(outputPdf, cachedPdf);
+      console.log(`[Preview] Converted ${path.basename(absolutePath)} in ${Date.now() - startedAt}ms`);
+
+      return cachedPdf;
+    } catch (error: any) {
+      const detail = [error?.stderr, error?.stdout, error?.message]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .join(' | ');
+      if (error?.timedOut) {
+        console.error(
+          `[Preview] LibreOffice conversion timed out for ${absolutePath} after ${Date.now() - startedAt}ms (configured ${timeoutMs}ms)${detail ? `: ${detail}` : ''}`
+        );
+        throw new StructuredRequestError(
+          504,
+          FILE_PREVIEW_CONVERSION_TIMED_OUT_ERROR_CODE,
+          detail || null,
+          { timeoutSeconds }
+        );
+      }
+      console.error(
+        `[Preview] LibreOffice conversion failed for ${absolutePath} after ${Date.now() - startedAt}ms${detail ? `: ${detail}` : ''}`
+      );
+      throw error;
+    } finally {
+      previewConversionPromises.delete(cacheKey);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  })();
+
+  previewConversionPromises.set(cacheKey, conversionPromise);
+  return conversionPromise;
 }
 
 app.get('/api/files/preview-data', async (req, res) => {
@@ -7760,6 +7802,9 @@ app.get('/api/files/preview-data', async (req, res) => {
       mimeType: mode === 'converted' ? 'application/pdf' : undefined,
     });
   } catch (error: any) {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
     console.error(`[Preview Data Error] ${error.message}`);
     if (error.message === 'Only absolute paths are allowed') {
       return res.status(403).json({ error: error.message });
@@ -7800,6 +7845,9 @@ app.get('/api/files/preview', async (req, res) => {
     res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(path.basename(cachedPdf))}`);
     res.sendFile(cachedPdf);
   } catch (error: any) {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
     console.error(`[Preview Error] ${error.message}`);
     if (error.message === 'Only absolute paths are allowed') {
       return res.status(403).send(error.message);

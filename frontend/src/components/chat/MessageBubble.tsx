@@ -1172,6 +1172,10 @@ export const normalizeProcessBlocks = (content: string, processStartTag?: string
   const lang = isStillExtracting ? 'process_step_thought_streaming' : 'process_step_thought';
   const cleanedContent = cleanupTagArtifacts(content.replace(regex, '\n'));
 
+  if (!mergedInner) {
+    return cleanedContent;
+  }
+
   return `\`\`\`\`${lang}\n${mergedInner}\n\`\`\`\`\n\n${cleanedContent}`.trim();
 };
 

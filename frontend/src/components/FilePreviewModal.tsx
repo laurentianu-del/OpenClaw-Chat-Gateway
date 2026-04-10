@@ -72,6 +72,29 @@ type PreviewState =
 // Cache capabilities result
 let cachedCapabilities: { libreoffice: boolean } | null = null;
 
+function resolvePreviewErrorMessage(
+  data: { errorCode?: string; errorParams?: Record<string, string | number | boolean | null> | null; error?: string; message?: string } | null,
+  t: (key: string, options?: any) => string,
+  fallbackKey: string
+): string {
+  if (data?.errorCode) {
+    const translated = t(data.errorCode, (data.errorParams || {}) as any);
+    if (translated !== data.errorCode) {
+      return translated;
+    }
+  }
+
+  if (typeof data?.message === 'string' && data.message.trim()) {
+    return data.message.trim();
+  }
+
+  if (typeof data?.error === 'string' && data.error.trim()) {
+    return data.error.trim();
+  }
+
+  return t(fallbackKey);
+}
+
 async function getCapabilities(): Promise<{ libreoffice: boolean }> {
   if (cachedCapabilities) return cachedCapabilities;
   try {
@@ -230,7 +253,8 @@ function ZoomableWrapper({ children, center = false }: { children: React.ReactNo
 // PDF Canvas Viewer — renders each page as a canvas (works on mobile)
 function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8Array }) {
   const containerRef = useRef<HTMLDivElement>(null);
-   const [pageCount, setPageCount] = useState(0);
+  const [pageCount, setPageCount] = useState(0);
+  const [renderedPages, setRenderedPages] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const { t } = useTranslation();
@@ -242,6 +266,7 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
       try {
         setLoading(true);
         setError('');
+        setRenderedPages(0);
         const source = pdfData ? { data: pdfData } : pdfUrl;
         if (!source) {
           throw new Error(t('filePreview.loadPdfFail'));
@@ -265,9 +290,10 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
           const fitScale = containerWidth / baseViewport.width;
           
           const isMobile = window.innerWidth <= 768;
-          // Drastically cap render scale on mobile to prevent iOS Safari memory crashes (canvas limits)
-          // 1.5x gives decent text clarity without blowing the RAM budget per page
-          const renderScale = fitScale * (isMobile ? Math.min(dpr, 1.5) : dpr * 2);
+          const isLargePdf = pdf.numPages >= 120;
+          // Cap large-document render scale to keep huge PDFs responsive instead of blocking on hundreds of canvases.
+          const desktopScaleMultiplier = isLargePdf ? 1.15 : 2;
+          const renderScale = fitScale * (isMobile ? Math.min(dpr, 1.5) : Math.min(dpr * desktopScaleMultiplier, 2));
           
           const viewport = page.getViewport({ scale: renderScale });
 
@@ -289,6 +315,13 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
           }
           if (cancelled) return;
           container.appendChild(canvas);
+          setRenderedPages(i);
+          if (i === 1) {
+            setLoading(false);
+          }
+          if (i % 4 === 0) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          }
         }
         setLoading(false);
       } catch (err: any) {
@@ -316,13 +349,22 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
 
   return (
     <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[400px]">
-      {loading && (
+      {loading && renderedPages === 0 && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
           <div className="flex flex-col items-center gap-3 text-gray-500">
              <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
             <span className="text-sm font-medium">{t('filePreview.renderingDoc')}</span>
           </div>
 
+        </div>
+      )}
+      {renderedPages > 0 && renderedPages < pageCount && (
+        <div className="sticky top-3 z-10 flex justify-end px-3 pt-3 pointer-events-none">
+          <div className="inline-flex items-center gap-2 rounded-full border border-gray-200 bg-white/95 px-3 py-1.5 text-xs text-gray-500">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500" />
+            <span>{t('filePreview.renderingDoc')}</span>
+            <span>{renderedPages}/{pageCount}</span>
+          </div>
         </div>
       )}
       <div ref={containerRef} className="p-4" />
@@ -586,7 +628,7 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
       const response = await fetch(dataUrl);
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        const message = payload?.message || payload?.error || t('filePreview.loadPdfFail');
+        const message = resolvePreviewErrorMessage(payload, t, 'filePreview.loadPdfFail');
         throw new Error(message);
       }
 

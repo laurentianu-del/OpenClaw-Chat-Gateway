@@ -211,6 +211,7 @@
     "testFailed": "Endpoint connectivity test failed"
   },
   "filePreview": {
+    "conversionTimedOut": "Preview exceeded the configured time limit: {{timeoutSeconds}} seconds",
     "fileNotFound": "File not found",
     "installLibreOffice": "LibreOffice is not installed on the server, preview is unavailable",
     "loadingPreview": "Loading preview...",
@@ -300,6 +301,10 @@
       "historyPageRoundsLabel": "History Page Rounds",
       "historyPageRoundsPlaceholder": "30",
       "historyPageRoundsHint": "Conversation pagination rounds are counted by user-started messages only. If the user sends 30 messages, that counts as 30 rounds no matter how many AI replies follow.",
+      "previewTimeoutLabel": "Preview Timeout",
+      "previewTimeoutPlaceholder": "60",
+      "previewTimeoutHint": "Set the timeout for document preview conversion in seconds. Range: {{min}}-{{max}}, default 60.",
+      "previewTimeoutInvalid": "Enter an integer number of seconds between {{min}} and {{max}}",
       "loginProtectionLabel": "Login Password Protection",
       "loginProtectionHint": "When enabled, visiting the web app requires a login password",
       "loginPasswordLabel": "Login Password",

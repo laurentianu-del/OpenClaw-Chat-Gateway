@@ -211,6 +211,7 @@
     "testFailed": "端點連通性測試失敗"
   },
   "filePreview": {
+    "conversionTimedOut": "預覽檔案超過設定時間：{{timeoutSeconds}} 秒",
     "fileNotFound": "檔案未找到",
     "installLibreOffice": "服務端未安裝 LibreOffice，無法預覽",
     "loadingPreview": "載入預覽中...",
@@ -300,6 +301,10 @@
       "historyPageRoundsLabel": "歷史分頁輪數",
       "historyPageRoundsPlaceholder": "30",
       "historyPageRoundsHint": "依使用者發起訊息的次數計算對話分頁輪數，使用者發起 30 次訊息，就算 30 輪，不受 AI 回覆條數影響。",
+      "previewTimeoutLabel": "預覽逾時時間",
+      "previewTimeoutPlaceholder": "60",
+      "previewTimeoutHint": "設定文件預覽轉換的逾時時間，單位為秒。支援 {{min}}-{{max}} 秒，預設 60 秒。",
+      "previewTimeoutInvalid": "請輸入 {{min}}-{{max}} 之間的整數秒數",
       "loginProtectionLabel": "登入密碼保護",
       "loginProtectionHint": "開啟後，訪問網頁需要輸入登入密碼",
       "loginPasswordLabel": "登入密碼",

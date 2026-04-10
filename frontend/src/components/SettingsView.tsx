@@ -18,6 +18,42 @@ interface SettingsViewProps {
   onModelsChanged?: () => void;
 }
 
+const PREVIEW_TIMEOUT_MIN_SECONDS = 5;
+const PREVIEW_TIMEOUT_MAX_SECONDS = 3600;
+
+function normalizePreviewTimeoutSeconds(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.min(PREVIEW_TIMEOUT_MAX_SECONDS, Math.max(PREVIEW_TIMEOUT_MIN_SECONDS, Math.round(value)));
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return Math.min(PREVIEW_TIMEOUT_MAX_SECONDS, Math.max(PREVIEW_TIMEOUT_MIN_SECONDS, parsed));
+    }
+  }
+
+  return 60;
+}
+
+function parsePreviewTimeoutSecondsInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  if (parsed < PREVIEW_TIMEOUT_MIN_SECONDS || parsed > PREVIEW_TIMEOUT_MAX_SECONDS) {
+    return null;
+  }
+
+  return parsed;
+}
+
 function resolveStructuredErrorDisplay(
   data: { errorCode?: string; errorParams?: Record<string, string | number | boolean | null> | null; errorDetail?: string | null; error?: string; message?: string },
   t: (key: string, options?: any) => string,
@@ -525,6 +561,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [generalError, setGeneralError] = useState(false);
   const [aiNameError, setAiNameError] = useState<'' | 'required' | 'tooLong'>('');
   const [historyPageRoundsInput, setHistoryPageRoundsInput] = useState(() => String(readChatHistoryPageRounds()));
+  const [previewTimeoutSecondsInput, setPreviewTimeoutSecondsInput] = useState(() => String(normalizePreviewTimeoutSeconds(undefined)));
+  const [previewTimeoutError, setPreviewTimeoutError] = useState(false);
 
   const getVisualLength = (str: string) => {
     let len = 0;
@@ -654,6 +692,9 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
           const nextHistoryPageRounds = normalizeChatHistoryPageRounds(data.historyPageRounds);
           setHistoryPageRoundsInput(String(nextHistoryPageRounds));
           persistChatHistoryPageRounds(nextHistoryPageRounds);
+        }
+        if (data.previewConversionTimeoutSeconds !== undefined) {
+          setPreviewTimeoutSecondsInput(String(normalizePreviewTimeoutSeconds(data.previewConversionTimeoutSeconds)));
         }
         if (data.language) {
           void applyLanguagePreference(data.language);
@@ -2443,14 +2484,28 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       return;
     }
     setAiNameError('');
+    const nextPreviewTimeoutSeconds = parsePreviewTimeoutSecondsInput(previewTimeoutSecondsInput);
+    if (nextPreviewTimeoutSeconds === null) {
+      setPreviewTimeoutError(true);
+      setIsLoading(false);
+      return;
+    }
+    setPreviewTimeoutError(false);
 
     try {
       const res = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aiName, loginEnabled, loginPassword, historyPageRounds: nextHistoryPageRounds }),
+        body: JSON.stringify({
+          aiName,
+          loginEnabled,
+          loginPassword,
+          historyPageRounds: nextHistoryPageRounds,
+          previewConversionTimeoutSeconds: nextPreviewTimeoutSeconds,
+        }),
       });
       if (res.ok) {
+        setPreviewTimeoutSecondsInput(String(nextPreviewTimeoutSeconds));
         setGeneralSaved(true);
         setTimeout(() => setGeneralSaved(false), 2000);
       } else throw new Error(t('settings.general.saveError'));
@@ -4146,6 +4201,55 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                       className="block w-full max-w-[220px] px-4 py-2.5 rounded-xl border border-gray-200 bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
                     />
                     <p className="text-xs text-gray-400 mt-1.5">{t('settings.general.historyPageRoundsHint')}</p>
+                  </div>
+
+                  <div className="border-t border-gray-100 pt-6">
+                    <label className="block text-sm font-semibold text-gray-900 mb-2">{t('settings.general.previewTimeoutLabel')}</label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      value={previewTimeoutSecondsInput}
+                      onChange={(event) => {
+                        setPreviewTimeoutSecondsInput(event.target.value);
+                        if (previewTimeoutError) {
+                          setPreviewTimeoutError(false);
+                        }
+                      }}
+                      onBlur={() => {
+                        const parsed = parsePreviewTimeoutSecondsInput(previewTimeoutSecondsInput);
+                        if (parsed !== null) {
+                          setPreviewTimeoutSecondsInput(String(parsed));
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          const parsed = parsePreviewTimeoutSecondsInput(previewTimeoutSecondsInput);
+                          if (parsed !== null) {
+                            setPreviewTimeoutSecondsInput(String(parsed));
+                          }
+                          (event.currentTarget as HTMLInputElement).blur();
+                        }
+                      }}
+                      placeholder={t('settings.general.previewTimeoutPlaceholder')}
+                      className={`block w-full max-w-[220px] px-4 py-2.5 rounded-xl border ${previewTimeoutError ? 'border-red-500' : 'border-gray-200'} bg-gray-50 focus:bg-white focus:outline-none focus:ring-2 ${previewTimeoutError ? 'focus:ring-red-500/20' : 'focus:ring-blue-500/20'} transition-all text-sm`}
+                    />
+                    {previewTimeoutError ? (
+                      <p className="text-xs text-red-500 mt-1.5 font-medium">
+                        {t('settings.general.previewTimeoutInvalid', {
+                          min: PREVIEW_TIMEOUT_MIN_SECONDS,
+                          max: PREVIEW_TIMEOUT_MAX_SECONDS,
+                        })}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-gray-400 mt-1.5">
+                        {t('settings.general.previewTimeoutHint', {
+                          min: PREVIEW_TIMEOUT_MIN_SECONDS,
+                          max: PREVIEW_TIMEOUT_MAX_SECONDS,
+                        })}
+                      </p>
+                    )}
                   </div>
 
                   {/* Login Password Toggle */}

@@ -11,6 +11,7 @@ interface Config {
   loginPassword?: string;
   allowedHosts?: string[];
   historyPageRounds?: number;
+  previewConversionTimeoutSeconds?: number;
   sidebarFavorites?: {
     agents: string[];
     groups: string[];
@@ -60,6 +61,21 @@ function normalizeHistoryPageRounds(value: unknown): number {
   return 30;
 }
 
+function normalizePreviewConversionTimeoutSeconds(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.min(3600, Math.max(5, Math.round(value)));
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return Math.min(3600, Math.max(5, parsed));
+    }
+  }
+
+  return 60;
+}
+
 function normalizeConfigLanguage(value: unknown): NonNullable<Config['language']> {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase().replace(/_/g, '-') : '';
 
@@ -99,6 +115,7 @@ const DEFAULT_CONFIG: Config = {
   loginPassword: '123456',
   allowedHosts: [],
   historyPageRounds: 30,
+  previewConversionTimeoutSeconds: 60,
   sidebarFavorites: {
     agents: [],
     groups: [],
@@ -133,6 +150,7 @@ export class ConfigManager {
         loginPassword: merged.loginPassword,
         allowedHosts: normalizeStoredStringArray(merged.allowedHosts),
         historyPageRounds: normalizeHistoryPageRounds(merged.historyPageRounds),
+        previewConversionTimeoutSeconds: normalizePreviewConversionTimeoutSeconds(merged.previewConversionTimeoutSeconds),
         sidebarFavorites: normalizeSidebarFavorites(merged.sidebarFavorites),
       };
     } catch {
@@ -144,6 +162,7 @@ export class ConfigManager {
     const merged = { ...this.getConfig(), ...newConfig };
     merged.language = normalizeConfigLanguage(merged.language);
     merged.historyPageRounds = normalizeHistoryPageRounds(merged.historyPageRounds);
+    merged.previewConversionTimeoutSeconds = normalizePreviewConversionTimeoutSeconds(merged.previewConversionTimeoutSeconds);
     merged.sidebarFavorites = normalizeSidebarFavorites(merged.sidebarFavorites);
     this.db.setConfig('app_config', JSON.stringify(merged));
   }
