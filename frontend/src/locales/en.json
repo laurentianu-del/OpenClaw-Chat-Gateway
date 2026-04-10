@@ -327,7 +327,7 @@
       "permissionsTitle": "Permission Settings",
       "permissionsDescription": "Control whether OpenClaw operates in host takeover mode.",
       "maxPermissionsLabel": "Maximum Permissions",
-      "maxPermissionsHint": "When enabled, OpenClaw will first try to prepare host takeover automatically: full tool access, no exec confirmation, a root entrypoint named `host-root`, and after the gateway restarts, wrapper takeover for `sudo`, `apt-get`, `pip`, `systemctl`, and similar commands. If the system needs privilege escalation for the first install, a dialog will ask for the current system user's password. When disabled, the takeover chain is removed and the default coding preset is restored.",
+      "maxPermissionsHint": "When enabled, OpenClaw will first try to prepare host takeover automatically: full tool access, no exec confirmation, a root entrypoint named `host-root`, and after the gateway restarts, wrapper takeover for `sudo`, `apt-get`, `pip`, `systemctl`, and similar commands; it also disables OpenClaw's own internal preflight interception for complex `exec` / script execution. If the system needs privilege escalation for the first install, a dialog will ask for the current system user's password. When disabled, the takeover chain is removed and the default coding preset is restored.",
       "maxPermissionsLoadFailed": "Failed to load the maximum permissions status",
       "hostTakeoverStatusLabel": "Host Takeover Status",
       "hostTakeoverCurrentUserLabel": "Current System User",

@@ -456,6 +456,9 @@ type HostTakeoverStatus = {
   helperInstalled: boolean;
   helperReachable: boolean;
   servicePathPatched: boolean;
+  execPreflightBypassReady: boolean;
+  execPreflightTargetCount: number;
+  execPreflightPatchedCount: number;
   currentUser: string;
   wrapperDir: string;
   hostRootPath: string;
@@ -1743,6 +1746,11 @@ function getExecApprovalsPath() {
   return path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
 }
 
+const OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER = 'openclaw-chat-gateway:max-permissions-exec-preflight-bypass';
+const OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE = 'async function validateScriptFileForShellBleed(params) {';
+const OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE = `async function validateScriptFileForShellBleed(params) { return; /* ${OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER} */`;
+const OPENCLAW_EXEC_PREFLIGHT_PATCH_BACKUP_SUFFIX = '.clawui-max-permissions.exec-preflight.bak';
+
 type HostTakeoverOverrideSnapshot = {
   existed: boolean;
   content: string | null;
@@ -1751,6 +1759,25 @@ type HostTakeoverOverrideSnapshot = {
 type TextFileSnapshot = {
   existed: boolean;
   content: string | null;
+};
+
+type FilePathSnapshot = {
+  filePath: string;
+  snapshot: TextFileSnapshot;
+};
+
+type OpenClawExecPreflightPatchTarget = {
+  packageRoot: string;
+  targetPath: string;
+  backupPath: string;
+};
+
+type OpenClawExecPreflightBypassStatus = {
+  ready: boolean;
+  targetCount: number;
+  patchedCount: number;
+  rawDetail: string | null;
+  targets: OpenClawExecPreflightPatchTarget[];
 };
 
 function getCurrentUserName() {
@@ -1883,6 +1910,220 @@ function restoreTextFile(filePath: string, snapshot: TextFileSnapshot) {
   }
 
   fs.rmSync(filePath, { force: true });
+}
+
+function snapshotFilePaths(filePaths: string[]): FilePathSnapshot[] {
+  const uniquePaths = Array.from(new Set(filePaths.map((filePath) => path.resolve(filePath))));
+  return uniquePaths.map((filePath) => ({
+    filePath,
+    snapshot: snapshotTextFile(filePath),
+  }));
+}
+
+function restoreFilePathSnapshots(snapshots: FilePathSnapshot[]) {
+  for (const entry of snapshots) {
+    restoreTextFile(entry.filePath, entry.snapshot);
+  }
+}
+
+function getOpenClawExecPreflightPatchBackupPath(targetPath: string) {
+  return `${targetPath}${OPENCLAW_EXEC_PREFLIGHT_PATCH_BACKUP_SUFFIX}`;
+}
+
+function readOpenClawExecPreflightSource(targetPath: string) {
+  return fs.readFileSync(targetPath, 'utf-8');
+}
+
+function isOpenClawExecPreflightBypassPatched(source: string) {
+  return source.includes(OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER)
+    || source.includes(OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE);
+}
+
+function collectOpenClawExecPreflightPatchTargets(): OpenClawExecPreflightPatchTarget[] {
+  const targets: OpenClawExecPreflightPatchTarget[] = [];
+  const seen = new Set<string>();
+
+  for (const packageRoot of collectOpenClawPackageRoots()) {
+    const distDir = path.join(packageRoot, 'dist');
+    if (!fs.existsSync(distDir)) continue;
+
+    let entryNames: string[] = [];
+    try {
+      entryNames = fs.readdirSync(distDir)
+        .filter((entryName) => entryName.endsWith('.js'))
+        .sort((left, right) => {
+          const leftPriority = /^pi-embedded-.*\.js$/i.test(left) ? 0 : 1;
+          const rightPriority = /^pi-embedded-.*\.js$/i.test(right) ? 0 : 1;
+          if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+          return left.localeCompare(right);
+        });
+    } catch {
+      continue;
+    }
+
+    for (const entryName of entryNames) {
+      const targetPath = path.join(distDir, entryName);
+      if (seen.has(targetPath)) continue;
+
+      const backupPath = getOpenClawExecPreflightPatchBackupPath(targetPath);
+      let shouldInclude = fs.existsSync(backupPath);
+
+      if (!shouldInclude) {
+        try {
+          const source = readOpenClawExecPreflightSource(targetPath);
+          shouldInclude = source.includes(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE)
+            || isOpenClawExecPreflightBypassPatched(source);
+        } catch {
+          shouldInclude = false;
+        }
+      }
+
+      if (!shouldInclude) continue;
+
+      seen.add(targetPath);
+      targets.push({
+        packageRoot,
+        targetPath,
+        backupPath,
+      });
+    }
+  }
+
+  return targets;
+}
+
+function snapshotOpenClawExecPreflightPatchFiles(
+  targets = collectOpenClawExecPreflightPatchTargets(),
+): FilePathSnapshot[] {
+  return snapshotFilePaths(targets.flatMap((target) => [target.targetPath, target.backupPath]));
+}
+
+function patchOpenClawExecPreflightBypassTarget(target: OpenClawExecPreflightPatchTarget) {
+  const source = readOpenClawExecPreflightSource(target.targetPath);
+  if (isOpenClawExecPreflightBypassPatched(source)) {
+    return;
+  }
+
+  if (!source.includes(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE)) {
+    throw new Error(`OpenClaw exec preflight validator signature not found in ${target.targetPath}.`);
+  }
+
+  if (!fs.existsSync(target.backupPath)) {
+    fs.writeFileSync(target.backupPath, source);
+  }
+
+  const patchedSource = source.replace(
+    OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE,
+    OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE,
+  );
+  if (patchedSource === source) {
+    throw new Error(`Failed to patch OpenClaw exec preflight validator in ${target.targetPath}.`);
+  }
+
+  fs.writeFileSync(target.targetPath, patchedSource);
+}
+
+function restoreOpenClawExecPreflightBypassTarget(target: OpenClawExecPreflightPatchTarget) {
+  if (fs.existsSync(target.backupPath)) {
+    fs.writeFileSync(target.targetPath, fs.readFileSync(target.backupPath, 'utf-8'));
+    fs.rmSync(target.backupPath, { force: true });
+    return;
+  }
+
+  if (!fs.existsSync(target.targetPath)) {
+    return;
+  }
+
+  const source = readOpenClawExecPreflightSource(target.targetPath);
+  if (!isOpenClawExecPreflightBypassPatched(source)) {
+    return;
+  }
+
+  const restoredSource = source.replace(
+    OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE,
+    OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE,
+  );
+  if (restoredSource !== source) {
+    fs.writeFileSync(target.targetPath, restoredSource);
+  }
+}
+
+function readOpenClawExecPreflightBypassStatus(): OpenClawExecPreflightBypassStatus {
+  const targets = collectOpenClawExecPreflightPatchTargets();
+  if (targets.length === 0) {
+    return {
+      ready: false,
+      targetCount: 0,
+      patchedCount: 0,
+      rawDetail: 'Could not locate the OpenClaw exec preflight bundle to patch.',
+      targets,
+    };
+  }
+
+  let patchedCount = 0;
+  const unpatchedTargets: string[] = [];
+
+  for (const target of targets) {
+    try {
+      const source = readOpenClawExecPreflightSource(target.targetPath);
+      if (isOpenClawExecPreflightBypassPatched(source)) {
+        patchedCount += 1;
+      } else {
+        unpatchedTargets.push(path.basename(target.targetPath));
+      }
+    } catch {
+      unpatchedTargets.push(path.basename(target.targetPath));
+    }
+  }
+
+  if (patchedCount === targets.length) {
+    return {
+      ready: true,
+      targetCount: targets.length,
+      patchedCount,
+      rawDetail: null,
+      targets,
+    };
+  }
+
+  return {
+    ready: false,
+    targetCount: targets.length,
+    patchedCount,
+    rawDetail: `The OpenClaw exec preflight bypass is not active for: ${unpatchedTargets.join(', ')}`,
+    targets,
+  };
+}
+
+function applyOpenClawExecPreflightBypass(enabled: boolean) {
+  const targets = collectOpenClawExecPreflightPatchTargets();
+
+  if (enabled && targets.length === 0) {
+    throw new Error('Could not locate the OpenClaw exec preflight bundle for maximum permissions.');
+  }
+
+  for (const target of targets) {
+    if (enabled) {
+      patchOpenClawExecPreflightBypassTarget(target);
+    } else {
+      restoreOpenClawExecPreflightBypassTarget(target);
+    }
+  }
+
+  if (enabled) {
+    const status = readOpenClawExecPreflightBypassStatus();
+    if (!status.ready) {
+      throw new Error(status.rawDetail || 'Failed to activate the OpenClaw exec preflight bypass.');
+    }
+  }
+}
+
+function synchronizeOpenClawExecPreflightBypassBestEffort(enabled: boolean) {
+  try {
+    applyOpenClawExecPreflightBypass(enabled);
+  } catch (error) {
+    console.error('Failed to synchronize the OpenClaw exec preflight bypass:', error);
+  }
 }
 
 function buildHostTakeoverHostRootScript() {
@@ -2281,6 +2522,15 @@ async function readHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === 
   const currentUser = getCurrentUserName();
   const autoInstallMode = getHostTakeoverAutoInstallMode();
   const autoInstallSupported = isHostTakeoverAutoInstallSupported();
+  const execPreflightBypassStatus = enabled
+    ? readOpenClawExecPreflightBypassStatus()
+    : {
+        ready: false,
+        targetCount: 0,
+        patchedCount: 0,
+        rawDetail: null,
+        targets: [],
+      } satisfies OpenClawExecPreflightBypassStatus;
   const helperInstalled = fs.existsSync(HOST_TAKEOVER_SYSTEM_HELPER_PATH);
   const overrideContent = fs.existsSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH)
     ? fs.readFileSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, 'utf-8')
@@ -2317,7 +2567,9 @@ async function readHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === 
     rawDetail = rawDetail || normalizeCliText(error?.stderr) || normalizeCliText(error?.message) || `Could not inspect ${OPENCLAW_GATEWAY_SERVICE_NAME}.`;
   }
 
-  const ready = helperReachable && servicePathPatched;
+  const ready = helperReachable
+    && servicePathPatched
+    && (!enabled || execPreflightBypassStatus.ready);
   let mode: HostTakeoverMode = 'disabled';
 
   if (!enabled) {
@@ -2329,7 +2581,9 @@ async function readHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === 
     rawDetail = rawDetail || 'The host takeover helper has not been installed yet.';
   } else {
     mode = 'broken';
-    rawDetail = rawDetail || 'The host takeover chain is incomplete.';
+    rawDetail = rawDetail
+      || execPreflightBypassStatus.rawDetail
+      || 'The host takeover chain is incomplete.';
   }
 
   return {
@@ -2339,6 +2593,9 @@ async function readHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === 
     helperInstalled,
     helperReachable,
     servicePathPatched,
+    execPreflightBypassReady: enabled && execPreflightBypassStatus.ready,
+    execPreflightTargetCount: execPreflightBypassStatus.targetCount,
+    execPreflightPatchedCount: execPreflightBypassStatus.patchedCount,
     currentUser,
     wrapperDir: HOST_TAKEOVER_WRAPPER_DIR,
     hostRootPath: HOST_TAKEOVER_HOST_ROOT_PATH,
@@ -2354,6 +2611,15 @@ async function safeReadHostTakeoverStatus(enabled = readMaxPermissionsEnabled() 
   try {
     return await readHostTakeoverStatus(enabled);
   } catch (error: any) {
+    const execPreflightBypassStatus = enabled
+      ? readOpenClawExecPreflightBypassStatus()
+      : {
+          ready: false,
+          targetCount: 0,
+          patchedCount: 0,
+          rawDetail: null,
+          targets: [],
+        } satisfies OpenClawExecPreflightBypassStatus;
     return {
       enabled,
       mode: enabled ? 'broken' : 'disabled',
@@ -2361,6 +2627,9 @@ async function safeReadHostTakeoverStatus(enabled = readMaxPermissionsEnabled() 
       helperInstalled: fs.existsSync(HOST_TAKEOVER_SYSTEM_HELPER_PATH),
       helperReachable: false,
       servicePathPatched: false,
+      execPreflightBypassReady: enabled && execPreflightBypassStatus.ready,
+      execPreflightTargetCount: execPreflightBypassStatus.targetCount,
+      execPreflightPatchedCount: execPreflightBypassStatus.patchedCount,
       currentUser: getCurrentUserName(),
       wrapperDir: HOST_TAKEOVER_WRAPPER_DIR,
       hostRootPath: HOST_TAKEOVER_HOST_ROOT_PATH,
@@ -2368,7 +2637,10 @@ async function safeReadHostTakeoverStatus(enabled = readMaxPermissionsEnabled() 
       autoInstallSupported: isHostTakeoverAutoInstallSupported(),
       autoInstallMode: getHostTakeoverAutoInstallMode(),
       manualInstallCommand: buildHostTakeoverManualInstallCommand(),
-      rawDetail: normalizeCliText(error?.stderr) || normalizeCliText(error?.message) || 'Failed to inspect host takeover status.',
+      rawDetail: execPreflightBypassStatus.rawDetail
+        || normalizeCliText(error?.stderr)
+        || normalizeCliText(error?.message)
+        || 'Failed to inspect host takeover status.',
     };
   }
 }
@@ -2380,6 +2652,7 @@ function buildHostTakeoverChatInstruction() {
     'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
     'Treat installed host tools as part of your execution environment: if a command-line tool exists on this machine, you should discover it from PATH and use it directly instead of claiming the product lacks that capability.',
     'For uploaded files or workspace files, use their absolute paths. When the model cannot natively understand a file type, first call the appropriate local tool to inspect, transcribe, convert, extract, or summarize it, then continue the task.',
+    'Under maximum permissions, OpenClaw internal exec/script preflight interception is also bypassed, so complex shell and interpreter command sequences may be executed directly when needed.',
     buildManagedDocumentToolingInstruction(),
     `Immediate root entrypoint: ${HOST_TAKEOVER_HOST_ROOT_PATH}`,
     `Run a single root command with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /usr/bin/id -u`,
@@ -3184,6 +3457,7 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
   const configSnapshot = snapshotTextFile(configPath);
   const approvalsSnapshot = snapshotTextFile(execApprovalsPath);
   const overrideSnapshot = snapshotHostTakeoverOverride();
+  const execPreflightSnapshot = snapshotOpenClawExecPreflightPatchFiles();
   let overrideTouched = false;
 
   try {
@@ -3198,6 +3472,7 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
     }
 
     setMaxPermissionsEnabled(enabled);
+    applyOpenClawExecPreflightBypass(enabled);
 
     if (enabled) {
       warmManagedHostToolingInBackground();
@@ -3221,6 +3496,12 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
     }
 
     try {
+      restoreFilePathSnapshots(execPreflightSnapshot);
+    } catch (restoreExecPreflightError) {
+      console.error('Failed to restore the OpenClaw exec preflight patch state after max permissions error:', restoreExecPreflightError);
+    }
+
+    try {
       restoreHostTakeoverOverride(overrideSnapshot);
       if (overrideTouched) {
         await reloadOpenClawGatewayUserSystemd();
@@ -3233,11 +3514,14 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
   }
 }
 
-if (readMaxPermissionsEnabled() === true) {
-  setImmediate(() => {
+setImmediate(() => {
+  const maxPermissionsEnabled = readMaxPermissionsEnabled() === true;
+  patchExecApprovals(maxPermissionsEnabled);
+  synchronizeOpenClawExecPreflightBypassBestEffort(maxPermissionsEnabled);
+  if (maxPermissionsEnabled) {
     warmManagedHostToolingInBackground();
-  });
-}
+  }
+});
 
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
   const executablePath = await ensureResolvedOpenClawExecutablePath();

@@ -237,6 +237,9 @@ type HostTakeoverStatus = {
   helperInstalled: boolean;
   helperReachable: boolean;
   servicePathPatched: boolean;
+  execPreflightBypassReady: boolean;
+  execPreflightTargetCount: number;
+  execPreflightPatchedCount: number;
   currentUser: string;
   wrapperDir: string;
   hostRootPath: string;

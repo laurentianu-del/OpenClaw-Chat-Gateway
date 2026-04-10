@@ -327,7 +327,7 @@
       "permissionsTitle": "权限设置",
       "permissionsDescription": "控制 OpenClaw 是否以“接管本机”的方式运行。",
       "maxPermissionsLabel": "最大化权限",
-      "maxPermissionsHint": "开启后，OpenClaw 会自动尝试准备“接管本机”链路：开放全部工具权限、关闭命令确认、创建 root 入口 `host-root`，并在重启网关后接管 `sudo`、`apt-get`、`pip`、`systemctl` 等常用命令。若系统首次需要提权，会弹窗让你输入当前系统用户密码；关闭后会移除该接管链路并恢复默认 coding 预设。",
+      "maxPermissionsHint": "开启后，OpenClaw 会自动尝试准备“接管本机”链路：开放全部工具权限、关闭命令确认、创建 root 入口 `host-root`，并在重启网关后接管 `sudo`、`apt-get`、`pip`、`systemctl` 等常用命令；同时也会关闭 OpenClaw 自身对复杂 `exec` / 脚本执行的内部预检拦截。若系统首次需要提权，会弹窗让你输入当前系统用户密码；关闭后会移除该接管链路并恢复默认 coding 预设。",
       "maxPermissionsLoadFailed": "读取最大化权限状态失败",
       "hostTakeoverStatusLabel": "主机接管状态",
       "hostTakeoverCurrentUserLabel": "当前系统账号",
