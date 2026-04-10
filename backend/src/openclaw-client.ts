@@ -249,6 +249,7 @@ export class OpenClawClient extends EventEmitter {
       const fail = (err: Error) => {
         this.connected = false;
         this.connectPromise = null;
+        this.rejectPendingRequests(err);
         reject(err);
       };
 
@@ -334,6 +335,7 @@ export class OpenClawClient extends EventEmitter {
       this.ws.on('close', () => {
         this.connected = false;
         this.connectPromise = null;
+        this.rejectPendingRequests(new Error('Client disconnected'));
         this.emit('disconnected');
       });
 
@@ -344,6 +346,14 @@ export class OpenClawClient extends EventEmitter {
     });
 
     return this.connectPromise;
+  }
+
+  private rejectPendingRequests(error: Error): void {
+    for (const [, pending] of this.pending) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   private async request(method: string, params?: any, timeoutMs = 60000): Promise<any> {
@@ -393,6 +403,22 @@ export class OpenClawClient extends EventEmitter {
       sessionKey,
       limit,
     }, 30000);
+  }
+
+  async getGatewayStatus(timeoutMs = 10000): Promise<any> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    return this.request('status', {}, timeoutMs);
+  }
+
+  async getGatewayHealth(timeoutMs = 10000): Promise<any> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    return this.request('health', { probe: true }, timeoutMs);
   }
 
   private extractLatestAssistantText(historyPayload: any): string {
@@ -500,11 +526,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   disconnect(): void {
-    for (const [, p] of this.pending) {
-      clearTimeout(p.timer);
-      p.reject(new Error('Client disconnected'));
-    }
-    this.pending.clear();
+    this.rejectPendingRequests(new Error('Client disconnected'));
 
     if (this.ws) {
       this.ws.close();

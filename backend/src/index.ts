@@ -47,6 +47,82 @@ import { getCurrentAppVersionInfo, getLatestVersionInfo, type LatestVersionInfo 
 const execPromise = util.promisify(exec);
 const execFilePromise = util.promisify(execFile);
 
+function execFileWithInput(
+  file: string,
+  args: string[],
+  input: string,
+  options?: { timeout?: number; env?: NodeJS.ProcessEnv; cwd?: string }
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, {
+      env: options?.env,
+      cwd: options?.cwd,
+      stdio: 'pipe',
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | null = null;
+
+    const finalizeError = (error: any) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      reject(error);
+    };
+
+    const finalizeSuccess = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ stdout, stderr });
+    };
+
+    if (options?.timeout && options.timeout > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+      }, options.timeout);
+    }
+
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    child.on('error', (error) => {
+      finalizeError(error);
+    });
+
+    child.on('close', (code, signal) => {
+      if (code === 0 && !timedOut) {
+        finalizeSuccess();
+        return;
+      }
+
+      const error: any = new Error(
+        timedOut
+          ? `${file} timed out`
+          : `${file} exited with code ${code ?? 'null'}${signal ? ` (signal ${signal})` : ''}`
+      );
+      error.code = code;
+      error.signal = signal;
+      error.stdout = stdout;
+      error.stderr = stderr;
+      finalizeError(error);
+    });
+
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(input);
+  });
+}
+
 const app = express();
 const server = createServer(app);
 
@@ -58,6 +134,7 @@ const dataDir = process.env.CLAWUI_DATA_DIR || '.clawui';
 const uploadDir = path.join(process.env.HOME || '.', dataDir, 'uploads');
 const browserWarmupMarkerPath = path.join(process.env.HOME || '.', dataDir, 'browser-warmup.pending');
 const updateRestartStatePath = path.join(process.env.HOME || '.', dataDir, 'update-restart-state.json');
+const gatewayRestartStatePath = path.join(process.env.HOME || '.', dataDir, 'gateway-restart-state.json');
 fs.mkdirSync(uploadDir, { recursive: true });
 
 // OpenClaw media directory (screenshots, inbound files, etc.)
@@ -105,6 +182,10 @@ const BROWSER_SELF_HEAL_FAILED_ERROR_CODE = 'gateway.browserSelfHealFailed';
 const BROWSER_TASK_BUSY_ERROR_CODE = 'gateway.browserTaskBusy';
 const BROWSER_HEADED_MODE_LOAD_FAILED_ERROR_CODE = 'gateway.browserHeadedModeLoadFailed';
 const BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE = 'gateway.browserHeadedModeUpdateFailed';
+const GATEWAY_MAX_PERMISSIONS_UPDATE_FAILED_ERROR_CODE = 'gateway.maxPermissionsUpdateFailed';
+const GATEWAY_HOST_TAKEOVER_CREDENTIALS_REQUIRED_ERROR_CODE = 'gateway.hostTakeoverCredentialsRequired';
+const GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE = 'gateway.hostTakeoverInstallFailed';
+const GATEWAY_HOST_TAKEOVER_SERVICE_NOT_FOUND_ERROR_CODE = 'gateway.hostTakeoverServiceNotFound';
 const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
 const AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'agents.idContainsWhitespace';
 const AGENT_ID_ALREADY_EXISTS_ERROR_CODE = 'agents.idAlreadyExists';
@@ -241,6 +322,24 @@ type BrowserTaskSnapshot = {
   updatedAt: string | null;
 };
 
+type GatewayRestartTrigger =
+  | 'gateway'
+  | 'browser-headed-mode';
+
+type GatewayRestartTaskStatus =
+  | 'idle'
+  | 'restarting'
+  | 'failed';
+
+type GatewayRestartSnapshot = {
+  status: GatewayRestartTaskStatus;
+  trigger: GatewayRestartTrigger | null;
+  rawDetail: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  targetHeadedModeEnabled: boolean | null;
+};
+
 type UpdateRestartStepId =
   | 'restart_openclaw'
   | 'restart_project'
@@ -324,6 +423,35 @@ type OpenClawUpdateSnapshot = {
   updatedAt: string | null;
 };
 
+type HostTakeoverMode =
+  | 'disabled'
+  | 'ready'
+  | 'needs_install'
+  | 'broken';
+
+type HostTakeoverAutoInstallMode =
+  | 'root'
+  | 'sudo'
+  | 'pkexec'
+  | 'manual';
+
+type HostTakeoverStatus = {
+  enabled: boolean;
+  mode: HostTakeoverMode;
+  ready: boolean;
+  helperInstalled: boolean;
+  helperReachable: boolean;
+  servicePathPatched: boolean;
+  currentUser: string;
+  wrapperDir: string;
+  hostRootPath: string;
+  helperPath: string;
+  autoInstallSupported: boolean;
+  autoInstallMode: HostTakeoverAutoInstallMode;
+  manualInstallCommand: string | null;
+  rawDetail: string | null;
+};
+
 type ActiveOpenClawUpdateProcess = {
   child: ReturnType<typeof spawn>;
   cancelRequested: boolean;
@@ -339,8 +467,25 @@ const UPDATE_RESTART_STEP_IDS: UpdateRestartStepId[] = [
 ];
 const OPENCLAW_LATEST_VERSION_CACHE_TTL_MS = 60 * 1000;
 const OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS = [700, 1000] as const;
+const OPENCLAW_GATEWAY_READY_PROBE_TIMEOUT_MS = 5000;
+const OPENCLAW_GATEWAY_READY_PROBE_STEP_TIMEOUT_MS = 2000;
+const OPENCLAW_GATEWAY_READY_RESULT_CACHE_TTL_MS = 3000;
+const OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS = 20 * 1000;
 const OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS = 1200;
 const OPENCLAW_UPDATE_SUCCESS_AUTO_RESET_MS = 5000;
+const OPENCLAW_GATEWAY_SERVICE_NAME = 'openclaw-gateway.service';
+const HOST_TAKEOVER_SYSTEM_HELPER_PATH = '/usr/local/lib/openclaw-host-takeover/run';
+const HOST_TAKEOVER_WRAPPER_DIR = path.join(os.homedir(), '.openclaw', 'host-takeover', 'bin');
+const HOST_TAKEOVER_HOST_ROOT_PATH = path.join(HOST_TAKEOVER_WRAPPER_DIR, 'host-root');
+const HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH = path.join(
+  os.homedir(),
+  '.config',
+  'systemd',
+  'user',
+  `${OPENCLAW_GATEWAY_SERVICE_NAME}.d`,
+  '90-host-takeover.conf'
+);
+const HOST_TAKEOVER_INSTALLER_SCRIPT_PATH = path.join(appRepoRoot, 'backend', 'scripts', 'install-host-takeover.sh');
 const OPENCLAW_UPDATE_CANCELLABLE_PHASES = new Set([
   'download-package',
   'install-package',
@@ -361,6 +506,17 @@ function createDefaultUpdateSnapshot(): UpdateSnapshot {
     updatedAt: new Date().toISOString(),
     serviceName: null,
     restartSteps: null,
+  };
+}
+
+function createDefaultGatewayRestartSnapshot(): GatewayRestartSnapshot {
+  return {
+    status: 'idle',
+    trigger: null,
+    rawDetail: null,
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+    targetHeadedModeEnabled: null,
   };
 }
 
@@ -481,7 +637,50 @@ function syncPersistedUpdateRestartSnapshot() {
   }
 }
 
+function readPersistedGatewayRestartSnapshot(): GatewayRestartSnapshot | null {
+  try {
+    if (!fs.existsSync(gatewayRestartStatePath)) {
+      return null;
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(gatewayRestartStatePath, 'utf8')) as Partial<GatewayRestartSnapshot>;
+    if (parsed.status !== 'restarting' && parsed.status !== 'failed') {
+      return null;
+    }
+
+    const trigger = normalizeCliText(parsed.trigger);
+    return {
+      ...createDefaultGatewayRestartSnapshot(),
+      ...parsed,
+      status: parsed.status,
+      trigger: trigger === 'gateway' || trigger === 'browser-headed-mode' ? trigger : null,
+      rawDetail: normalizeCliText(parsed.rawDetail) || null,
+      startedAt: normalizeCliText(parsed.startedAt) || null,
+      updatedAt: normalizeCliText(parsed.updatedAt) || new Date().toISOString(),
+      targetHeadedModeEnabled: typeof parsed.targetHeadedModeEnabled === 'boolean' ? parsed.targetHeadedModeEnabled : null,
+    };
+  } catch (error) {
+    console.warn('[GatewayRestart] Failed to read persisted restart state:', error);
+    return null;
+  }
+}
+
+function syncPersistedGatewayRestartSnapshot() {
+  try {
+    if (gatewayRestartSnapshot.status === 'restarting' || gatewayRestartSnapshot.status === 'failed') {
+      fs.mkdirSync(path.dirname(gatewayRestartStatePath), { recursive: true });
+      fs.writeFileSync(gatewayRestartStatePath, `${JSON.stringify(gatewayRestartSnapshot, null, 2)}\n`);
+      return;
+    }
+
+    fs.rmSync(gatewayRestartStatePath, { force: true });
+  } catch (error) {
+    console.warn('[GatewayRestart] Failed to sync persisted restart state:', error);
+  }
+}
+
 let updateSnapshot = readPersistedUpdateRestartSnapshot() || createDefaultUpdateSnapshot();
+let gatewayRestartSnapshot = readPersistedGatewayRestartSnapshot() || createDefaultGatewayRestartSnapshot();
 let activeUpdateProcess: ActiveUpdateProcess | null = null;
 let cachedLatestVersionInfo: AppLatestVersionInfo | null = null;
 let openClawUpdateSnapshot = createDefaultOpenClawUpdateSnapshot();
@@ -489,9 +688,17 @@ let activeOpenClawUpdateProcess: ActiveOpenClawUpdateProcess | null = null;
 let cachedOpenClawLatestVersionInfo: OpenClawLatestVersionInfo | null = null;
 let cachedOpenClawLatestVersionCheckedAt = 0;
 let openClawUpdateRuntimeReconcileInFlight: Promise<void> | null = null;
+let openClawUpdateSuccessFinalizeTask: Promise<void> | null = null;
 let lastOpenClawUpdateRuntimeReconcileAt = 0;
 let openClawUpdateSuccessResetTimer: NodeJS.Timeout | null = null;
 let updateRestartResumeTask: Promise<void> | null = null;
+let activeGatewayRestartTask: Promise<void> | null = null;
+let cachedGatewayProbeKey: string | null = null;
+let cachedGatewayProbeResult:
+  | { checkedAt: number; result: { connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' } }
+  | null = null;
+const gatewayProbeInflight = new Map<string, Promise<{ connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' }>>();
+let gatewayRestartReconcileStableSinceMs: number | null = null;
 
 function appendUpdateLog(message: string) {
   const line = normalizeCliText(message);
@@ -513,6 +720,28 @@ function patchUpdateSnapshot(patch: Partial<UpdateSnapshot>) {
 function resetUpdateSnapshot() {
   updateSnapshot = createDefaultUpdateSnapshot();
   syncPersistedUpdateRestartSnapshot();
+}
+
+function getGatewayRestartSnapshot() {
+  return { ...gatewayRestartSnapshot };
+}
+
+function patchGatewayRestartSnapshot(patch: Partial<GatewayRestartSnapshot>) {
+  if (patch.status !== undefined) {
+    gatewayRestartReconcileStableSinceMs = null;
+  }
+  gatewayRestartSnapshot = {
+    ...gatewayRestartSnapshot,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  syncPersistedGatewayRestartSnapshot();
+}
+
+function resetGatewayRestartSnapshot() {
+  gatewayRestartReconcileStableSinceMs = null;
+  gatewayRestartSnapshot = createDefaultGatewayRestartSnapshot();
+  syncPersistedGatewayRestartSnapshot();
 }
 
 function rememberLatestVersionInfo(info: AppLatestVersionInfo | null) {
@@ -784,6 +1013,51 @@ function buildOpenClawUpdateStatusResponse(): OpenClawUpdateSnapshot {
   };
 }
 
+function scheduleOpenClawUpdateSuccessFinalization(options: {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  successLogMessage: string;
+}) {
+  if (openClawUpdateSuccessFinalizeTask) {
+    return openClawUpdateSuccessFinalizeTask;
+  }
+
+  openClawUpdateSuccessFinalizeTask = (async () => {
+    try {
+      appendOpenClawUpdateLog('Waiting for OpenClaw gateway connection to stabilize after the update.');
+      await waitForGatewayConnectionStable(BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS, {
+        minimumStableWindowMs: OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS,
+        probeIntervalMs: OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS,
+      });
+      patchOpenClawUpdateSnapshot({
+        status: 'update_succeeded',
+        phase: 'complete',
+        canCancel: false,
+        currentVersion: options.currentVersion,
+        latestVersion: options.latestVersion,
+        message: getOpenClawUpdatePhaseMessage('complete'),
+        rawDetail: null,
+      });
+      appendOpenClawUpdateLog(options.successLogMessage);
+      scheduleOpenClawUpdateSuccessAutoReset();
+    } catch (error) {
+      const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
+      patchOpenClawUpdateSnapshot({
+        status: 'update_failed',
+        phase: 'verifying-version',
+        canCancel: false,
+        message: 'OpenClaw update verification failed.',
+        rawDetail: detail,
+      });
+      appendOpenClawUpdateLog(`OpenClaw update completed, but connection recovery failed: ${detail}`);
+    } finally {
+      openClawUpdateSuccessFinalizeTask = null;
+    }
+  })();
+
+  return openClawUpdateSuccessFinalizeTask;
+}
+
 async function reconcileOpenClawUpdateSnapshotFromRuntime() {
   if (openClawUpdateSnapshot.status !== 'updating') {
     return;
@@ -838,16 +1112,15 @@ async function reconcileOpenClawUpdateSnapshotFromRuntime() {
     }
 
     if (openClawUpdateSnapshot.status !== 'update_succeeded' || openClawUpdateSnapshot.phase !== 'complete') {
-      patchOpenClawUpdateSnapshot({
-        status: 'update_succeeded',
-        phase: 'complete',
-        canCancel: false,
+      patchOpenClawUpdatePhaseState('verifying-version', {
         currentVersion: observedVersion,
-        message: getOpenClawUpdatePhaseMessage('complete'),
-        rawDetail: null,
+        canCancel: false,
       });
-      appendOpenClawUpdateLog(`Detected OpenClaw ${observedVersion}. Update completed successfully.`);
-      scheduleOpenClawUpdateSuccessAutoReset();
+      void scheduleOpenClawUpdateSuccessFinalization({
+        currentVersion: observedVersion,
+        latestVersion,
+        successLogMessage: `Detected OpenClaw ${observedVersion}. Update completed successfully.`,
+      });
     }
   })().finally(() => {
     openClawUpdateRuntimeReconcileInFlight = null;
@@ -1143,17 +1416,11 @@ async function startOpenClawUpdateTask() {
         appendOpenClawUpdateLog('Verified and repaired the OpenClaw shell entrypoint.');
         patchOpenClawUpdatePhaseState('verifying-version');
         const verifiedInfo = await getOpenClawLatestVersionInfo();
-        patchOpenClawUpdateSnapshot({
-          status: 'update_succeeded',
-          phase: 'complete',
-          canCancel: false,
+        void scheduleOpenClawUpdateSuccessFinalization({
           currentVersion: verifiedInfo.currentVersion,
           latestVersion: verifiedInfo.latestVersion,
-          message: getOpenClawUpdatePhaseMessage('complete'),
-          rawDetail: null,
+          successLogMessage: `OpenClaw update completed successfully. Current version: ${verifiedInfo.currentVersion || 'unknown'}.`,
         });
-        appendOpenClawUpdateLog(`OpenClaw update completed successfully. Current version: ${verifiedInfo.currentVersion || 'unknown'}.`);
-        scheduleOpenClawUpdateSuccessAutoReset();
       } catch (error) {
         const detail = readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error));
         patchOpenClawUpdateSnapshot({
@@ -1184,7 +1451,7 @@ async function startOpenClawUpdateTask() {
 }
 
 async function resetOpenClawUpdateTaskState() {
-  if (activeOpenClawUpdateProcess) {
+  if (activeOpenClawUpdateProcess || openClawUpdateSuccessFinalizeTask) {
     throw new StructuredRequestError(409, OPENCLAW_UPDATE_ALREADY_RUNNING_ERROR_CODE, 'Cannot reset while an OpenClaw update task is running.');
   }
   resetOpenClawUpdateSnapshot();
@@ -1460,6 +1727,630 @@ function getOpenClawConfigPath() {
 
 function getExecApprovalsPath() {
   return path.join(os.homedir(), '.openclaw', 'exec-approvals.json');
+}
+
+type HostTakeoverOverrideSnapshot = {
+  existed: boolean;
+  content: string | null;
+};
+
+type TextFileSnapshot = {
+  existed: boolean;
+  content: string | null;
+};
+
+function getCurrentUserName() {
+  const envUser = normalizeCliText(process.env.USER);
+  if (envUser) return envUser;
+  try {
+    return normalizeCliText(os.userInfo().username) || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function getHostTakeoverSudoersPath(userName = getCurrentUserName()) {
+  return `/etc/sudoers.d/openclaw-host-takeover-${userName}`;
+}
+
+function buildHostTakeoverManualInstallCommand(userName = getCurrentUserName()) {
+  if (!fs.existsSync(HOST_TAKEOVER_INSTALLER_SCRIPT_PATH)) {
+    return null;
+  }
+
+  return [
+    'sudo',
+    '/bin/bash',
+    shellQuote(HOST_TAKEOVER_INSTALLER_SCRIPT_PATH),
+    '--user',
+    shellQuote(userName),
+    '--helper-path',
+    shellQuote(HOST_TAKEOVER_SYSTEM_HELPER_PATH),
+    '--sudoers-path',
+    shellQuote(getHostTakeoverSudoersPath(userName)),
+  ].join(' ');
+}
+
+function getHostTakeoverAutoInstallMode(): HostTakeoverAutoInstallMode {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    return 'root';
+  }
+  if (fs.existsSync('/usr/bin/sudo')) {
+    return 'sudo';
+  }
+  return 'manual';
+}
+
+function isHostTakeoverAutoInstallSupported() {
+  return getHostTakeoverAutoInstallMode() !== 'manual';
+}
+
+function needsSudoPassword(detail: string) {
+  const normalized = normalizeCliText(detail).toLowerCase();
+  return normalized.includes('password is required')
+    || normalized.includes('a terminal is required')
+    || normalized.includes('no askpass program specified')
+    || normalized.includes('authentication is required');
+}
+
+function normalizePathEntries(pathValue: string | null | undefined) {
+  return (pathValue || '')
+    .split(':')
+    .map((entry) => normalizeCliText(entry))
+    .filter(Boolean);
+}
+
+function prependPathEntry(pathValue: string, entry: string) {
+  return [entry, ...normalizePathEntries(pathValue).filter((item) => item !== entry)].join(':');
+}
+
+function snapshotHostTakeoverOverride(): HostTakeoverOverrideSnapshot {
+  if (!fs.existsSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH)) {
+    return {
+      existed: false,
+      content: null,
+    };
+  }
+
+  return {
+    existed: true,
+    content: fs.readFileSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, 'utf-8'),
+  };
+}
+
+function restoreHostTakeoverOverride(snapshot: HostTakeoverOverrideSnapshot) {
+  if (snapshot.existed) {
+    fs.mkdirSync(path.dirname(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH), { recursive: true });
+    fs.writeFileSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, snapshot.content || '');
+    return;
+  }
+
+  fs.rmSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, { force: true });
+}
+
+function snapshotTextFile(filePath: string): TextFileSnapshot {
+  if (!fs.existsSync(filePath)) {
+    return {
+      existed: false,
+      content: null,
+    };
+  }
+
+  return {
+    existed: true,
+    content: fs.readFileSync(filePath, 'utf-8'),
+  };
+}
+
+function restoreTextFile(filePath: string, snapshot: TextFileSnapshot) {
+  if (snapshot.existed) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, snapshot.content || '');
+    return;
+  }
+
+  fs.rmSync(filePath, { force: true });
+}
+
+function buildHostTakeoverHostRootScript() {
+  return `#!/bin/bash
+set -euo pipefail
+
+HELPER_PATH=${shellQuote(HOST_TAKEOVER_SYSTEM_HELPER_PATH)}
+
+die() {
+  echo "$1" >&2
+  exit 126
+}
+
+target_user=""
+if [[ "\${1:-}" == "--as-user" ]]; then
+  shift
+  target_user="\${1:-}"
+  if [[ -z "$target_user" ]]; then
+    echo "Missing user after --as-user" >&2
+    exit 64
+  fi
+  shift
+fi
+
+if [[ "\${1:-}" == "--" ]]; then
+  shift
+fi
+
+if [[ $# -eq 0 ]]; then
+  echo "Usage: host-root [--as-user USER] -- <command> [args...]" >&2
+  exit 64
+fi
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    if command -v runuser >/dev/null 2>&1; then
+      exec runuser -u "$target_user" -- "$@"
+    fi
+    exec su -s /bin/sh "$target_user" -c "$(printf '%q ' "$@")"
+  fi
+  exec "$@"
+fi
+
+if [[ ! -x /usr/bin/sudo ]]; then
+  die "OpenClaw host takeover requires /usr/bin/sudo on the host."
+fi
+
+if [[ -x "$HELPER_PATH" ]]; then
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    exec /usr/bin/sudo -n "$HELPER_PATH" --as-user "$target_user" -- "$@"
+  fi
+  exec /usr/bin/sudo -n "$HELPER_PATH" "$@"
+fi
+
+if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+  exec /usr/bin/sudo -n -u "$target_user" -- "$@"
+fi
+
+exec /usr/bin/sudo -n -- "$@"
+`;
+}
+
+function buildHostTakeoverSudoScript() {
+  return `#!/bin/bash
+set -euo pipefail
+
+WRAPPER_DIR=${shellQuote(HOST_TAKEOVER_WRAPPER_DIR)}
+orig=("$@")
+target_user=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|-H|-E|-k|-S)
+      shift
+      ;;
+    -u)
+      shift
+      target_user="\${1:-}"
+      if [[ -z "$target_user" ]]; then
+        echo "Missing user after -u" >&2
+        exit 64
+      fi
+      shift
+      ;;
+    -u*)
+      target_user="\${1#-u}"
+      if [[ -z "$target_user" ]]; then
+        echo "Missing user after -u" >&2
+        exit 64
+      fi
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      exec /usr/bin/sudo -n "\${orig[@]}"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -eq 0 ]]; then
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    exec "$WRAPPER_DIR/host-root" --as-user "$target_user" -- /bin/sh
+  fi
+  exec "$WRAPPER_DIR/host-root" /bin/sh
+fi
+
+if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+  exec "$WRAPPER_DIR/host-root" --as-user "$target_user" -- "$@"
+fi
+
+exec "$WRAPPER_DIR/host-root" "$@"
+`;
+}
+
+function buildHostTakeoverRootCommandScript(
+  commandName: string,
+  candidatePaths: string[],
+  options?: { bypassUserFlag?: string }
+) {
+  const candidateLines = candidatePaths
+    .map((candidate) => candidate)
+    .join('\n');
+  const bypassBlock = options?.bypassUserFlag
+    ? `
+for arg in "$@"; do
+  if [[ "$arg" == ${shellQuote(options.bypassUserFlag)} ]]; then
+    exec "$target" "$@"
+  fi
+done
+`
+    : '';
+
+  return `#!/bin/bash
+set -euo pipefail
+
+WRAPPER_DIR=${shellQuote(HOST_TAKEOVER_WRAPPER_DIR)}
+target=""
+while IFS= read -r candidate; do
+  if [[ -x "$candidate" ]]; then
+    target="$candidate"
+    break
+  fi
+done <<'EOF'
+${candidateLines}
+EOF
+
+if [[ -z "$target" ]]; then
+  echo "OpenClaw host takeover could not find ${commandName} on this host." >&2
+  exit 127
+fi
+${bypassBlock}
+exec "$WRAPPER_DIR/host-root" "$target" "$@"
+`;
+}
+
+function buildHostTakeoverPipScript(preferredCommand: 'pip' | 'pip3') {
+  const primaryPath = preferredCommand === 'pip3' ? '/usr/bin/pip3' : '/usr/bin/pip';
+  return `#!/bin/bash
+set -euo pipefail
+
+WRAPPER_DIR=${shellQuote(HOST_TAKEOVER_WRAPPER_DIR)}
+target=""
+if [[ -x ${shellQuote(primaryPath)} ]]; then
+  target=${shellQuote(primaryPath)}
+elif [[ -x /usr/bin/python3 ]]; then
+  exec "$WRAPPER_DIR/host-root" /usr/bin/python3 -m pip "$@"
+else
+  echo "OpenClaw host takeover could not find ${preferredCommand} or python3 on this host." >&2
+  exit 127
+fi
+
+exec "$WRAPPER_DIR/host-root" "$target" "$@"
+`;
+}
+
+function buildHostTakeoverPythonScript(commandName: 'python' | 'python3') {
+  const candidates = commandName === 'python'
+    ? ['/usr/bin/python', '/usr/bin/python3']
+    : ['/usr/bin/python3', '/usr/local/bin/python3'];
+  const candidateLines = candidates
+    .map((candidate) => candidate)
+    .join('\n');
+
+  return `#!/bin/bash
+set -euo pipefail
+
+WRAPPER_DIR=${shellQuote(HOST_TAKEOVER_WRAPPER_DIR)}
+target=""
+while IFS= read -r candidate; do
+  if [[ -x "$candidate" ]]; then
+    target="$candidate"
+    break
+  fi
+done <<'EOF'
+${candidateLines}
+EOF
+
+if [[ -z "$target" ]]; then
+  echo "OpenClaw host takeover could not find ${commandName} on this host." >&2
+  exit 127
+fi
+
+if [[ "\${1:-}" == "-m" && ( "\${2:-}" == "pip" || "\${2:-}" == "ensurepip" ) ]]; then
+  exec "$WRAPPER_DIR/host-root" "$target" "$@"
+fi
+
+exec "$target" "$@"
+`;
+}
+
+function ensureHostTakeoverWrappers() {
+  fs.mkdirSync(HOST_TAKEOVER_WRAPPER_DIR, { recursive: true });
+
+  const scripts = new Map<string, string>([
+    ['host-root', buildHostTakeoverHostRootScript()],
+    ['sudo', buildHostTakeoverSudoScript()],
+    ['apt', buildHostTakeoverRootCommandScript('apt', ['/usr/bin/apt'])],
+    ['apt-get', buildHostTakeoverRootCommandScript('apt-get', ['/usr/bin/apt-get'])],
+    ['apt-cache', buildHostTakeoverRootCommandScript('apt-cache', ['/usr/bin/apt-cache'])],
+    ['dpkg', buildHostTakeoverRootCommandScript('dpkg', ['/usr/bin/dpkg'])],
+    ['dnf', buildHostTakeoverRootCommandScript('dnf', ['/usr/bin/dnf'])],
+    ['yum', buildHostTakeoverRootCommandScript('yum', ['/usr/bin/yum'])],
+    ['pacman', buildHostTakeoverRootCommandScript('pacman', ['/usr/bin/pacman'])],
+    ['apk', buildHostTakeoverRootCommandScript('apk', ['/sbin/apk', '/usr/sbin/apk'])],
+    ['zypper', buildHostTakeoverRootCommandScript('zypper', ['/usr/bin/zypper'])],
+    ['rpm', buildHostTakeoverRootCommandScript('rpm', ['/usr/bin/rpm'])],
+    ['snap', buildHostTakeoverRootCommandScript('snap', ['/usr/bin/snap'])],
+    ['flatpak', buildHostTakeoverRootCommandScript('flatpak', ['/usr/bin/flatpak'])],
+    ['systemctl', buildHostTakeoverRootCommandScript('systemctl', ['/usr/bin/systemctl'], { bypassUserFlag: '--user' })],
+    ['service', buildHostTakeoverRootCommandScript('service', ['/usr/sbin/service', '/usr/bin/service'])],
+    ['loginctl', buildHostTakeoverRootCommandScript('loginctl', ['/usr/bin/loginctl'])],
+    ['journalctl', buildHostTakeoverRootCommandScript('journalctl', ['/usr/bin/journalctl'], { bypassUserFlag: '--user' })],
+    ['mount', buildHostTakeoverRootCommandScript('mount', ['/usr/bin/mount', '/bin/mount'])],
+    ['umount', buildHostTakeoverRootCommandScript('umount', ['/usr/bin/umount', '/bin/umount'])],
+    ['chown', buildHostTakeoverRootCommandScript('chown', ['/usr/bin/chown', '/bin/chown'])],
+    ['chmod', buildHostTakeoverRootCommandScript('chmod', ['/usr/bin/chmod', '/bin/chmod'])],
+    ['chgrp', buildHostTakeoverRootCommandScript('chgrp', ['/usr/bin/chgrp', '/bin/chgrp'])],
+    ['tee', buildHostTakeoverRootCommandScript('tee', ['/usr/bin/tee'])],
+    ['pip', buildHostTakeoverPipScript('pip')],
+    ['pip3', buildHostTakeoverPipScript('pip3')],
+    ['python', buildHostTakeoverPythonScript('python')],
+    ['python3', buildHostTakeoverPythonScript('python3')],
+  ]);
+
+  for (const [fileName, content] of scripts.entries()) {
+    const filePath = path.join(HOST_TAKEOVER_WRAPPER_DIR, fileName);
+    fs.writeFileSync(filePath, content, { mode: 0o755 });
+    fs.chmodSync(filePath, 0o755);
+  }
+}
+
+async function readOpenClawGatewayServiceEnvironmentPath() {
+  const { stdout } = await execFilePromise(
+    'systemctl',
+    ['--user', 'show', OPENCLAW_GATEWAY_SERVICE_NAME, '-p', 'Environment', '--value'],
+    {
+      timeout: 10000,
+      maxBuffer: 1024 * 1024,
+    }
+  );
+  const normalized = normalizeCliText(stdout);
+  const matched = normalized.match(/(?:^|\s)PATH=([^\s]+)/);
+  return normalizeCliText(matched?.[1]) || null;
+}
+
+async function reloadOpenClawGatewayUserSystemd() {
+  await execFilePromise('systemctl', ['--user', 'daemon-reload'], {
+    timeout: 10000,
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function setHostTakeoverSystemdOverrideEnabled(enabled: boolean) {
+  if (enabled) {
+    const currentPath = await readOpenClawGatewayServiceEnvironmentPath();
+    if (!currentPath) {
+      throw new StructuredRequestError(
+        500,
+        GATEWAY_HOST_TAKEOVER_SERVICE_NOT_FOUND_ERROR_CODE,
+        `Could not detect ${OPENCLAW_GATEWAY_SERVICE_NAME} or its PATH environment.`
+      );
+    }
+
+    const nextPath = prependPathEntry(currentPath, HOST_TAKEOVER_WRAPPER_DIR);
+    fs.mkdirSync(path.dirname(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH), { recursive: true });
+    fs.writeFileSync(
+      HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH,
+      `[Service]\nEnvironment=PATH=${nextPath}\n`
+    );
+  } else {
+    fs.rmSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, { force: true });
+  }
+
+  await reloadOpenClawGatewayUserSystemd();
+}
+
+async function installHostTakeoverHelper(password?: string | null) {
+  const userName = getCurrentUserName();
+  if (!fs.existsSync(HOST_TAKEOVER_INSTALLER_SCRIPT_PATH)) {
+    throw new StructuredRequestError(
+      500,
+      GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE,
+      `Host takeover installer script not found at ${HOST_TAKEOVER_INSTALLER_SCRIPT_PATH}.`
+    );
+  }
+
+  const installerArgs = [
+    '/bin/bash',
+    HOST_TAKEOVER_INSTALLER_SCRIPT_PATH,
+    '--user',
+    userName,
+    '--helper-path',
+    HOST_TAKEOVER_SYSTEM_HELPER_PATH,
+    '--sudoers-path',
+    getHostTakeoverSudoersPath(userName),
+  ];
+
+  if (fs.existsSync(HOST_TAKEOVER_SYSTEM_HELPER_PATH)) {
+    try {
+      const { stdout } = await execFilePromise('sudo', ['-n', HOST_TAKEOVER_SYSTEM_HELPER_PATH, '/usr/bin/id', '-u'], {
+        timeout: 5000,
+        maxBuffer: 16 * 1024,
+      });
+      if (normalizeCliText(stdout) === '0') {
+        return;
+      }
+    } catch {}
+  }
+
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    try {
+      await execFilePromise(installerArgs[0], installerArgs.slice(1), {
+        timeout: 15000,
+        maxBuffer: 1024 * 1024,
+      });
+      return;
+    } catch (error: any) {
+      throw new StructuredRequestError(
+        500,
+        GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE,
+        readCliErrorDetail(error) || error?.message || 'Failed to install the host takeover helper.'
+      );
+    }
+  }
+
+  try {
+    await execFilePromise('sudo', ['-n', ...installerArgs], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024,
+    });
+    return;
+  } catch (error: any) {
+    const detail = readCliErrorDetail(error) || error?.message || 'Failed to install the host takeover helper.';
+    if (!password && needsSudoPassword(detail)) {
+      throw new StructuredRequestError(
+        409,
+        GATEWAY_HOST_TAKEOVER_CREDENTIALS_REQUIRED_ERROR_CODE,
+        'Installing host takeover needs the current system user password.',
+        { userName }
+      );
+    }
+
+    if (!password) {
+      throw new StructuredRequestError(
+        500,
+        GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE,
+        detail
+      );
+    }
+  }
+
+  try {
+    await execFileWithInput(
+      'sudo',
+      ['-S', '-k', '-p', '', ...installerArgs],
+      `${password}\n`,
+      { timeout: 20000 }
+    );
+  } catch (error: any) {
+    const detail = readCliErrorDetail(error) || error?.message || 'Failed to install the host takeover helper.';
+    throw new StructuredRequestError(
+      500,
+      GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE,
+      detail
+    );
+  }
+}
+
+async function readHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === true): Promise<HostTakeoverStatus> {
+  const currentUser = getCurrentUserName();
+  const autoInstallMode = getHostTakeoverAutoInstallMode();
+  const autoInstallSupported = isHostTakeoverAutoInstallSupported();
+  const helperInstalled = fs.existsSync(HOST_TAKEOVER_SYSTEM_HELPER_PATH);
+  const overrideContent = fs.existsSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH)
+    ? fs.readFileSync(HOST_TAKEOVER_SYSTEMD_OVERRIDE_PATH, 'utf-8')
+    : '';
+  const overridePathPatched = normalizeCliText(overrideContent).includes(HOST_TAKEOVER_WRAPPER_DIR);
+  let helperReachable = false;
+  let servicePathPatched = false;
+  let rawDetail: string | null = null;
+
+  if (helperInstalled) {
+    try {
+      const { stdout } = await execFilePromise(
+        'sudo',
+        ['-n', HOST_TAKEOVER_SYSTEM_HELPER_PATH, '/usr/bin/id', '-u'],
+        {
+          timeout: 5000,
+          maxBuffer: 16 * 1024,
+        }
+      );
+      helperReachable = normalizeCliText(stdout) === '0';
+      if (!helperReachable) {
+        rawDetail = 'The host takeover helper responded, but did not confirm root execution.';
+      }
+    } catch (error: any) {
+      rawDetail = normalizeCliText(error?.stderr) || normalizeCliText(error?.message) || 'The host takeover helper is installed but not reachable.';
+    }
+  }
+
+  try {
+    const servicePath = await readOpenClawGatewayServiceEnvironmentPath();
+    servicePathPatched = normalizePathEntries(servicePath).includes(HOST_TAKEOVER_WRAPPER_DIR) || overridePathPatched;
+  } catch (error: any) {
+    servicePathPatched = overridePathPatched;
+    rawDetail = rawDetail || normalizeCliText(error?.stderr) || normalizeCliText(error?.message) || `Could not inspect ${OPENCLAW_GATEWAY_SERVICE_NAME}.`;
+  }
+
+  const ready = helperReachable && servicePathPatched;
+  let mode: HostTakeoverMode = 'disabled';
+
+  if (!enabled) {
+    mode = 'disabled';
+  } else if (ready) {
+    mode = 'ready';
+  } else if (!helperInstalled) {
+    mode = 'needs_install';
+    rawDetail = rawDetail || 'The host takeover helper has not been installed yet.';
+  } else {
+    mode = 'broken';
+    rawDetail = rawDetail || 'The host takeover chain is incomplete.';
+  }
+
+  return {
+    enabled,
+    mode,
+    ready,
+    helperInstalled,
+    helperReachable,
+    servicePathPatched,
+    currentUser,
+    wrapperDir: HOST_TAKEOVER_WRAPPER_DIR,
+    hostRootPath: HOST_TAKEOVER_HOST_ROOT_PATH,
+    helperPath: HOST_TAKEOVER_SYSTEM_HELPER_PATH,
+    autoInstallSupported,
+    autoInstallMode,
+    manualInstallCommand: buildHostTakeoverManualInstallCommand(),
+    rawDetail,
+  };
+}
+
+async function safeReadHostTakeoverStatus(enabled = readMaxPermissionsEnabled() === true): Promise<HostTakeoverStatus> {
+  try {
+    return await readHostTakeoverStatus(enabled);
+  } catch (error: any) {
+    return {
+      enabled,
+      mode: enabled ? 'broken' : 'disabled',
+      ready: false,
+      helperInstalled: fs.existsSync(HOST_TAKEOVER_SYSTEM_HELPER_PATH),
+      helperReachable: false,
+      servicePathPatched: false,
+      currentUser: getCurrentUserName(),
+      wrapperDir: HOST_TAKEOVER_WRAPPER_DIR,
+      hostRootPath: HOST_TAKEOVER_HOST_ROOT_PATH,
+      helperPath: HOST_TAKEOVER_SYSTEM_HELPER_PATH,
+      autoInstallSupported: isHostTakeoverAutoInstallSupported(),
+      autoInstallMode: getHostTakeoverAutoInstallMode(),
+      manualInstallCommand: buildHostTakeoverManualInstallCommand(),
+      rawDetail: normalizeCliText(error?.stderr) || normalizeCliText(error?.message) || 'Failed to inspect host takeover status.',
+    };
+  }
+}
+
+function buildHostTakeoverChatInstruction() {
+  const currentUser = getCurrentUserName();
+  return [
+    '【Host takeover】',
+    'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
+    `Immediate root entrypoint: ${HOST_TAKEOVER_HOST_ROOT_PATH}`,
+    `Run a single root command with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /usr/bin/id -u`,
+    `Run a complex root shell with: ${HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
+    `To drop back to the normal user, run: ${HOST_TAKEOVER_HOST_ROOT_PATH} --as-user ${currentUser} -- <command>`,
+    'After the OpenClaw gateway restarts, common commands such as sudo, apt, apt-get, pip, python -m pip, systemctl, journalctl, mount, umount, chmod, chown, and tee will also flow through the takeover wrappers automatically.',
+  ].join('\n');
 }
 
 function isExecutableFile(filePath: string) {
@@ -1838,83 +2729,126 @@ async function readOpenClawVersion() {
   }
 }
 
+function buildGatewayProbeCacheKey(params: {
+  gatewayUrl: string;
+  token?: string;
+  password?: string;
+}) {
+  return JSON.stringify({
+    gatewayUrl: normalizeCliText(params.gatewayUrl),
+    token: normalizeCliText(params.token) || '',
+    password: normalizeCliText(params.password) || '',
+  });
+}
+
+type GatewayConnectionProbeResult = {
+  connected: boolean;
+  message?: string;
+  source: 'local-runtime' | 'auth-probe';
+};
+
 async function probeGatewayConnectionStatus(params: {
   gatewayUrl: string;
   token?: string;
   password?: string;
-}, options?: {
-  requireAuth?: boolean;
-}): Promise<{ connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' }> {
-  const gatewayTarget = parseGatewayUrlForStatusProbe(params.gatewayUrl);
-  let localHealthFailureMessage: string | null = null;
-
-  if (gatewayTarget && isLoopbackHostname(gatewayTarget.hostname)) {
-    const health = await probeGatewayHealth(params.gatewayUrl);
-    if (!health.ok) {
-      // Older OpenClaw builds may not respond to /health reliably.
-      // Fall back to auth probe before declaring disconnected.
-      localHealthFailureMessage = health.message || 'Local OpenClaw gateway is not responding';
-    }
-
-    const credentialMatches = evaluateLocalGatewayCredentialMatch(params, gatewayTarget);
-    if (health.ok && credentialMatches === true) {
-      return {
-        connected: true,
-        message: 'Local OpenClaw gateway runtime healthy',
-        source: 'local-runtime',
-      };
-    }
-
-    if (credentialMatches === false) {
-      return {
-        connected: false,
-        message: 'Gateway credentials do not match local OpenClaw config',
-        source: 'local-runtime',
-      };
-    }
-
-    if (health.ok && !options?.requireAuth) {
-      return {
-        connected: true,
-        message: 'Local OpenClaw gateway runtime healthy',
-        source: 'local-runtime',
-      };
-    }
+}): Promise<GatewayConnectionProbeResult> {
+  const probeKey = buildGatewayProbeCacheKey(params);
+  const now = Date.now();
+  if (
+    cachedGatewayProbeKey === probeKey
+    && cachedGatewayProbeResult
+    && (now - cachedGatewayProbeResult.checkedAt) <= OPENCLAW_GATEWAY_READY_RESULT_CACHE_TTL_MS
+  ) {
+    return cachedGatewayProbeResult.result;
   }
 
-  const client = new OpenClawClient({
-    gatewayUrl: params.gatewayUrl,
-    token: params.token,
-    password: params.password,
-  });
-  client.on('error', () => {});
-  let timeoutId: NodeJS.Timeout | null = null;
+  const inflightProbe = gatewayProbeInflight.get(probeKey);
+  if (inflightProbe) {
+    return inflightProbe;
+  }
 
-  try {
-    await Promise.race([
-      client.connect(),
-      new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error('Gateway connect probe timeout')), 3000);
-      }),
-    ]);
-    return {
-      connected: true,
-      message: localHealthFailureMessage
-        ? 'Gateway auth probe succeeded after local health probe failed'
-        : undefined,
-      source: 'auth-probe',
-    };
-  } catch (error: any) {
-    return {
-      connected: false,
-      message: localHealthFailureMessage || readCliErrorDetail(error) || error?.message || 'Connection failed',
-      source: 'auth-probe',
-    };
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
+  const probePromise: Promise<GatewayConnectionProbeResult> = (async () => {
+    const gatewayTarget = parseGatewayUrlForStatusProbe(params.gatewayUrl);
+    const isLocalLoopbackTarget = gatewayTarget ? isLoopbackHostname(gatewayTarget.hostname) : false;
+    let localHealthFailureMessage: string | null = null;
+
+    if (isLocalLoopbackTarget) {
+      const health = await probeGatewayHealth(params.gatewayUrl);
+      if (!health.ok) {
+        // Older OpenClaw builds may not respond to /health reliably.
+        // Fall back to a real gateway RPC probe before declaring disconnected.
+        localHealthFailureMessage = health.message || 'Local OpenClaw gateway is not responding';
+      }
+
+      const credentialMatches = evaluateLocalGatewayCredentialMatch(params, gatewayTarget);
+      if (credentialMatches === false) {
+        return {
+          connected: false,
+          message: 'Gateway credentials do not match local OpenClaw config',
+          source: 'local-runtime',
+        };
+      }
     }
-    client.disconnect();
+
+    const attemptGatewayReadyProbe = async (options?: {
+      totalTimeoutMs?: number;
+      stepTimeoutMs?: number;
+    }): Promise<GatewayConnectionProbeResult> => {
+      const client = new OpenClawClient({
+        gatewayUrl: params.gatewayUrl,
+        token: params.token,
+        password: params.password,
+      });
+      client.on('error', () => {});
+      let timeoutId: NodeJS.Timeout | null = null;
+
+      try {
+        await Promise.race([
+          client.getGatewayStatus(options?.stepTimeoutMs ?? OPENCLAW_GATEWAY_READY_PROBE_STEP_TIMEOUT_MS),
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
+              () => reject(new Error('Gateway readiness probe timeout')),
+              options?.totalTimeoutMs ?? OPENCLAW_GATEWAY_READY_PROBE_TIMEOUT_MS
+            );
+          }),
+        ]);
+        return {
+          connected: true,
+          message: isLocalLoopbackTarget
+            ? (localHealthFailureMessage
+              ? 'Local OpenClaw gateway ready after HTTP health probe failed'
+              : 'Local OpenClaw gateway ready')
+            : undefined,
+          source: isLocalLoopbackTarget ? 'local-runtime' : 'auth-probe',
+        };
+      } catch (error: any) {
+        return {
+          connected: false,
+          message: readCliErrorDetail(error) || error?.message || localHealthFailureMessage || 'Connection failed',
+          source: isLocalLoopbackTarget ? 'local-runtime' : 'auth-probe',
+        };
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        client.disconnect();
+      }
+    };
+
+    return attemptGatewayReadyProbe();
+  })();
+
+  gatewayProbeInflight.set(probeKey, probePromise);
+  try {
+    const result = await probePromise;
+    cachedGatewayProbeKey = probeKey;
+    cachedGatewayProbeResult = {
+      checkedAt: Date.now(),
+      result,
+    };
+    return result;
+  } finally {
+    gatewayProbeInflight.delete(probeKey);
   }
 }
 
@@ -2155,14 +3089,7 @@ function patchExecApprovals(enabled: boolean) {
   fs.writeFileSync(execApprovalsPath, JSON.stringify(approvals, null, 2));
 }
 
-function setMaxPermissionsEnabled(enabled: boolean) {
-  const configPath = getOpenClawConfigPath();
-  if (!fs.existsSync(configPath)) {
-    throw new Error('openclaw.json not found');
-  }
-
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-
+function applyMaxPermissionsConfig(config: any, enabled: boolean) {
   if (enabled) {
     config.tools = MAX_PERMISSIONS_TOOLS;
 
@@ -2181,13 +3108,89 @@ function setMaxPermissionsEnabled(enabled: boolean) {
 
   if (!config.agents) config.agents = {};
   if (!config.agents.defaults) config.agents.defaults = {};
-  if (!config.agents.defaults.sandbox) config.agents.defaults.sandbox = {};
-  config.agents.defaults.sandbox.mode = 'off';
+  if (enabled) {
+    if (!config.agents.defaults.sandbox) config.agents.defaults.sandbox = {};
+    config.agents.defaults.sandbox.mode = 'off';
+    config.agents.defaults.elevatedDefault = 'full';
+  } else {
+    if (config.agents.defaults.sandbox && typeof config.agents.defaults.sandbox === 'object') {
+      delete config.agents.defaults.sandbox.mode;
+      if (Object.keys(config.agents.defaults.sandbox).length === 0) {
+        delete config.agents.defaults.sandbox;
+      }
+    }
+    delete config.agents.defaults.elevatedDefault;
+  }
+}
+
+function setMaxPermissionsEnabled(enabled: boolean) {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+  applyMaxPermissionsConfig(config, enabled);
 
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
   patchExecApprovals(enabled);
 
   return { enabled };
+}
+
+async function configureMaxPermissionsState(enabled: boolean, options?: { systemPassword?: string | null }) {
+  const configPath = getOpenClawConfigPath();
+  if (!fs.existsSync(configPath)) {
+    throw new Error('openclaw.json not found');
+  }
+
+  const execApprovalsPath = getExecApprovalsPath();
+  const configSnapshot = snapshotTextFile(configPath);
+  const approvalsSnapshot = snapshotTextFile(execApprovalsPath);
+  const overrideSnapshot = snapshotHostTakeoverOverride();
+  let overrideTouched = false;
+
+  try {
+    if (enabled) {
+      ensureHostTakeoverWrappers();
+      await installHostTakeoverHelper(options?.systemPassword);
+      overrideTouched = true;
+      await setHostTakeoverSystemdOverrideEnabled(true);
+    } else {
+      overrideTouched = overrideSnapshot.existed;
+      await setHostTakeoverSystemdOverrideEnabled(false);
+    }
+
+    setMaxPermissionsEnabled(enabled);
+
+    return {
+      enabled,
+      hostTakeover: await safeReadHostTakeoverStatus(enabled),
+    };
+  } catch (error) {
+    try {
+      restoreTextFile(configPath, configSnapshot);
+    } catch (restoreConfigError) {
+      console.error('Failed to restore openclaw.json after max permissions error:', restoreConfigError);
+    }
+
+    try {
+      restoreTextFile(execApprovalsPath, approvalsSnapshot);
+    } catch (restoreApprovalsError) {
+      console.error('Failed to restore exec approvals after max permissions error:', restoreApprovalsError);
+    }
+
+    try {
+      restoreHostTakeoverOverride(overrideSnapshot);
+      if (overrideTouched) {
+        await reloadOpenClawGatewayUserSystemd();
+      }
+    } catch (restoreOverrideError) {
+      console.error('Failed to restore host takeover override after max permissions error:', restoreOverrideError);
+    }
+
+    throw error;
+  }
 }
 
 async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
@@ -2574,31 +3577,132 @@ async function restartGatewayService() {
   await execFilePromise(executablePath, ['gateway', 'restart']);
 }
 
+type OpenClawGatewayServiceRuntimeState = {
+  execMainPid: number | null;
+  activeState: string | null;
+  subState: string | null;
+  activeEnterTimestampMonotonic: number | null;
+  execMainStartTimestampMonotonic: number | null;
+  stateChangeTimestampMonotonic: number | null;
+};
+
+function parseSystemdMonotonicValue(value: string) {
+  const parsed = Number.parseInt(normalizeCliText(value), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseSystemdShowProperties(stdout: string) {
+  const properties = new Map<string, string>();
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    const separatorIndex = line.indexOf('=');
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    const key = normalizeCliText(line.slice(0, separatorIndex));
+    if (!key) {
+      continue;
+    }
+
+    properties.set(key, line.slice(separatorIndex + 1));
+  }
+
+  return properties;
+}
+
 async function readOpenClawGatewayServiceRuntimeState() {
   try {
     const { stdout } = await execFilePromise(
       'systemctl',
-      ['--user', 'show', 'openclaw-gateway.service', '-p', 'ExecMainPID', '-p', 'ActiveState', '-p', 'SubState', '--value'],
+      [
+        '--user',
+        'show',
+        'openclaw-gateway.service',
+        '-p', 'ExecMainPID',
+        '-p', 'ActiveState',
+        '-p', 'SubState',
+        '-p', 'ActiveEnterTimestampMonotonic',
+        '-p', 'ExecMainStartTimestampMonotonic',
+        '-p', 'StateChangeTimestampMonotonic',
+      ],
       {
         timeout: 15000,
         maxBuffer: 1024 * 1024,
       }
     );
-    const [pidRaw = '', activeStateRaw = '', subStateRaw = ''] = stdout.split(/\r?\n/);
+    const properties = parseSystemdShowProperties(stdout);
+    const pidRaw = properties.get('ExecMainPID') || '';
+    const activeStateRaw = properties.get('ActiveState') || '';
+    const subStateRaw = properties.get('SubState') || '';
+    const activeEnterRaw = properties.get('ActiveEnterTimestampMonotonic') || '';
+    const execMainStartRaw = properties.get('ExecMainStartTimestampMonotonic') || '';
+    const stateChangeRaw = properties.get('StateChangeTimestampMonotonic') || '';
     const parsedPid = Number.parseInt(normalizeCliText(pidRaw), 10);
 
     return {
       execMainPid: Number.isFinite(parsedPid) && parsedPid > 0 ? parsedPid : null,
       activeState: normalizeCliText(activeStateRaw) || null,
       subState: normalizeCliText(subStateRaw) || null,
-    };
+      activeEnterTimestampMonotonic: parseSystemdMonotonicValue(activeEnterRaw),
+      execMainStartTimestampMonotonic: parseSystemdMonotonicValue(execMainStartRaw),
+      stateChangeTimestampMonotonic: parseSystemdMonotonicValue(stateChangeRaw),
+    } satisfies OpenClawGatewayServiceRuntimeState;
   } catch {
     return {
       execMainPid: null,
       activeState: null,
       subState: null,
-    };
+      activeEnterTimestampMonotonic: null,
+      execMainStartTimestampMonotonic: null,
+      stateChangeTimestampMonotonic: null,
+    } satisfies OpenClawGatewayServiceRuntimeState;
   }
+}
+
+function hasGatewayRestartBeenObserved(
+  previousRuntimeState: OpenClawGatewayServiceRuntimeState,
+  nextRuntimeState: OpenClawGatewayServiceRuntimeState
+) {
+  if (
+    previousRuntimeState.execMainPid !== null
+    && nextRuntimeState.execMainPid !== null
+    && nextRuntimeState.execMainPid !== previousRuntimeState.execMainPid
+  ) {
+    return true;
+  }
+
+  if (
+    previousRuntimeState.activeEnterTimestampMonotonic !== null
+    && nextRuntimeState.activeEnterTimestampMonotonic !== null
+    && nextRuntimeState.activeEnterTimestampMonotonic > previousRuntimeState.activeEnterTimestampMonotonic
+  ) {
+    return true;
+  }
+
+  if (
+    previousRuntimeState.execMainStartTimestampMonotonic !== null
+    && nextRuntimeState.execMainStartTimestampMonotonic !== null
+    && nextRuntimeState.execMainStartTimestampMonotonic > previousRuntimeState.execMainStartTimestampMonotonic
+  ) {
+    return true;
+  }
+
+  if (
+    previousRuntimeState.stateChangeTimestampMonotonic !== null
+    && nextRuntimeState.stateChangeTimestampMonotonic !== null
+    && nextRuntimeState.stateChangeTimestampMonotonic > previousRuntimeState.stateChangeTimestampMonotonic
+    && (nextRuntimeState.activeState !== previousRuntimeState.activeState || nextRuntimeState.subState !== previousRuntimeState.subState)
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function buildGatewayStatusProbeParams() {
@@ -2613,64 +3717,169 @@ function buildGatewayStatusProbeParams() {
   };
 }
 
-async function waitForGatewayRestartAfterBrowserModeChange(previousPid: number | null) {
+function isGatewayRuntimeStateKnown(runtimeState: OpenClawGatewayServiceRuntimeState) {
+  return runtimeState.execMainPid !== null
+    || runtimeState.activeState !== null
+    || runtimeState.subState !== null
+    || runtimeState.activeEnterTimestampMonotonic !== null
+    || runtimeState.execMainStartTimestampMonotonic !== null
+    || runtimeState.stateChangeTimestampMonotonic !== null;
+}
+
+async function waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState: OpenClawGatewayServiceRuntimeState) {
   const deadline = Date.now() + BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS;
-  const restartObservationDeadline = Date.now() + 12000;
   let restartObserved = false;
-  let stableConnectedChecks = 0;
   let lastFailure = 'OpenClaw restart in progress';
 
   while (Date.now() < deadline) {
     const runtimeState = await readOpenClawGatewayServiceRuntimeState();
-    if (previousPid !== null && runtimeState.execMainPid !== null && runtimeState.execMainPid !== previousPid) {
+    const runtimeStateKnown = isGatewayRuntimeStateKnown(runtimeState);
+    const runtimeStateRunning = runtimeState.activeState === 'active' && runtimeState.subState === 'running';
+    if (hasGatewayRestartBeenObserved(previousRuntimeState, runtimeState)) {
       restartObserved = true;
     }
 
-    if (runtimeState.activeState === 'failed') {
+    if (
+      runtimeStateKnown
+      && !runtimeStateRunning
+    ) {
+      restartObserved = true;
+    }
+
+    if (runtimeStateKnown && runtimeState.activeState === 'failed') {
       throw new Error('OpenClaw gateway service failed to restart.');
     }
 
     const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
-    if (!probe.connected) {
+    const runtimeReady = !runtimeStateKnown || runtimeStateRunning;
+
+    if (!probe.connected || !runtimeReady) {
       restartObserved = true;
-      stableConnectedChecks = 0;
-      lastFailure = probe.message || lastFailure;
+      lastFailure = probe.message || (runtimeReady
+        ? 'OpenClaw gateway is still warming up.'
+        : 'OpenClaw gateway service is still starting.');
     } else if (restartObserved) {
-      stableConnectedChecks += 1;
-      if (stableConnectedChecks >= 2) {
-        return;
-      }
-    } else if (Date.now() >= restartObservationDeadline) {
+      await waitForGatewayConnectionStable(Math.max(0, deadline - Date.now()), {
+        minimumStableWindowMs: OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS,
+        probeIntervalMs: BROWSER_HEADED_MODE_RESTART_POLL_INTERVAL_MS,
+      });
       return;
+    } else {
+      lastFailure = 'Waiting to observe OpenClaw gateway restart.';
     }
 
     await sleep(BROWSER_HEADED_MODE_RESTART_POLL_INTERVAL_MS);
   }
 
-  throw new Error(lastFailure || 'Timed out waiting for OpenClaw to restart.');
+  throw new Error(
+    restartObserved
+      ? (lastFailure || 'Timed out waiting for OpenClaw to restart.')
+      : 'Timed out waiting to observe OpenClaw gateway restart.'
+  );
 }
 
-async function waitForGatewayConnectionStable(timeoutMs: number) {
+async function waitForGatewayConnectionStable(
+  timeoutMs: number,
+  options?: {
+    minimumStableWindowMs?: number;
+    probeIntervalMs?: number;
+  },
+) {
   const deadline = Date.now() + timeoutMs;
-  let stableConnectedChecks = 0;
+  const minimumStableWindowMs = Math.max(0, options?.minimumStableWindowMs ?? 0);
+  const probeIntervalMs = Math.max(250, options?.probeIntervalMs ?? UPDATE_RESTART_RESUME_POLL_INTERVAL_MS);
   let lastFailure = 'OpenClaw connection is still recovering';
+  let stableSinceMs: number | null = null;
 
   while (Date.now() < deadline) {
     const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
     if (probe.connected) {
-      stableConnectedChecks += 1;
-      if (stableConnectedChecks >= 2) {
+      const now = Date.now();
+      if (stableSinceMs === null) {
+        stableSinceMs = now;
+      }
+
+      if ((now - stableSinceMs) >= minimumStableWindowMs) {
         return;
       }
+
+      lastFailure = 'OpenClaw gateway recovered, waiting to confirm connection stability.';
     } else {
-      stableConnectedChecks = 0;
+      stableSinceMs = null;
       lastFailure = probe.message || lastFailure;
     }
 
-    await sleep(UPDATE_RESTART_RESUME_POLL_INTERVAL_MS);
+    await sleep(probeIntervalMs);
   }
 
   throw new Error(lastFailure || 'Timed out waiting for OpenClaw to become available.');
+}
+
+async function reconcileGatewayRestartSnapshot() {
+  if (gatewayRestartSnapshot.status !== 'restarting' || activeGatewayRestartTask) {
+    gatewayRestartReconcileStableSinceMs = null;
+    return getGatewayRestartSnapshot();
+  }
+
+  try {
+    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    if (probe.connected) {
+      const now = Date.now();
+      if (gatewayRestartReconcileStableSinceMs === null) {
+        gatewayRestartReconcileStableSinceMs = now;
+      } else if ((now - gatewayRestartReconcileStableSinceMs) >= OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS) {
+        resetGatewayRestartSnapshot();
+      }
+    } else {
+      gatewayRestartReconcileStableSinceMs = null;
+    }
+  } catch {
+    gatewayRestartReconcileStableSinceMs = null;
+  }
+
+  return getGatewayRestartSnapshot();
+}
+
+function runTrackedGatewayRestart(options: {
+  trigger: GatewayRestartTrigger;
+  previousRuntimeState: OpenClawGatewayServiceRuntimeState;
+  targetHeadedModeEnabled?: boolean | null;
+}) {
+  if (activeGatewayRestartTask) {
+    return getGatewayRestartSnapshot();
+  }
+
+  patchGatewayRestartSnapshot({
+    status: 'restarting',
+    trigger: options.trigger,
+    rawDetail: null,
+    startedAt: new Date().toISOString(),
+    targetHeadedModeEnabled: typeof options.targetHeadedModeEnabled === 'boolean'
+      ? options.targetHeadedModeEnabled
+      : null,
+  });
+
+  activeGatewayRestartTask = (async () => {
+    try {
+      await restartGatewayService();
+      await waitForGatewayRestartAfterBrowserModeChange(options.previousRuntimeState);
+      resetGatewayRestartSnapshot();
+    } catch (error) {
+      patchGatewayRestartSnapshot({
+        status: 'failed',
+        trigger: options.trigger,
+        rawDetail: readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error)),
+        targetHeadedModeEnabled: typeof options.targetHeadedModeEnabled === 'boolean'
+          ? options.targetHeadedModeEnabled
+          : null,
+      });
+      console.error('Tracked gateway restart task failed:', error);
+    }
+  })().finally(() => {
+    activeGatewayRestartTask = null;
+  });
+
+  return getGatewayRestartSnapshot();
 }
 
 function scheduleGatewayRestart() {
@@ -2963,7 +4172,7 @@ async function restartClawUiService() {
   setTimeout(() => {
     (async () => {
       await scheduleGatewayRestart();
-      await waitForGatewayRestartAfterBrowserModeChange(previousGatewayRuntimeState.execMainPid);
+      await waitForGatewayRestartAfterBrowserModeChange(previousGatewayRuntimeState);
       restartSteps = updateRestartStepStatus(restartSteps, 'restart_openclaw', 'completed');
       restartSteps = updateRestartStepStatus(restartSteps, 'restart_project', 'running');
       patchUpdateSnapshot({
@@ -4196,17 +5405,8 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.get('/api/gateway/status', async (_req, res) => {
-  const config = configManager.getConfig();
-  if (!config.gatewayUrl) {
-    return res.json({ connected: false, message: 'Gateway URL not configured' });
-  }
-
   try {
-    const result = await probeGatewayConnectionStatus({
-      gatewayUrl: config.gatewayUrl,
-      token: config.token,
-      password: config.password,
-    });
+    const result = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
     res.json({
       connected: result.connected,
       message: result.message,
@@ -4225,7 +5425,7 @@ app.post('/api/config/test', async (req, res) => {
   }
 
   try {
-    const result = await probeGatewayConnectionStatus({ gatewayUrl, token, password }, { requireAuth: true });
+    const result = await probeGatewayConnectionStatus({ gatewayUrl, token, password });
     if (result.connected) {
       return res.json({ success: true, message: 'Connection successful', source: result.source });
     }
@@ -4344,6 +5544,31 @@ app.get('/api/config/browser-headed-mode', (_req, res) => {
   }
 });
 
+app.get('/api/config/restart/status', async (_req, res) => {
+  res.json({
+    success: true,
+    restart: await reconcileGatewayRestartSnapshot(),
+  });
+});
+
+app.post('/api/config/restart/status/reset', (_req, res) => {
+  if (gatewayRestartSnapshot.status === 'restarting') {
+    return res.status(409).json({
+      ...buildStructuredApiError(
+        GATEWAY_RESTART_FAILED_ERROR_CODE,
+        'OpenClaw gateway restart is still running.'
+      ),
+      restart: getGatewayRestartSnapshot(),
+    });
+  }
+
+  resetGatewayRestartSnapshot();
+  res.json({
+    success: true,
+    restart: getGatewayRestartSnapshot(),
+  });
+});
+
 app.post('/api/config/browser-headed-mode', (req, res) => {
   const { headedModeEnabled } = req.body ?? {};
   if (typeof headedModeEnabled !== 'boolean') {
@@ -4366,18 +5591,26 @@ app.post('/api/config/browser-headed-mode', (req, res) => {
 
       const previousRuntimeState = await readOpenClawGatewayServiceRuntimeState();
       const config = setBrowserHeadedModeEnabled(headedModeEnabled);
-      await waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState.execMainPid);
+      const restart = runTrackedGatewayRestart({
+        trigger: 'browser-headed-mode',
+        previousRuntimeState,
+        targetHeadedModeEnabled: headedModeEnabled,
+      });
 
       res.json({
         success: true,
         config,
-        restartCompleted: true,
+        restartCompleted: false,
+        restart,
       });
     } catch (error: any) {
-      res.status(500).json(buildStructuredApiError(
-        BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
-        error?.message || 'Failed to update browser headed mode config'
-      ));
+      res.status(500).json({
+        ...buildStructuredApiError(
+          BROWSER_HEADED_MODE_UPDATE_FAILED_ERROR_CODE,
+          error?.message || 'Failed to update browser headed mode config'
+        ),
+        restart: getGatewayRestartSnapshot(),
+      });
     }
   })();
 });
@@ -4404,7 +5637,7 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
     const before = await runBrowserHealthCheck(reportRepairProgress);
 
     reportRepairProgress('enable-permissions');
-    setMaxPermissionsEnabled(true);
+    await configureMaxPermissionsState(true);
     reportRepairProgress('restart-gateway');
     await restartGatewayService();
     reportRepairProgress('stop-browser');
@@ -4432,34 +5665,67 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
   }
 });
 
-app.get('/api/config/max-permissions', (_req, res) => {
-  try {
-    res.json({ enabled: readMaxPermissionsEnabled() === true });
-  } catch (error: any) {
-    res.json({ enabled: false });
-  }
+app.get('/api/config/max-permissions', async (_req, res) => {
+  const enabled = readMaxPermissionsEnabled() === true;
+  const hostTakeover = await safeReadHostTakeoverStatus(enabled);
+  res.json({ enabled, hostTakeover });
 });
 
-app.post('/api/config/max-permissions', (req, res) => {
-  (async () => {
-    const { enabled } = req.body;
-    setMaxPermissionsEnabled(Boolean(enabled));
-    res.json({ success: true, enabled: Boolean(enabled), restartRequired: true });
-  })().catch((error: any) => {
-    res.status(500).json({ success: false, message: error.message });
-  });
+app.post('/api/config/max-permissions', async (req, res) => {
+  const requestedEnabled = Boolean(req.body?.enabled);
+  const systemPassword = normalizeCliText(req.body?.systemPassword) || null;
+
+  try {
+    const result = await configureMaxPermissionsState(requestedEnabled, { systemPassword });
+    res.json({
+      success: true,
+      enabled: result.enabled,
+      restartRequired: true,
+      hostTakeover: result.hostTakeover,
+    });
+  } catch (error: any) {
+    const currentEnabled = readMaxPermissionsEnabled() === true;
+    const hostTakeover = await safeReadHostTakeoverStatus(requestedEnabled || currentEnabled);
+    hostTakeover.enabled = currentEnabled;
+
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json({
+        ...error.payload,
+        enabled: currentEnabled,
+        hostTakeover,
+      });
+    }
+
+    res.status(500).json({
+      ...buildStructuredApiError(
+        GATEWAY_MAX_PERMISSIONS_UPDATE_FAILED_ERROR_CODE,
+        readCliErrorDetail(error) || error?.message || 'Failed to update maximum permissions.'
+      ),
+      enabled: currentEnabled,
+      hostTakeover,
+    });
+  }
 });
 
 app.post('/api/config/restart', async (_req, res) => {
   try {
     const previousRuntimeState = await readOpenClawGatewayServiceRuntimeState();
-    await restartGatewayService();
-    await waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState.execMainPid);
+    const restart = runTrackedGatewayRestart({
+      trigger: 'gateway',
+      previousRuntimeState,
+    });
 
-    res.json({ success: true, message: 'Gateway connections reset and service restarted' });
+    res.json({
+      success: true,
+      message: 'Gateway restart started',
+      restart,
+    });
   } catch (error: any) {
     console.error('Failed to restart gateway:', error);
-    res.status(500).json(buildStructuredApiError(GATEWAY_RESTART_FAILED_ERROR_CODE, error?.message));
+    res.status(500).json({
+      ...buildStructuredApiError(GATEWAY_RESTART_FAILED_ERROR_CODE, error?.message),
+      restart: getGatewayRestartSnapshot(),
+    });
   }
 });
 
@@ -5661,20 +6927,23 @@ app.post('/api/chat', async (req, res) => {
   try {
     const sessionInfo = sessionManager.getSession(sessionId);
     let finalMessage = String(message);
+    let injectedInstructions = '';
 
     if (sessionInfo) {
       const history = db.getMessages(sessionId, 1);
-      let injectedInstructions = '';
       if (history.length === 0 && sessionInfo.prompt) {
         injectedInstructions += `${sessionInfo.prompt}\n\n`;
       }
       if (sessionInfo.process_start_tag && sessionInfo.process_end_tag) {
         injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
       }
-      
-      if (injectedInstructions) {
-        finalMessage = `${injectedInstructions}${finalMessage}`;
-      }
+    }
+    if (readMaxPermissionsEnabled() === true) {
+      injectedInstructions += `${buildHostTakeoverChatInstruction()}\n\n`;
+    }
+
+    if (injectedInstructions) {
+      finalMessage = `${injectedInstructions}${finalMessage}`;
     }
 
     let finalParentId = parentId ? Number(parentId) : undefined;
@@ -5820,20 +7089,23 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     const sessionInfo = sessionManager.getSession(sessionId);
     let finalMessage = String(message);
+    let injectedInstructions = '';
 
     if (sessionInfo) {
       const history = db.getMessages(sessionId, 1);
-      let injectedInstructions = '';
       if (history.length === 0 && sessionInfo.prompt) {
         injectedInstructions += `${sessionInfo.prompt}\n\n`;
       }
       if (sessionInfo.process_start_tag && sessionInfo.process_end_tag) {
         injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
       }
-      
-      if (injectedInstructions) {
-        finalMessage = `${injectedInstructions}${finalMessage}`;
-      }
+    }
+    if (readMaxPermissionsEnabled() === true) {
+      injectedInstructions += `${buildHostTakeoverChatInstruction()}\n\n`;
+    }
+
+    if (injectedInstructions) {
+      finalMessage = `${injectedInstructions}${finalMessage}`;
     }
 
     const client = await getConnection(sessionId);

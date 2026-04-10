@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import UnifiedChatView from './components/UnifiedChatView';
 import SettingsView from './components/SettingsView';
@@ -8,6 +8,8 @@ import { requestActiveContextRefresh, type ActiveContextRefreshDetail } from './
 export type ViewType = 'chat' | 'settings' | 'groups';
 export type SettingsTab = 'gateway' | 'general' | 'models' | 'commands' | 'about';
 const LAST_CONVERSATION_VIEW_STORAGE_KEY = 'clawui_last_conversation_view';
+const CONNECTION_STATUS_STORAGE_KEY = 'clawui_connection_status';
+const CONNECTION_STATUS_STORAGE_TTL_MS = 30 * 1000;
 const BOOTSTRAP_REQUEST_TIMEOUT_MS = 8000;
 const CONNECTION_STATUS_POLL_CONNECTED_MS = 10000;
 const CONNECTION_STATUS_POLL_DISCONNECTED_MS = 2000;
@@ -39,6 +41,25 @@ async function fetchJsonWithTimeout<T>(input: RequestInfo | URL, init?: RequestI
 }
 
 export default function App() {
+  const connectionFailureCountRef = useRef(0);
+  const connectionRetryTimerRef = useRef<number | null>(null);
+  const latestIsConnectedRef = useRef(false);
+  const getInitialConnectionState = () => {
+    try {
+      const raw = window.sessionStorage.getItem(CONNECTION_STATUS_STORAGE_KEY);
+      if (!raw) return false;
+      const parsed = JSON.parse(raw) as { connected?: unknown; checkedAt?: unknown };
+      const connected = parsed?.connected === true;
+      const checkedAt = typeof parsed?.checkedAt === 'number' ? parsed.checkedAt : 0;
+      if ((Date.now() - checkedAt) > CONNECTION_STATUS_STORAGE_TTL_MS) {
+        return false;
+      }
+      return connected;
+    } catch {
+      return false;
+    }
+  };
+
   const getHashState = () => {
     const hash = window.location.hash.replace('#', '');
     if (!hash) {
@@ -68,7 +89,7 @@ export default function App() {
   const initialState = getHashState();
 
   const [currentView, setCurrentView] = useState<ViewType>(initialState.view);
-  const [isConnected, setIsConnected] = useState(false);
+  const [isConnected, setIsConnected] = useState<boolean>(() => getInitialConnectionState());
   const [settingsTab, setSettingsTab] = useState<SettingsTab>(initialState.tab);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null); // null = checking
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
@@ -254,12 +275,52 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    latestIsConnectedRef.current = isConnected;
+    try {
+      window.sessionStorage.setItem(CONNECTION_STATUS_STORAGE_KEY, JSON.stringify({
+        connected: isConnected,
+        checkedAt: Date.now(),
+      }));
+    } catch {}
+  }, [isConnected]);
+
+  useEffect(() => {
     const checkStatus = async () => {
       try {
         const data = await fetchJsonWithTimeout<{ connected?: boolean }>('/api/gateway/status');
-        setIsConnected(!!data.connected);
-      } catch (e) {
+        if (data.connected) {
+          connectionFailureCountRef.current = 0;
+          if (connectionRetryTimerRef.current !== null) {
+            window.clearTimeout(connectionRetryTimerRef.current);
+            connectionRetryTimerRef.current = null;
+          }
+          setIsConnected(true);
+          return;
+        }
+      } catch (e) {}
+
+      if (!latestIsConnectedRef.current) {
+        connectionFailureCountRef.current = 0;
         setIsConnected(false);
+        return;
+      }
+
+      connectionFailureCountRef.current += 1;
+      if (connectionFailureCountRef.current >= 2) {
+        connectionFailureCountRef.current = 0;
+        if (connectionRetryTimerRef.current !== null) {
+          window.clearTimeout(connectionRetryTimerRef.current);
+          connectionRetryTimerRef.current = null;
+        }
+        setIsConnected(false);
+        return;
+      }
+
+      if (connectionRetryTimerRef.current === null) {
+        connectionRetryTimerRef.current = window.setTimeout(() => {
+          connectionRetryTimerRef.current = null;
+          void checkStatus();
+        }, 1500);
       }
     };
 
@@ -283,6 +344,10 @@ export default function App() {
 
     return () => {
       window.clearInterval(timer);
+      if (connectionRetryTimerRef.current !== null) {
+        window.clearTimeout(connectionRetryTimerRef.current);
+        connectionRetryTimerRef.current = null;
+      }
       window.removeEventListener('focus', handleImmediateCheck);
       window.removeEventListener('online', handleImmediateCheck);
       window.removeEventListener(CONNECTION_STATUS_REFRESH_EVENT, handleImmediateCheck as EventListener);

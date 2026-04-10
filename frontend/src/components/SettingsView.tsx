@@ -129,6 +129,47 @@ type BrowserTaskInfo = {
   updatedAt: string | null;
 };
 
+type GatewayRestartTrigger =
+  | 'gateway'
+  | 'browser-headed-mode';
+
+type GatewayRestartTaskStatus =
+  | 'idle'
+  | 'restarting'
+  | 'failed';
+
+type GatewayRestartTaskInfo = {
+  status: GatewayRestartTaskStatus;
+  trigger: GatewayRestartTrigger | null;
+  rawDetail: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  targetHeadedModeEnabled: boolean | null;
+};
+
+type HostTakeoverMode =
+  | 'disabled'
+  | 'ready'
+  | 'needs_install'
+  | 'broken';
+
+type HostTakeoverStatus = {
+  enabled: boolean;
+  mode: HostTakeoverMode;
+  ready: boolean;
+  helperInstalled: boolean;
+  helperReachable: boolean;
+  servicePathPatched: boolean;
+  currentUser: string;
+  wrapperDir: string;
+  hostRootPath: string;
+  helperPath: string;
+  autoInstallSupported: boolean;
+  autoInstallMode: 'root' | 'sudo' | 'pkexec' | 'manual';
+  manualInstallCommand: string | null;
+  rawDetail: string | null;
+};
+
 type AppVersionInfo = {
   appName: string;
   version: string;
@@ -326,6 +367,34 @@ function joinDistinctLines(values: Array<string | null | undefined>) {
   return lines.join('\n');
 }
 
+function parseTimestampMs(value: string | null | undefined): number | null {
+  if (typeof value !== 'string' || !value.trim()) {
+    return null;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeGatewayRestartTaskInfo(raw: unknown): GatewayRestartTaskInfo | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const candidate = raw as Partial<GatewayRestartTaskInfo>;
+  const status = typeof candidate.status === 'string' ? candidate.status : 'idle';
+  const trigger = typeof candidate.trigger === 'string' ? candidate.trigger : null;
+
+  return {
+    status: status === 'restarting' || status === 'failed' ? status : 'idle',
+    trigger: trigger === 'gateway' || trigger === 'browser-headed-mode' ? trigger : null,
+    rawDetail: typeof candidate.rawDetail === 'string' && candidate.rawDetail.trim() ? candidate.rawDetail.trim() : null,
+    startedAt: typeof candidate.startedAt === 'string' && candidate.startedAt.trim() ? candidate.startedAt.trim() : null,
+    updatedAt: typeof candidate.updatedAt === 'string' && candidate.updatedAt.trim() ? candidate.updatedAt.trim() : null,
+    targetHeadedModeEnabled: typeof candidate.targetHeadedModeEnabled === 'boolean' ? candidate.targetHeadedModeEnabled : null,
+  };
+}
+
 export default function SettingsView({ isConnected, settingsTab, onMenuClick, onModelsChanged }: SettingsViewProps) {
   const { t, i18n } = useTranslation();
 
@@ -349,6 +418,13 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [detectedOpenClawVersion, setDetectedOpenClawVersion] = useState('');
   const [maxPermissions, setMaxPermissions] = useState(false);
   const [isTogglingPermissions, setIsTogglingPermissions] = useState(false);
+  const [hostTakeoverStatus, setHostTakeoverStatus] = useState<HostTakeoverStatus | null>(null);
+  const [permissionsError, setPermissionsError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [permissionsPasswordModalOpen, setPermissionsPasswordModalOpen] = useState(false);
+  const [permissionsPassword, setPermissionsPassword] = useState('');
+  const [permissionsPasswordUser, setPermissionsPasswordUser] = useState('');
+  const [permissionsPasswordError, setPermissionsPasswordError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isSubmittingPermissionsPassword, setIsSubmittingPermissionsPassword] = useState(false);
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
   const [newHost, setNewHost] = useState('');
   const [editingHost, setEditingHost] = useState<string | null>(null);
@@ -370,6 +446,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [browserHeadedModeModalDetail, setBrowserHeadedModeModalDetail] = useState('');
   const [gatewayRestartModalStage, setGatewayRestartModalStage] = useState<RestartFlowModalStage>(null);
   const [gatewayRestartModalDetail, setGatewayRestartModalDetail] = useState('');
+  const [gatewayRestartTaskInfo, setGatewayRestartTaskInfo] = useState<GatewayRestartTaskInfo | null>(null);
   const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
   const [appVersionError, setAppVersionError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isLoadingAppVersion, setIsLoadingAppVersion] = useState(false);
@@ -390,6 +467,13 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [isUpdateCancelModalOpen, setIsUpdateCancelModalOpen] = useState(false);
   const [isCancellingUpdate, setIsCancellingUpdate] = useState(false);
   const updateRestartModalStartedAtRef = useRef<number | null>(null);
+  const gatewayRestartTaskInfoRef = useRef<GatewayRestartTaskInfo | null>(null);
+  const pendingGatewayRestartStartRef = useRef<{ trigger: GatewayRestartTrigger; startedAtMs: number } | null>(null);
+
+  const updateGatewayRestartTaskInfo = (nextTaskInfo: GatewayRestartTaskInfo | null) => {
+    gatewayRestartTaskInfoRef.current = nextTaskInfo;
+    setGatewayRestartTaskInfo(nextTaskInfo);
+  };
 
   // --- General settings state ---
   const [aiName, setAiName] = useState(() => t('settings.general.aiNamePlaceholder'));
@@ -1043,6 +1127,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     if (settingsTab !== 'gateway') return;
     void fetchBrowserHeadedModeState();
     void fetchBrowserTaskStatus({ quiet: true });
+    void fetchGatewayRestartTaskStatus().catch(() => {});
   }, [settingsTab]);
 
   useEffect(() => {
@@ -1156,6 +1241,95 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       window.clearInterval(timer);
     };
   }, [settingsTab, browserTaskInfo?.status]);
+
+  useEffect(() => {
+    if (settingsTab !== 'gateway' || gatewayRestartTaskInfo?.status !== 'restarting') {
+      return;
+    }
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const nextTask = await fetchGatewayRestartTaskStatus();
+        if (cancelled || !nextTask || nextTask.status !== 'restarting') {
+          return;
+        }
+      } catch {}
+    };
+
+    void poll();
+    const timer = window.setInterval(() => {
+      void poll();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [settingsTab, gatewayRestartTaskInfo?.status]);
+
+  useEffect(() => {
+    if (!gatewayRestartTaskInfo) {
+      return;
+    }
+
+    if (gatewayRestartTaskInfo.status === 'restarting') {
+      if (gatewayRestartTaskInfo.trigger === 'browser-headed-mode') {
+        if (typeof gatewayRestartTaskInfo.targetHeadedModeEnabled === 'boolean') {
+          setBrowserHeadedModePendingEnabled(gatewayRestartTaskInfo.targetHeadedModeEnabled);
+        }
+        setIsTogglingBrowserHeadedMode(true);
+        setBrowserHeadedModeModalDetail('');
+        setBrowserHeadedModeModalStage('restarting');
+      } else if (gatewayRestartTaskInfo.trigger === 'gateway') {
+        setIsRestarting(true);
+        setGatewayRestartModalDetail('');
+        setGatewayRestartModalStage('restarting');
+      }
+      return;
+    }
+
+    if (gatewayRestartTaskInfo.status === 'failed') {
+      const failureDetail = gatewayRestartTaskInfo.rawDetail || '';
+      if (gatewayRestartTaskInfo.trigger === 'browser-headed-mode') {
+        if (typeof gatewayRestartTaskInfo.targetHeadedModeEnabled === 'boolean') {
+          setBrowserHeadedModePendingEnabled(gatewayRestartTaskInfo.targetHeadedModeEnabled);
+        }
+        setIsTogglingBrowserHeadedMode(false);
+        setBrowserHeadedModeModalDetail(failureDetail);
+        setBrowserHeadedModeModalStage('failure');
+        void fetchBrowserHeadedModeState().catch(() => {});
+      } else if (gatewayRestartTaskInfo.trigger === 'gateway') {
+        setIsRestarting(false);
+        setGatewayRestartModalDetail(failureDetail);
+        setGatewayRestartModalStage('failure');
+      }
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
+      return;
+    }
+
+    if (browserHeadedModeModalStage === 'restarting') {
+      setIsTogglingBrowserHeadedMode(false);
+      setBrowserHeadedModeModalDetail('');
+      setBrowserHeadedModeModalStage('success');
+      void fetchBrowserHeadedModeState().catch(() => {});
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
+    }
+
+    if (gatewayRestartModalStage === 'restarting') {
+      setIsRestarting(false);
+      setRestartSuccess(true);
+      setGatewayRestartNoticeSource(null);
+      setGatewayRestartModalDetail('');
+      setGatewayRestartModalStage('success');
+      window.setTimeout(() => setRestartSuccess(false), 3000);
+      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
+    }
+  }, [
+    browserHeadedModeModalStage,
+    gatewayRestartModalStage,
+    gatewayRestartTaskInfo,
+  ]);
 
   useEffect(() => {
     if (updateStatusInfo?.status !== 'updating') {
@@ -1642,26 +1816,104 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setGatewayRestartModalStage('confirm');
   };
 
+  const applyGatewayRestartTaskState = (data: { restart?: unknown }) => {
+    const nextTaskInfo = normalizeGatewayRestartTaskInfo(data.restart);
+    const pendingStart = pendingGatewayRestartStartRef.current;
+    const currentTaskInfo = gatewayRestartTaskInfoRef.current;
+
+    if (
+      pendingStart
+      && currentTaskInfo?.status === 'restarting'
+      && currentTaskInfo.trigger === pendingStart.trigger
+      && nextTaskInfo?.status === 'idle'
+    ) {
+      const nextUpdatedAtMs = parseTimestampMs(nextTaskInfo.updatedAt);
+      if (nextUpdatedAtMs === null || nextUpdatedAtMs < pendingStart.startedAtMs) {
+        return currentTaskInfo;
+      }
+    }
+
+    if (pendingStart) {
+      const nextUpdatedAtMs = parseTimestampMs(nextTaskInfo?.updatedAt);
+      const acknowledgedProgress = nextTaskInfo?.trigger === pendingStart.trigger
+        && (nextTaskInfo.status === 'restarting' || nextTaskInfo.status === 'failed');
+      const completedLocalRequest = nextTaskInfo?.status === 'idle'
+        && (nextUpdatedAtMs === null || nextUpdatedAtMs >= pendingStart.startedAtMs);
+
+      if (acknowledgedProgress || completedLocalRequest) {
+        pendingGatewayRestartStartRef.current = null;
+      }
+    }
+
+    updateGatewayRestartTaskInfo(nextTaskInfo);
+    return nextTaskInfo;
+  };
+
+  const fetchGatewayRestartTaskStatus = async () => {
+    const res = await fetch('/api/config/restart/status');
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(typeof data?.errorDetail === 'string' && data.errorDetail.trim()
+        ? data.errorDetail.trim()
+        : 'Failed to load gateway restart status');
+    }
+    return applyGatewayRestartTaskState(data);
+  };
+
+  const resetGatewayRestartTaskStatus = async () => {
+    const res = await fetch('/api/config/restart/status/reset', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(typeof data?.errorDetail === 'string' && data.errorDetail.trim()
+        ? data.errorDetail.trim()
+        : 'Failed to reset gateway restart status');
+    }
+    return applyGatewayRestartTaskState(data);
+  };
+
   const closeGatewayRestartModal = () => {
     if (gatewayRestartModalStage === 'restarting') return;
     setGatewayRestartModalStage(null);
     setGatewayRestartModalDetail('');
+    if (gatewayRestartTaskInfo?.status === 'failed' && gatewayRestartTaskInfo.trigger === 'gateway') {
+      updateGatewayRestartTaskInfo({
+        status: 'idle',
+        trigger: null,
+        rawDetail: null,
+        startedAt: null,
+        updatedAt: new Date().toISOString(),
+        targetHeadedModeEnabled: null,
+      });
+      void resetGatewayRestartTaskStatus().catch(() => {});
+    }
   };
 
   const handleConfirmRestartGateway = async () => {
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
     setIsRestarting(true);
     setRestartSuccess(false);
     setGatewayRestartModalDetail('');
     setGatewayRestartModalStage('restarting');
+    pendingGatewayRestartStartRef.current = {
+      trigger: 'gateway',
+      startedAtMs,
+    };
+    updateGatewayRestartTaskInfo({
+      status: 'restarting',
+      trigger: 'gateway',
+      rawDetail: null,
+      startedAt,
+      updatedAt: startedAt,
+      targetHeadedModeEnabled: null,
+    });
     try {
       const res = await fetch('/api/config/restart', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      applyGatewayRestartTaskState(data);
       if (res.ok) {
-        setRestartSuccess(true);
-        setGatewayRestartNoticeSource(null);
-        setGatewayRestartModalStage('success');
-        setTimeout(() => setRestartSuccess(false), 3000);
+        await fetchGatewayRestartTaskStatus().catch(() => {});
       } else {
-        const data = await res.json().catch(() => ({}));
         const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.restartFailed');
         setGatewayRestartModalDetail(joinDistinctLines([
           display.message !== t('settings.gateway.restartFailed') ? display.message : '',
@@ -1670,13 +1922,19 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setGatewayRestartModalStage('failure');
       }
     } catch (err) {
+      pendingGatewayRestartStartRef.current = null;
       console.error(err);
       const detail = err instanceof Error && err.message.trim() ? err.message.trim() : '';
       setGatewayRestartModalDetail(detail);
       setGatewayRestartModalStage('failure');
-    } finally {
-      setIsRestarting(false);
-      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
+      updateGatewayRestartTaskInfo({
+        status: 'failed',
+        trigger: 'gateway',
+        rawDetail: detail || null,
+        startedAt: null,
+        updatedAt: new Date().toISOString(),
+        targetHeadedModeEnabled: null,
+      });
     }
   };
 
@@ -1709,6 +1967,11 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     });
   };
 
+  const applyMaxPermissionsState = (data: { enabled?: unknown; hostTakeover?: unknown }) => {
+    setMaxPermissions(!!data.enabled);
+    setHostTakeoverStatus((data.hostTakeover as HostTakeoverStatus | null) || null);
+  };
+
   const fetchBrowserHeadedModeState = async () => {
     setIsLoadingBrowserHeadedMode(true);
     try {
@@ -1733,43 +1996,127 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     const res = await fetch('/api/config/max-permissions');
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(typeof data?.message === 'string' ? data.message : 'Failed to load max permissions state');
+      const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.maxPermissionsLoadFailed');
+      setPermissionsError(display);
+      throw new Error(display.detail || display.message);
     }
-    const enabled = !!data.enabled;
-    setMaxPermissions(enabled);
-    return enabled;
+    applyMaxPermissionsState(data);
+    setPermissionsError(EMPTY_INLINE_ERROR);
+    return !!data.enabled;
+  };
+
+  const closePermissionsPasswordModal = () => {
+    if (isSubmittingPermissionsPassword) return;
+    setPermissionsPasswordModalOpen(false);
+    setPermissionsPasswordUser('');
+    setPermissionsPassword('');
+    setPermissionsPasswordError(EMPTY_INLINE_ERROR);
+  };
+
+  const requestMaxPermissionsChange = async (nextEnabled: boolean, systemPassword?: string) => {
+    const res = await fetch('/api/config/max-permissions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: nextEnabled,
+        ...(systemPassword ? { systemPassword } : {}),
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
   };
 
   const handleToggleMaxPermissions = async () => {
     const nextEnabled = !maxPermissions;
     setMaxPermissions(nextEnabled);
     setIsTogglingPermissions(true);
+    setPermissionsError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
     setGatewayRestartNoticeSource(null);
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     try {
-      const res = await fetch('/api/config/max-permissions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: nextEnabled }),
-      });
-      const data = await res.json().catch(() => ({}));
+      const { res, data } = await requestMaxPermissionsChange(nextEnabled);
       if (res.ok && data.success) {
-        setMaxPermissions(!!data.enabled);
+        applyMaxPermissionsState(data);
+        setPermissionsError(EMPTY_INLINE_ERROR);
         setBrowserHealth(null);
         setGatewayRestartNoticeSource('permissions');
+      } else if (nextEnabled && data.errorCode === 'gateway.hostTakeoverCredentialsRequired') {
+        if (typeof data.enabled === 'boolean' || data.hostTakeover) {
+          applyMaxPermissionsState(data);
+        } else {
+          setMaxPermissions(false);
+        }
+        setPermissionsPasswordUser(
+          typeof data?.errorParams?.userName === 'string' && data.errorParams.userName.trim()
+            ? data.errorParams.userName.trim()
+            : (data.hostTakeover?.currentUser || hostTakeoverStatus?.currentUser || '')
+        );
+        setPermissionsPassword('');
+        setPermissionsPasswordError(EMPTY_INLINE_ERROR);
+        setPermissionsPasswordModalOpen(true);
       } else {
-        await fetchMaxPermissionsState().catch(() => {
-          setMaxPermissions(!nextEnabled);
-        });
+        setPermissionsError(resolveStructuredErrorDisplay(data, t, 'gateway.maxPermissionsUpdateFailed'));
+        if (typeof data.enabled === 'boolean' || data.hostTakeover) {
+          applyMaxPermissionsState(data);
+        } else {
+          await fetchMaxPermissionsState().catch(() => {
+            setMaxPermissions(!nextEnabled);
+          });
+        }
       }
     } catch (err) {
       console.error(err);
+      setPermissionsError({
+        message: t('gateway.maxPermissionsUpdateFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
       await fetchMaxPermissionsState().catch(() => {
         setMaxPermissions(!nextEnabled);
       });
     } finally {
       setIsTogglingPermissions(false);
+    }
+  };
+
+  const handleSubmitPermissionsPassword = async () => {
+    if (!permissionsPassword.trim()) {
+      setPermissionsPasswordError({
+        message: t('settings.gateway.hostTakeoverPasswordRequired'),
+        detail: '',
+      });
+      return;
+    }
+
+    setIsSubmittingPermissionsPassword(true);
+    setPermissionsPasswordError(EMPTY_INLINE_ERROR);
+    setPermissionsError(EMPTY_INLINE_ERROR);
+
+    try {
+      const { res, data } = await requestMaxPermissionsChange(true, permissionsPassword);
+      if (res.ok && data.success) {
+        applyMaxPermissionsState(data);
+        setPermissionsPasswordUser('');
+        setPermissionsPassword('');
+        setPermissionsPasswordModalOpen(false);
+        setPermissionsPasswordError(EMPTY_INLINE_ERROR);
+        setBrowserHealth(null);
+        setGatewayRestartNoticeSource('permissions');
+        return;
+      }
+
+      if (typeof data.enabled === 'boolean' || data.hostTakeover) {
+        applyMaxPermissionsState(data);
+      }
+
+      setPermissionsPasswordError(resolveStructuredErrorDisplay(data, t, 'gateway.hostTakeoverInstallFailed'));
+    } catch (err) {
+      setPermissionsPasswordError({
+        message: t('gateway.hostTakeoverInstallFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsSubmittingPermissionsPassword(false);
     }
   };
 
@@ -1844,14 +2191,39 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setBrowserHeadedModeModalStage(null);
     setBrowserHeadedModePendingEnabled(null);
     setBrowserHeadedModeModalDetail('');
+    if (gatewayRestartTaskInfo?.status === 'failed' && gatewayRestartTaskInfo.trigger === 'browser-headed-mode') {
+      updateGatewayRestartTaskInfo({
+        status: 'idle',
+        trigger: null,
+        rawDetail: null,
+        startedAt: null,
+        updatedAt: new Date().toISOString(),
+        targetHeadedModeEnabled: null,
+      });
+      void resetGatewayRestartTaskStatus().catch(() => {});
+    }
   };
 
   const handleConfirmBrowserHeadedModeToggle = async () => {
     if (browserHeadedModePendingEnabled === null) return;
 
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs).toISOString();
     setIsTogglingBrowserHeadedMode(true);
     setBrowserHeadedModeModalDetail('');
     setBrowserHeadedModeModalStage('restarting');
+    pendingGatewayRestartStartRef.current = {
+      trigger: 'browser-headed-mode',
+      startedAtMs,
+    };
+    updateGatewayRestartTaskInfo({
+      status: 'restarting',
+      trigger: 'browser-headed-mode',
+      rawDetail: null,
+      startedAt,
+      updatedAt: startedAt,
+      targetHeadedModeEnabled: browserHeadedModePendingEnabled,
+    });
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
     setGatewayRestartNoticeSource(null);
@@ -1864,10 +2236,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         body: JSON.stringify({ headedModeEnabled: browserHeadedModePendingEnabled }),
       });
       const data = await res.json().catch(() => ({}));
+      applyGatewayRestartTaskState(data);
       if (res.ok && data.success && data.config) {
         applyBrowserHeadedModeConfig(data.config as BrowserHeadedModeConfig);
-        await fetchBrowserHeadedModeState().catch(() => {});
-        setBrowserHeadedModeModalStage('success');
+        await fetchGatewayRestartTaskStatus().catch(() => {});
       } else {
         await fetchBrowserHeadedModeState().catch(() => {});
         const display = resolveStructuredErrorDisplay(data, t, 'gateway.browserHeadedModeUpdateFailed');
@@ -1876,6 +2248,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setBrowserHeadedModeModalStage('failure');
       }
     } catch (err) {
+      pendingGatewayRestartStartRef.current = null;
       await fetchBrowserHeadedModeState().catch(() => {});
       const detail = err instanceof Error && err.message.trim() ? err.message.trim() : '';
       setBrowserHealthError({
@@ -1884,9 +2257,14 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       });
       setBrowserHeadedModeModalDetail(detail);
       setBrowserHeadedModeModalStage('failure');
-    } finally {
-      setIsTogglingBrowserHeadedMode(false);
-      window.dispatchEvent(new Event(CONNECTION_STATUS_REFRESH_EVENT));
+      updateGatewayRestartTaskInfo({
+        status: 'failed',
+        trigger: 'browser-headed-mode',
+        rawDetail: detail || null,
+        startedAt: null,
+        updatedAt: new Date().toISOString(),
+        targetHeadedModeEnabled: browserHeadedModePendingEnabled,
+      });
     }
   };
 
@@ -3231,6 +3609,19 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       </button>
     );
   };
+  const hostTakeoverMode = hostTakeoverStatus?.mode || 'disabled';
+  const hostTakeoverToneClass = hostTakeoverMode === 'ready'
+    ? 'border-green-200 bg-green-50 text-green-700'
+    : hostTakeoverMode === 'broken'
+      ? 'border-red-200 bg-red-50 text-red-700'
+      : hostTakeoverMode === 'needs_install'
+        ? 'border-amber-200 bg-amber-50 text-amber-700'
+        : 'border-gray-200 bg-gray-50 text-gray-600';
+  const hostTakeoverPathVisible = !!hostTakeoverStatus?.hostRootPath && (maxPermissions || hostTakeoverMode !== 'disabled');
+  const hostTakeoverManualInstallVisible = !!hostTakeoverStatus?.manualInstallCommand
+    && hostTakeoverMode !== 'ready'
+    && hostTakeoverMode !== 'disabled'
+    && hostTakeoverStatus?.autoInstallSupported === false;
   const headerTitle = settingsTab === 'gateway'
     ? t('settings.gateway.headerTitle')
     : settingsTab === 'general'
@@ -3361,6 +3752,68 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                     {gatewayRestartNoticeSource === 'permissions' && (
                       <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
                         {t('settings.gateway.restartRequiredNotice')}
+                      </div>
+                    )}
+
+                    <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${hostTakeoverToneClass}`}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-gray-900">{t('settings.gateway.hostTakeoverStatusLabel')}</span>
+                        <span className="rounded-full border border-current/15 px-2 py-0.5 text-xs font-semibold uppercase tracking-wide">
+                          {t(`settings.gateway.hostTakeoverModes.${hostTakeoverMode}`)}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-current">
+                        {t(`settings.gateway.hostTakeoverDescriptions.${hostTakeoverMode}`)}
+                      </p>
+                      {hostTakeoverStatus?.currentUser && (
+                        <p className="mt-3 text-xs text-gray-600">
+                          <span className="font-semibold text-gray-700">{t('settings.gateway.hostTakeoverCurrentUserLabel')}:</span>{' '}
+                          <span className="font-mono">{hostTakeoverStatus.currentUser}</span>
+                        </p>
+                      )}
+                      {hostTakeoverPathVisible && (
+                        <div className="mt-3">
+                          <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                            {t('settings.gateway.hostTakeoverEntryPointLabel')}
+                          </div>
+                          <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 font-mono text-xs text-gray-700 break-all">
+                            {hostTakeoverStatus?.hostRootPath}
+                          </div>
+                        </div>
+                      )}
+                      {hostTakeoverStatus?.rawDetail && (
+                        <div className="mt-3">
+                          <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                            {t('settings.gateway.hostTakeoverDetailLabel')}
+                          </div>
+                          <div className="mt-1 rounded-xl border border-current/10 bg-white/70 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
+                            {hostTakeoverStatus.rawDetail}
+                          </div>
+                        </div>
+                      )}
+                      {hostTakeoverManualInstallVisible && (
+                        <div className="mt-3">
+                          <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                            {t('settings.gateway.hostTakeoverManualInstallLabel')}
+                          </div>
+                          <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 font-mono text-xs text-gray-700 break-all whitespace-pre-wrap">
+                            {hostTakeoverStatus?.manualInstallCommand}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {permissionsError.message && (
+                      <div className="mt-4 rounded-xl border border-red-100 bg-red-50 px-3 py-3 text-sm text-red-600 flex items-start gap-2">
+                        <X className="w-4 h-4 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <div>{permissionsError.message}</div>
+                          {permissionsError.detail && (
+                            <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                              {permissionsError.detail}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -4374,6 +4827,90 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
         </div>
       </div>
+
+      {permissionsPasswordModalOpen && (
+        <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-amber-100">
+                {isSubmittingPermissionsPassword
+                  ? <Loader2 className="h-6 w-6 animate-spin text-amber-600" />
+                  : <Zap className="h-6 w-6 text-amber-600" />}
+              </div>
+              <h3 className="mb-2 text-center text-lg font-bold text-gray-900">
+                {t('settings.gateway.hostTakeoverPasswordModalTitle')}
+              </h3>
+              <p className="text-center text-sm text-gray-500 whitespace-pre-wrap">
+                {t('settings.gateway.hostTakeoverPasswordModalMessage')}
+              </p>
+
+              <div className="mt-5 space-y-4">
+                <div>
+                  <div className="mb-2 text-sm font-semibold text-gray-900">
+                    {t('settings.gateway.hostTakeoverCurrentUserLabel')}
+                  </div>
+                  <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 font-mono text-sm text-gray-700 break-all">
+                    {permissionsPasswordUser || hostTakeoverStatus?.currentUser || '-'}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="mb-2 block text-sm font-semibold text-gray-900">
+                    {t('settings.gateway.hostTakeoverPasswordLabel')}
+                  </label>
+                  <input
+                    type="password"
+                    value={permissionsPassword}
+                    onChange={(event) => setPermissionsPassword(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !isSubmittingPermissionsPassword) {
+                        event.preventDefault();
+                        void handleSubmitPermissionsPassword();
+                      }
+                    }}
+                    placeholder={t('settings.gateway.hostTakeoverPasswordPlaceholder')}
+                    disabled={isSubmittingPermissionsPassword}
+                    className="block w-full rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 text-sm focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all"
+                  />
+                </div>
+
+                {permissionsPasswordError.message && (
+                  <div className="rounded-xl border border-red-100 bg-red-50 px-3 py-3 text-sm text-red-600">
+                    <div>{permissionsPasswordError.message}</div>
+                    {permissionsPasswordError.detail && (
+                      <div className="mt-2 rounded-xl border border-red-100 bg-white/70 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {permissionsPasswordError.detail}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+              <button
+                type="button"
+                onClick={closePermissionsPasswordModal}
+                disabled={isSubmittingPermissionsPassword}
+                className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSubmitPermissionsPassword()}
+                disabled={isSubmittingPermissionsPassword}
+                className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isSubmittingPermissionsPassword
+                  ? t('settings.gateway.hostTakeoverPasswordSubmitting')
+                  : t('settings.gateway.hostTakeoverPasswordSubmit')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {browserHeadedModeModalStage && (
         <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">

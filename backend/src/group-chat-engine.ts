@@ -1,4 +1,7 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import type DB from './db';
 import type { GroupMemberRow, GroupMessageRow } from './db';
 import { extractOpenClawMessageText, type OpenClawClient } from './openclaw-client';
@@ -26,6 +29,8 @@ const MAX_CHAIN_DEPTH_MESSAGE_CODE = 'group.maxChainDepthReached' as const;
 const MAX_CHAIN_DEPTH_MESSAGE_REGEX = /^链式转发已达到最大深度 \((\d+) 轮\)$/;
 const AGENT_RESPONSE_FAILED_MESSAGE_CODE = 'group.agentResponseFailed' as const;
 const AGENT_RESPONSE_FAILED_MESSAGE_REGEX = /^❌\s+(.+?)\s+响应失败:\s*([\s\S]*)$/;
+const GROUP_HOST_TAKEOVER_CONFIG_PATH = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+const GROUP_HOST_TAKEOVER_HOST_ROOT_PATH = path.join(os.homedir(), '.openclaw', 'host-takeover', 'bin', 'host-root');
 
 export interface StructuredGroupMessage {
   messageCode?: string;
@@ -51,6 +56,27 @@ type ActiveGroupRun = {
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
+}
+
+function isGroupHostTakeoverEnabled(): boolean {
+  try {
+    const config = JSON.parse(fs.readFileSync(GROUP_HOST_TAKEOVER_CONFIG_PATH, 'utf-8'));
+    return !config?.tools?.profile && config?.tools?.exec?.security === 'full';
+  } catch {
+    return false;
+  }
+}
+
+function buildGroupHostTakeoverPrompt(): string {
+  const currentUser = (process.env.USER || 'user').trim() || 'user';
+  return [
+    '【Host takeover】',
+    'Maximum permissions are enabled. You can directly operate this Linux host and use root when required.',
+    `Immediate root entrypoint: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH}`,
+    `Run a complex root shell with: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} /bin/sh -lc '<command>'`,
+    `To drop back to the normal user, run: ${GROUP_HOST_TAKEOVER_HOST_ROOT_PATH} --as-user ${currentUser} -- <command>`,
+    'After the OpenClaw gateway restarts, common commands such as sudo, apt, apt-get, pip, python -m pip, systemctl, journalctl, mount, umount, chmod, chown, and tee will also flow through the takeover wrappers automatically.',
+  ].join('\n');
 }
 
 function createMaxChainDepthMessage(maxDepth: number): Required<StructuredGroupMessage> & { content: string } {
@@ -330,6 +356,10 @@ export class GroupChatEngine extends EventEmitter {
     // 1. Group-level system prompt
     if (groupDesc && groupDesc.trim() !== '') {
       parts.push(groupDesc);
+    }
+
+    if (isGroupHostTakeoverEnabled()) {
+      parts.push(buildGroupHostTakeoverPrompt());
     }
 
     if (workspacePath && uploadsPath && outputPath) {
