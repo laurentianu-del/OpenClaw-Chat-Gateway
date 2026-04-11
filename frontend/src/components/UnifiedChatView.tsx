@@ -121,6 +121,10 @@ function parsePositiveCursorValue(value: unknown): number | null {
   return null;
 }
 
+function isPersistedMessageId(value: string | null | undefined): boolean {
+  return typeof value === 'string' && /^\d+$/.test(value.trim());
+}
+
 function normalizeHistoryPageInfo(rawPageInfo: any, fallbackLimit = HISTORY_FETCH_BATCH_MIN_LIMIT): HistoryPageInfo {
   const limit = parsePositiveCursorValue(rawPageInfo?.limit) ?? fallbackLimit;
   const oldestLoadedId = parsePositiveCursorValue(rawPageInfo?.oldestLoadedId);
@@ -2060,6 +2064,12 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
         const contentType = response.headers.get('content-type') || '';
 
         if (contentType.includes('application/json')) {
+          const latestAssistantMessage = [...messagesRef.current]
+            .reverse()
+            .find((message) => message.role !== 'user');
+          if (latestAssistantMessage && !String(latestAssistantMessage.content || '').trim()) {
+            await recoverLatestChatMessages(true);
+          }
           setIsLoading(false);
           return;
         }
@@ -2581,7 +2591,14 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
             && message.parentId === editingMessageId
           );
           const regenerateTarget = latestReply ?? ({ id: `dummy-${Date.now()}`, role: 'assistant', parentId: editingMessageId } as ChatMessage);
-          handleRegenerate(regenerateTarget, nextContent);
+          await handleRegenerate(
+            regenerateTarget,
+            nextContent,
+            {
+              explicitParentId: editingMessageId,
+              targetMessageId: editingMessageId,
+            },
+          );
         }
       } catch {}
     } else if (isGroup && currentGroup) {
@@ -2595,7 +2612,14 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     setEditingMessageId(null); setEditContent(''); setEditExistingAttachments([]); setEditPendingFiles([]);
   };
 
-  const handleRegenerate = async (msg: ChatMessage, customParentContent?: string) => {
+  const handleRegenerate = async (
+    msg: ChatMessage,
+    customParentContent?: string,
+    options?: {
+      explicitParentId?: string;
+      targetMessageId?: string;
+    },
+  ) => {
     if (isChat) {
       const tempId = `temp-${Date.now()}`;
       let resolvedId = tempId;
@@ -2610,7 +2634,8 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       const updateAssistantMessages = (updater: (message: ChatMessage) => ChatMessage) => {
         setMessages(prev => prev.map(message => assistantTargetIds.has(message.id) ? updater(message) : message));
       };
-      let parentId = msg.parentId;
+      let parentId = options?.explicitParentId || msg.parentId;
+      const requestTargetMessageId = options?.targetMessageId || msg.id;
       if (!parentId) { const idx = messages.findIndex(m => m.id === msg.id); if (idx > 0) parentId = messages[idx - 1]?.id; }
       if (isLoading || !activeKey || !parentId) return;
       clearNewerHistoryWindowTrail();
@@ -2625,7 +2650,16 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
           { id: tempId, role: 'assistant', content: '', timestamp: new Date(), model: currentSession?.model || msg.model, agentName: currentSession?.name || msg.agentName, parentId },
         ]);
         setActiveLeafId(tempId);
-        const response = await fetch('/api/chat/regenerate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: contentStr, sessionId: activeKey, parentId }) });
+        const response = await fetch('/api/chat/regenerate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: contentStr,
+            sessionId: activeKey,
+            parentId,
+            ...(isPersistedMessageId(requestTargetMessageId) ? { targetMessageId: requestTargetMessageId } : {}),
+          }),
+        });
         if (!response.ok || !response.body) {
           dropAssistantPatches();
           const fallbackContent = `❌ ${t('common.error')}: ${t('unifiedChat.requestFailed')}`;
@@ -2968,12 +3002,16 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
   const handleStop = async () => {
     if (isChat && activeKey) {
       try {
-        await fetch('/api/chat/stop', {
+        const response = await fetch('/api/chat/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId: activeKey }),
         });
+        if (response.ok) {
+          await recoverLatestChatMessages(true);
+        }
       } catch {}
+      setIsLoading(false);
       return;
     }
 

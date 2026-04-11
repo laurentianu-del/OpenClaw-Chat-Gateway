@@ -1751,6 +1751,30 @@ const OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER = 'openclaw-chat-gateway:max-permiss
 const OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE = 'async function validateScriptFileForShellBleed(params) {';
 const OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE = `async function validateScriptFileForShellBleed(params) { return; /* ${OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER} */`;
 const OPENCLAW_EXEC_PREFLIGHT_PATCH_BACKUP_SUFFIX = '.clawui-max-permissions.exec-preflight.bak';
+const OPENCLAW_BROWSER_FILL_COMPAT_MARKER = 'openclaw-chat-gateway:browser-fill-compat';
+const OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT_MARKER}:value-alias`;
+const OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT_MARKER}:fields-alias`;
+const OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT_MARKER}:cli-text-alias`;
+const OPENCLAW_BROWSER_FILL_COMPAT_PATCH_BACKUP_SUFFIX = '.clawui-browser-fill-compat.bak';
+const OPENCLAW_BROWSER_FILL_CLIENT_ENTRY_PATTERN = /^client-fetch-.*\.js$/i;
+const OPENCLAW_BROWSER_FILL_PLUGIN_ENTRY_PATTERN = /^plugin-service-.*\.js$/i;
+const OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE = 'const value = normalizeBrowserFormFieldValue(record.value);';
+const OPENCLAW_BROWSER_FILL_CLIENT_FIELD_PATCHED_SIGNATURE = `const value = normalizeBrowserFormFieldValue(record.value !== void 0 ? record.value : record.text); /* ${OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER} */`;
+const OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE = 'const fields = (Array.isArray(body.fields) ? body.fields : []).map((field) => {';
+const OPENCLAW_BROWSER_FILL_CLIENT_ACTION_PATCHED_SIGNATURE = [
+  'const fallbackRef = normalizeBrowserFormFieldRef(body.ref);',
+  '\t\t\t\t\t\tconst rawFields = Array.isArray(body.fields) ? body.fields : fallbackRef ? [{',
+  '\t\t\t\t\t\t\tref: fallbackRef,',
+  '\t\t\t\t\t\t\ttype: body.type,',
+  '\t\t\t\t\t\t\tvalue: body.value !== void 0 ? body.value : body.text',
+  `\t\t\t\t\t\t}] : []; /* ${OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER} */`,
+  '\t\t\t\t\t\tconst fields = rawFields.map((field) => {',
+].join('\n');
+const OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE = 'if (rec.value === void 0 || rec.value === null || normalizeBrowserFormFieldValue(rec.value) !== void 0) return parsedField;';
+const OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_PATCHED_SIGNATURE = [
+  `const rawValue = rec.value !== void 0 ? rec.value : rec.text; /* ${OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER} */`,
+  '\t\tif (rawValue === void 0 || rawValue === null || normalizeBrowserFormFieldValue(rawValue) !== void 0) return parsedField;',
+].join('\n');
 
 type HostTakeoverOverrideSnapshot = {
   existed: boolean;
@@ -1779,6 +1803,23 @@ type OpenClawExecPreflightBypassStatus = {
   patchedCount: number;
   rawDetail: string | null;
   targets: OpenClawExecPreflightPatchTarget[];
+};
+
+type OpenClawBrowserFillCompatPatchTargetKind = 'client-fetch' | 'plugin-service';
+
+type OpenClawBrowserFillCompatPatchTarget = {
+  packageRoot: string;
+  targetPath: string;
+  backupPath: string;
+  kind: OpenClawBrowserFillCompatPatchTargetKind;
+};
+
+type OpenClawBrowserFillCompatStatus = {
+  ready: boolean;
+  targetCount: number;
+  patchedCount: number;
+  rawDetail: string | null;
+  targets: OpenClawBrowserFillCompatPatchTarget[];
 };
 
 function getCurrentUserName() {
@@ -2124,6 +2165,219 @@ function synchronizeOpenClawExecPreflightBypassBestEffort(enabled: boolean) {
     applyOpenClawExecPreflightBypass(enabled);
   } catch (error) {
     console.error('Failed to synchronize the OpenClaw exec preflight bypass:', error);
+  }
+}
+
+function getOpenClawBrowserFillCompatPatchBackupPath(targetPath: string) {
+  return `${targetPath}${OPENCLAW_BROWSER_FILL_COMPAT_PATCH_BACKUP_SUFFIX}`;
+}
+
+function readOpenClawBrowserFillCompatSource(targetPath: string) {
+  return fs.readFileSync(targetPath, 'utf-8');
+}
+
+function isOpenClawBrowserFillCompatPatched(target: OpenClawBrowserFillCompatPatchTarget, source: string) {
+  if (target.kind === 'client-fetch') {
+    return source.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)
+      && source.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER);
+  }
+
+  return source.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER);
+}
+
+function collectOpenClawBrowserFillCompatPatchTargets(): OpenClawBrowserFillCompatPatchTarget[] {
+  const targets: OpenClawBrowserFillCompatPatchTarget[] = [];
+  const seen = new Set<string>();
+
+  for (const packageRoot of collectOpenClawPackageRoots()) {
+    const distDir = path.join(packageRoot, 'dist');
+    if (!fs.existsSync(distDir)) continue;
+
+    let entryNames: string[] = [];
+    try {
+      entryNames = fs.readdirSync(distDir)
+        .filter((entryName) => entryName.endsWith('.js'))
+        .sort((left, right) => left.localeCompare(right));
+    } catch {
+      continue;
+    }
+
+    for (const entryName of entryNames) {
+      const kind: OpenClawBrowserFillCompatPatchTargetKind | null = OPENCLAW_BROWSER_FILL_CLIENT_ENTRY_PATTERN.test(entryName)
+        ? 'client-fetch'
+        : OPENCLAW_BROWSER_FILL_PLUGIN_ENTRY_PATTERN.test(entryName)
+          ? 'plugin-service'
+          : null;
+      if (!kind) continue;
+
+      const targetPath = path.join(distDir, entryName);
+      if (seen.has(targetPath)) continue;
+
+      const backupPath = getOpenClawBrowserFillCompatPatchBackupPath(targetPath);
+      const target: OpenClawBrowserFillCompatPatchTarget = {
+        packageRoot,
+        targetPath,
+        backupPath,
+        kind,
+      };
+
+      let shouldInclude = fs.existsSync(backupPath);
+      if (!shouldInclude) {
+        try {
+          const source = readOpenClawBrowserFillCompatSource(targetPath);
+          shouldInclude = kind === 'client-fetch'
+            ? (source.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)
+                && source.includes(OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE))
+              || isOpenClawBrowserFillCompatPatched(target, source)
+            : source.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)
+              || isOpenClawBrowserFillCompatPatched(target, source);
+        } catch {
+          shouldInclude = false;
+        }
+      }
+
+      if (!shouldInclude) continue;
+
+      seen.add(targetPath);
+      targets.push(target);
+    }
+  }
+
+  return targets;
+}
+
+function patchOpenClawBrowserFillCompatTarget(target: OpenClawBrowserFillCompatPatchTarget) {
+  const source = readOpenClawBrowserFillCompatSource(target.targetPath);
+  if (isOpenClawBrowserFillCompatPatched(target, source)) {
+    return;
+  }
+
+  let patchedSource = source;
+
+  if (target.kind === 'client-fetch') {
+    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)) {
+      if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)) {
+        throw new Error(`OpenClaw browser fill value signature not found in ${target.targetPath}.`);
+      }
+
+      const nextSource = patchedSource.replace(
+        OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE,
+        OPENCLAW_BROWSER_FILL_CLIENT_FIELD_PATCHED_SIGNATURE,
+      );
+      if (nextSource === patchedSource) {
+        throw new Error(`Failed to patch the OpenClaw browser fill value alias in ${target.targetPath}.`);
+      }
+      patchedSource = nextSource;
+    }
+
+    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER)) {
+      if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE)) {
+        throw new Error(`OpenClaw browser fill fields signature not found in ${target.targetPath}.`);
+      }
+
+      const nextSource = patchedSource.replace(
+        OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE,
+        OPENCLAW_BROWSER_FILL_CLIENT_ACTION_PATCHED_SIGNATURE,
+      );
+      if (nextSource === patchedSource) {
+        throw new Error(`Failed to patch the OpenClaw browser fill fields alias in ${target.targetPath}.`);
+      }
+      patchedSource = nextSource;
+    }
+  } else {
+    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)) {
+      throw new Error(`OpenClaw browser fill CLI signature not found in ${target.targetPath}.`);
+    }
+
+    const nextSource = patchedSource.replace(
+      OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE,
+      OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_PATCHED_SIGNATURE,
+    );
+    if (nextSource === patchedSource) {
+      throw new Error(`Failed to patch the OpenClaw browser fill CLI alias in ${target.targetPath}.`);
+    }
+    patchedSource = nextSource;
+  }
+
+  if (patchedSource === source) {
+    return;
+  }
+
+  if (!fs.existsSync(target.backupPath)) {
+    fs.writeFileSync(target.backupPath, source);
+  }
+
+  fs.writeFileSync(target.targetPath, patchedSource);
+}
+
+function readOpenClawBrowserFillCompatStatus(): OpenClawBrowserFillCompatStatus {
+  const targets = collectOpenClawBrowserFillCompatPatchTargets();
+  if (targets.length === 0) {
+    return {
+      ready: false,
+      targetCount: 0,
+      patchedCount: 0,
+      rawDetail: 'Could not locate the OpenClaw browser fill bundle to patch.',
+      targets,
+    };
+  }
+
+  let patchedCount = 0;
+  const unpatchedTargets: string[] = [];
+
+  for (const target of targets) {
+    try {
+      const source = readOpenClawBrowserFillCompatSource(target.targetPath);
+      if (isOpenClawBrowserFillCompatPatched(target, source)) {
+        patchedCount += 1;
+      } else {
+        unpatchedTargets.push(path.basename(target.targetPath));
+      }
+    } catch {
+      unpatchedTargets.push(path.basename(target.targetPath));
+    }
+  }
+
+  if (patchedCount === targets.length) {
+    return {
+      ready: true,
+      targetCount: targets.length,
+      patchedCount,
+      rawDetail: null,
+      targets,
+    };
+  }
+
+  return {
+    ready: false,
+    targetCount: targets.length,
+    patchedCount,
+    rawDetail: `The OpenClaw browser fill compatibility patch is not active for: ${unpatchedTargets.join(', ')}`,
+    targets,
+  };
+}
+
+function applyOpenClawBrowserFillCompatPatch() {
+  const targets = collectOpenClawBrowserFillCompatPatchTargets();
+  if (targets.length === 0) {
+    throw new Error('Could not locate the OpenClaw browser fill bundle to patch.');
+  }
+
+  for (const target of targets) {
+    patchOpenClawBrowserFillCompatTarget(target);
+  }
+
+  const status = readOpenClawBrowserFillCompatStatus();
+  if (!status.ready) {
+    throw new Error(status.rawDetail || 'Failed to activate the OpenClaw browser fill compatibility patch.');
+  }
+}
+
+function synchronizeOpenClawBrowserFillCompatBestEffort() {
+  try {
+    applyOpenClawBrowserFillCompatPatch();
+  } catch (error) {
+    console.error('Failed to synchronize the OpenClaw browser fill compatibility patch:', error);
   }
 }
 
@@ -3474,6 +3728,7 @@ async function configureMaxPermissionsState(enabled: boolean, options?: { system
 
     setMaxPermissionsEnabled(enabled);
     applyOpenClawExecPreflightBypass(enabled);
+    synchronizeOpenClawBrowserFillCompatBestEffort();
 
     if (enabled) {
       warmManagedHostToolingInBackground();
@@ -3519,6 +3774,7 @@ setImmediate(() => {
   const maxPermissionsEnabled = readMaxPermissionsEnabled() === true;
   patchExecApprovals(maxPermissionsEnabled);
   synchronizeOpenClawExecPreflightBypassBestEffort(maxPermissionsEnabled);
+  synchronizeOpenClawBrowserFillCompatBestEffort();
   if (maxPermissionsEnabled) {
     warmManagedHostToolingInBackground();
   }
@@ -4811,28 +5067,28 @@ const AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES = new Set([
 const AGENT_STATE_RESET_PRESERVED_RELATIVE_FILE_PATHS = [
   path.join('agent', 'auth-profiles.json'),
 ] as const;
-const sessionResetEpochs = new Map<string, number>();
+const sessionInterruptionEpochs = new Map<string, number>();
 
-class SessionResetInterruptedError extends Error {
+class SessionInterruptedError extends Error {
   constructor(sessionId: string) {
-    super(`Session "${sessionId}" was reset during processing.`);
-    this.name = 'SessionResetInterruptedError';
+    super(`Session "${sessionId}" was interrupted during processing.`);
+    this.name = 'SessionInterruptedError';
   }
 }
 
-function getSessionResetEpoch(sessionId: string): number {
-  return sessionResetEpochs.get(sessionId) ?? 0;
+function getSessionInterruptionEpoch(sessionId: string): number {
+  return sessionInterruptionEpochs.get(sessionId) ?? 0;
 }
 
-function bumpSessionResetEpoch(sessionId: string): number {
-  const nextEpoch = getSessionResetEpoch(sessionId) + 1;
-  sessionResetEpochs.set(sessionId, nextEpoch);
+function bumpSessionInterruptionEpoch(sessionId: string): number {
+  const nextEpoch = getSessionInterruptionEpoch(sessionId) + 1;
+  sessionInterruptionEpochs.set(sessionId, nextEpoch);
   return nextEpoch;
 }
 
-function assertSessionResetEpoch(sessionId: string, expectedEpoch: number): void {
-  if (getSessionResetEpoch(sessionId) !== expectedEpoch) {
-    throw new SessionResetInterruptedError(sessionId);
+function assertSessionInterruptionEpoch(sessionId: string, expectedEpoch: number): void {
+  if (getSessionInterruptionEpoch(sessionId) !== expectedEpoch) {
+    throw new SessionInterruptedError(sessionId);
   }
 }
 
@@ -6788,8 +7044,9 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
 
   try {
     const agentId = session.agentId;
-    bumpSessionResetEpoch(req.params.id);
-    pendingChatPreparationManager.cancel(req.params.id);
+    const interruptedEpoch = getSessionInterruptionEpoch(req.params.id);
+    bumpSessionInterruptionEpoch(req.params.id);
+    pendingChatPreparationManager.cancel(req.params.id, interruptedEpoch);
 
     try {
       await activeRunManager.abortRun(req.params.id);
@@ -6858,13 +7115,20 @@ app.post('/api/sessions/reorder', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/history/:sessionId', (req, res) => {
-  const { beforeId, limit } = getHistoryPageQueryParams(req.query as Record<string, unknown>);
-  const result = db.getMessagesPage(req.params.sessionId, { beforeId, limit });
-  res.json(buildHistoryPageResponse(
-    result.rows.map((row) => withStructuredChatMessage(row, { sessionId: req.params.sessionId })),
-    result.pageInfo,
-  ));
+app.get('/api/history/:sessionId', async (req, res) => {
+  try {
+    const { beforeId, limit } = getHistoryPageQueryParams(req.query as Record<string, unknown>);
+    if (beforeId === null) {
+      await reconcileInactiveChatLatestMessage(req.params.sessionId);
+    }
+    const result = db.getMessagesPage(req.params.sessionId, { beforeId, limit });
+    res.json(buildHistoryPageResponse(
+      result.rows.map((row) => withStructuredChatMessage(row, { sessionId: req.params.sessionId })),
+      result.pageInfo,
+    ));
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.get('/api/history/:sessionId/search', (req, res) => {
@@ -6923,10 +7187,12 @@ interface ActiveRun {
   latestFinalEventAt?: number;
   pendingErrorDetail?: string;
   clientRef?: OpenClawClient;
+  cleanedUp?: boolean;
 }
 
 interface PendingChatPreparation {
   sessionId: string;
+  epoch: number;
   messageId: number;
   agentId: string;
   agentName: string;
@@ -6955,8 +7221,14 @@ function isStreamingClientOpen(res: express.Response): boolean {
 class PendingChatPreparationManager {
   private pending = new Map<string, PendingChatPreparation>();
 
-  get(sessionId: string): PendingChatPreparation | undefined {
-    return this.pending.get(sessionId);
+  private matchesEpoch(preparation: PendingChatPreparation | undefined, expectedEpoch?: number): preparation is PendingChatPreparation {
+    if (!preparation) return false;
+    return expectedEpoch === undefined || preparation.epoch === expectedEpoch;
+  }
+
+  get(sessionId: string, expectedEpoch?: number): PendingChatPreparation | undefined {
+    const preparation = this.pending.get(sessionId);
+    return this.matchesEpoch(preparation, expectedEpoch) ? preparation : undefined;
   }
 
   start(preparation: Omit<PendingChatPreparation, 'clients'>): PendingChatPreparation {
@@ -6968,13 +7240,13 @@ class PendingChatPreparationManager {
     return nextPreparation;
   }
 
-  attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean }): boolean {
-    const preparation = this.pending.get(sessionId);
+  attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean; expectedEpoch?: number }): boolean {
+    const preparation = this.get(sessionId, options?.expectedEpoch);
     if (!preparation || !isStreamingClientOpen(res)) return false;
 
     preparation.clients.push(res);
     res.on('close', () => {
-      const current = this.pending.get(sessionId);
+      const current = this.get(sessionId, preparation.epoch);
       if (!current) return;
       current.clients = current.clients.filter((client) => client !== res);
     });
@@ -6990,15 +7262,15 @@ class PendingChatPreparationManager {
     return true;
   }
 
-  promoteClients(sessionId: string): express.Response[] {
-    const preparation = this.pending.get(sessionId);
+  promoteClients(sessionId: string, expectedEpoch?: number): express.Response[] {
+    const preparation = this.get(sessionId, expectedEpoch);
     if (!preparation) return [];
     this.pending.delete(sessionId);
     return preparation.clients.filter((client) => isStreamingClientOpen(client));
   }
 
-  cancel(sessionId: string) {
-    const preparation = this.pending.get(sessionId);
+  cancel(sessionId: string, expectedEpoch?: number) {
+    const preparation = this.get(sessionId, expectedEpoch);
     if (!preparation) return;
 
     this.pending.delete(sessionId);
@@ -7017,8 +7289,8 @@ class PendingChatPreparationManager {
     messageParams?: Record<string, any>;
     rawDetail?: string | null;
     role: string;
-  }) {
-    const preparation = this.pending.get(sessionId);
+  }, expectedEpoch?: number) {
+    const preparation = this.get(sessionId, expectedEpoch);
     if (!preparation) return;
 
     this.pending.delete(sessionId);
@@ -7052,6 +7324,12 @@ class ActiveRunManager {
     return this.runs.get(sessionId);
   }
 
+  private isCurrentRun(run: ActiveRun | undefined): run is ActiveRun {
+    if (!run) return false;
+    const current = this.runs.get(run.sessionId);
+    return !!current && current.runId === run.runId && current.messageId === run.messageId;
+  }
+
   async abortRun(sessionId: string): Promise<{ aborted: boolean }> {
     const run = this.runs.get(sessionId);
     if (!run || !run.clientRef) {
@@ -7075,7 +7353,7 @@ class ActiveRunManager {
       res.end();
     });
 
-    this.cleanupRun(sessionId);
+    this.cleanupRun(run);
     return { aborted: result.aborted };
   }
 
@@ -7266,6 +7544,10 @@ class ActiveRunManager {
   private resetIdleTimeout(run: ActiveRun) {
     if (run.idleTimeout) clearTimeout(run.idleTimeout);
     run.idleTimeout = setTimeout(() => {
+      if (!this.isCurrentRun(run)) {
+        this.cleanupRun(run);
+        return;
+      }
       const errorMsg = run.text ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
       const finalText = run.text || errorMsg;
       const canonicalText = canonicalizeAssistantWorkspaceArtifacts(finalText, {
@@ -7276,7 +7558,7 @@ class ActiveRunManager {
       
       this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
       this.emitVisibleFinal(run, canonicalText, { end: true });
-      this.cleanupRun(run.sessionId);
+      this.cleanupRun(run);
     }, 600000); // 10 minutes
   }
 
@@ -7291,7 +7573,7 @@ class ActiveRunManager {
   }
 
   private scheduleCompletionProbe(run: ActiveRun, delay = CHAT_STREAM_COMPLETION_PROBE_DELAY_MS) {
-    if (!this.runs.has(run.sessionId)) return;
+    if (!this.isCurrentRun(run)) return;
     run.completionProbePending = true;
     if (run.completionProbeTimer) {
       clearTimeout(run.completionProbeTimer);
@@ -7307,7 +7589,7 @@ class ActiveRunManager {
   }
 
   private async probeCompletion(run: ActiveRun) {
-    if (!this.runs.has(run.sessionId) || run.completionProbeInFlight || !run.clientRef) {
+    if (!this.isCurrentRun(run) || run.completionProbeInFlight || !run.clientRef) {
       return;
     }
 
@@ -7320,7 +7602,7 @@ class ActiveRunManager {
       if (run.firstCompletionWaitResolvedAt === undefined) {
         run.firstCompletionWaitResolvedAt = Date.now();
       }
-      if (!this.runs.has(run.sessionId)) return;
+      if (!this.isCurrentRun(run)) return;
 
       let completedOutput = selectPreferredTextSnapshot(run.text, run.finalEventText);
       let settledErrorDetail = '';
@@ -7438,7 +7720,7 @@ class ActiveRunManager {
 
       this.finalizeRun(run, completedOutput);
     } catch (error: any) {
-      if (!this.runs.has(run.sessionId)) return;
+      if (!this.isCurrentRun(run)) return;
       const detail = typeof error?.message === 'string' ? error.message : '';
       if (/timeout/i.test(detail)) {
         this.scheduleCompletionProbe(run);
@@ -7447,14 +7729,14 @@ class ActiveRunManager {
       this.failRun(run, pendingErrorDetail || detail || 'Failed waiting for run completion.');
     } finally {
       run.completionProbeInFlight = false;
-      if (this.runs.has(run.sessionId) && run.completionProbePending && !run.completionProbeTimer) {
+      if (this.isCurrentRun(run) && run.completionProbePending && !run.completionProbeTimer) {
         this.scheduleCompletionProbe(run, 0);
       }
     }
   }
 
   private finalizeRun(run: ActiveRun, finalText: string) {
-    if (!this.runs.has(run.sessionId)) return;
+    if (!this.isCurrentRun(run)) return;
 
     let protectedFinalText = selectPreferredTextSnapshot(run.text, finalText);
     protectedFinalText = selectPreferredTextSnapshot(protectedFinalText, run.finalEventText);
@@ -7473,11 +7755,11 @@ class ActiveRunManager {
 
     this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
     this.emitVisibleFinal(run, canonicalText, { end: true });
-    this.cleanupRun(run.sessionId);
+    this.cleanupRun(run);
   }
 
   private failRun(run: ActiveRun, detail: string) {
-    if (!this.runs.has(run.sessionId)) return;
+    if (!this.isCurrentRun(run)) return;
 
     const structuredError = createStructuredChatError(detail);
 
@@ -7495,28 +7777,134 @@ class ActiveRunManager {
       })}\n\n`);
       res.end();
     });
-    this.cleanupRun(run.sessionId);
+    this.cleanupRun(run);
   }
 
-  private cleanupRun(sessionId: string) {
-    const run = this.runs.get(sessionId);
-    if (run) {
-      if (run.idleTimeout) clearTimeout(run.idleTimeout);
-      if (run.completionProbeTimer) clearTimeout(run.completionProbeTimer);
-      if (run.clientRef) {
-        if ((run as any)._onDelta) run.clientRef.off('chat.delta', (run as any)._onDelta);
-        if ((run as any)._onFinal) run.clientRef.off('chat.final', (run as any)._onFinal);
-        if ((run as any)._onAborted) run.clientRef.off('chat.aborted', (run as any)._onAborted);
-        if ((run as any)._onError) run.clientRef.off('chat.error', (run as any)._onError);
-        if ((run as any)._onDisconnect) run.clientRef.off('disconnected', (run as any)._onDisconnect);
+  private cleanupRun(run: ActiveRun) {
+    if (run.cleanedUp) {
+      if (this.isCurrentRun(run)) {
+        this.runs.delete(run.sessionId);
       }
-      this.runs.delete(sessionId);
+      return;
+    }
+
+    run.cleanedUp = true;
+    if (run.idleTimeout) clearTimeout(run.idleTimeout);
+    if (run.completionProbeTimer) clearTimeout(run.completionProbeTimer);
+    if (run.clientRef) {
+      if ((run as any)._onDelta) run.clientRef.off('chat.delta', (run as any)._onDelta);
+      if ((run as any)._onFinal) run.clientRef.off('chat.final', (run as any)._onFinal);
+      if ((run as any)._onAborted) run.clientRef.off('chat.aborted', (run as any)._onAborted);
+      if ((run as any)._onError) run.clientRef.off('chat.error', (run as any)._onError);
+      if ((run as any)._onDisconnect) run.clientRef.off('disconnected', (run as any)._onDisconnect);
+    }
+    if (this.isCurrentRun(run)) {
+      this.runs.delete(run.sessionId);
     }
   }
 }
 
 const activeRunManager = new ActiveRunManager(db);
 const pendingChatPreparationManager = new PendingChatPreparationManager();
+
+async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<void> {
+  if (activeRunManager.getRun(sessionId) || pendingChatPreparationManager.get(sessionId)) {
+    return;
+  }
+
+  const recentMessages = db.getMessages(sessionId, 100);
+  if (recentMessages.length === 0) {
+    return;
+  }
+
+  const latestAssistantLikeMessage = [...recentMessages].reverse().find((message) => (
+    (message.role === 'assistant' || message.role === 'system')
+    && typeof message.id === 'number'
+  ));
+
+  const latestAssistantLikeMessageId = typeof latestAssistantLikeMessage?.id === 'number'
+    ? latestAssistantLikeMessage.id
+    : null;
+
+  if (!latestAssistantLikeMessageId || !latestAssistantLikeMessage) {
+    return;
+  }
+
+  const latestStoredMessage = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null;
+  if (!latestStoredMessage || latestStoredMessage.id !== latestAssistantLikeMessageId) {
+    return;
+  }
+
+  const currentContent = typeof latestAssistantLikeMessage.content === 'string'
+    ? latestAssistantLikeMessage.content
+    : '';
+  if (currentContent.trim()) {
+    return;
+  }
+
+  const sessionInfo = sessionManager.getSession(sessionId);
+  const agentId = latestAssistantLikeMessage.agent_id && latestAssistantLikeMessage.agent_id !== 'system'
+    ? latestAssistantLikeMessage.agent_id
+    : (sessionInfo?.agentId || 'main');
+
+  if (!agentId) {
+    db.deleteMessage(latestAssistantLikeMessageId);
+    return;
+  }
+
+  try {
+    const client = await getConnection(sessionId);
+    const finalSessionKey = sessionId.startsWith('agent:')
+      ? sessionId
+      : `agent:${agentId}:chat:${sessionId}`;
+    const history = await client.getChatHistory(finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+    const latestOutcomeRecord = extractLatestAssistantOutcomeRecord(history);
+    const latestMessageCreatedAtMs = Date.parse(latestAssistantLikeMessage.created_at || '');
+    const historyIsNewerThanCurrentMessage = latestOutcomeRecord.timestampMs !== null
+      && Number.isFinite(latestMessageCreatedAtMs)
+      && latestOutcomeRecord.timestampMs > latestMessageCreatedAtMs;
+
+    if (historyIsNewerThanCurrentMessage && latestOutcomeRecord.kind === 'text') {
+      const workspacePath = getSessionWorkspacePath(sessionId);
+      const startedAtMs = Number.isFinite(latestMessageCreatedAtMs) ? latestMessageCreatedAtMs : Date.now();
+      const canonicalText = canonicalizeAssistantWorkspaceArtifacts(latestOutcomeRecord.text, {
+        workspacePath,
+        startedAtMs,
+      });
+      const rewritten = rewriteOpenClawMediaPaths(canonicalText, workspacePath);
+      if (rewritten.trim()) {
+        db.updateMessage(latestAssistantLikeMessageId, rewritten, latestAssistantLikeMessage.model_used || undefined);
+        db.updateMessageEnvelope(
+          latestAssistantLikeMessageId,
+          'assistant',
+          latestAssistantLikeMessage.agent_id && latestAssistantLikeMessage.agent_id !== 'system'
+            ? latestAssistantLikeMessage.agent_id
+            : agentId,
+          latestAssistantLikeMessage.agent_name && latestAssistantLikeMessage.agent_id !== 'system'
+            ? latestAssistantLikeMessage.agent_name
+            : (sessionInfo?.name || agentId),
+        );
+        return;
+      }
+    }
+
+    if (historyIsNewerThanCurrentMessage && latestOutcomeRecord.kind === 'error') {
+      const structuredError = createStructuredChatError(latestOutcomeRecord.error);
+      db.updateMessage(latestAssistantLikeMessageId, structuredError.content, latestAssistantLikeMessage.model_used || undefined);
+      db.updateMessageEnvelope(
+        latestAssistantLikeMessageId,
+        structuredError.role,
+        structuredError.agent_id,
+        structuredError.agent_name,
+      );
+      return;
+    }
+  } catch (error) {
+    console.warn(`[chat] Failed to reconcile inactive latest message for session ${sessionId}:`, error);
+  }
+
+  db.deleteMessage(latestAssistantLikeMessageId);
+}
 
 function getLatestChatRegenerateTarget(sessionId: string): {
   latestUserMessage: ChatRow | null;
@@ -7552,7 +7940,7 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId or message'));
   }
 
-  const sessionResetEpoch = getSessionResetEpoch(String(sessionId));
+  const sessionInterruptionEpoch = getSessionInterruptionEpoch(String(sessionId));
 
   let userMsgId: number | undefined;
   let assistantMsgId: number | undefined;
@@ -7617,6 +8005,7 @@ app.post('/api/chat', async (req, res) => {
 
     pendingChatPreparationManager.start({
       sessionId,
+      epoch: sessionInterruptionEpoch,
       messageId: assistantMsgId,
       agentId,
       agentName,
@@ -7624,12 +8013,15 @@ app.post('/api/chat', async (req, res) => {
       startedAt: Date.now(),
     });
     pendingPreparationActive = true;
-    pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
+    pendingChatPreparationManager.attachClient(sessionId, res, {
+      announceAttach: true,
+      expectedEpoch: sessionInterruptionEpoch,
+    });
 
     const client = await getConnection(sessionId);
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
 
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
@@ -7637,7 +8029,7 @@ app.post('/api/chat', async (req, res) => {
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
       sessionKey: sessionId,
@@ -7645,11 +8037,11 @@ app.post('/api/chat', async (req, res) => {
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
-    if (getSessionResetEpoch(sessionId) !== sessionResetEpoch) {
+    if (getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch) {
       try {
         await client.abortChat({ sessionKey: finalSessionKey, runId });
       } catch {}
-      throw new SessionResetInterruptedError(sessionId);
+      throw new SessionInterruptedError(sessionId);
     }
 
     const run = activeRunManager.startRun(
@@ -7664,24 +8056,24 @@ app.post('/api/chat', async (req, res) => {
       finalSessionKey,
       preRunHistorySnapshot
     );
-    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId);
+    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
     pendingClients.forEach((clientRes) => {
       activeRunManager.attachClient(sessionId, clientRes);
     });
 
   } catch (error: any) {
-    const resetInterrupted = error instanceof SessionResetInterruptedError || getSessionResetEpoch(sessionId) !== sessionResetEpoch;
+    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.cancel(sessionId);
+        pendingChatPreparationManager.cancel(sessionId, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else if (res.headersSent) {
         try {
           res.end();
         } catch {}
       } else {
-        res.status(409).json(buildStructuredChatHttpError('Session was reset during processing.'));
+        res.status(409).json(buildStructuredChatHttpError('Session was interrupted during processing.'));
       }
       return;
     }
@@ -7722,7 +8114,7 @@ app.post('/api/chat', async (req, res) => {
       ));
     } else {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.fail(sessionId, structuredError);
+        pendingChatPreparationManager.fail(sessionId, structuredError, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else {
         res.write(`data: ${JSON.stringify({
@@ -7740,22 +8132,46 @@ app.post('/api/chat', async (req, res) => {
 });
 
 app.post('/api/chat/regenerate', async (req, res) => {
-  const { sessionId, message, parentId } = req.body;
+  const { sessionId, message, parentId, targetMessageId } = req.body;
 
   if (!sessionId || !message || !parentId) {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId, message, or parentId'));
   }
 
-  const sessionResetEpoch = getSessionResetEpoch(String(sessionId));
+  const sessionInterruptionEpoch = getSessionInterruptionEpoch(String(sessionId));
 
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
 
   try {
-    const numericParentId = Number(parentId);
+    const requestedParentId = Number(parentId);
+    const requestedTargetMessageId = Number(targetMessageId);
     const { latestUserMessage, latestReplyMessage } = getLatestChatRegenerateTarget(sessionId);
     const latestUserId = Number(latestUserMessage?.id);
+    const latestReplyId = Number(latestReplyMessage?.id);
     const latestReplyParentId = Number(latestReplyMessage?.parent_id);
+    let numericParentId = Number.isFinite(requestedParentId) ? requestedParentId : NaN;
+
+    if (
+      Number.isFinite(numericParentId)
+      && Number.isFinite(latestReplyId)
+      && numericParentId === latestReplyId
+      && Number.isFinite(latestReplyParentId)
+    ) {
+      numericParentId = latestReplyParentId;
+    }
+
+    if (!Number.isFinite(numericParentId) && Number.isFinite(requestedTargetMessageId)) {
+      if (requestedTargetMessageId === latestUserId) {
+        numericParentId = latestUserId;
+      } else if (
+        Number.isFinite(latestReplyId)
+        && requestedTargetMessageId === latestReplyId
+        && Number.isFinite(latestReplyParentId)
+      ) {
+        numericParentId = latestReplyParentId;
+      }
+    }
 
     if (
       !Number.isFinite(numericParentId)
@@ -7825,6 +8241,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     pendingChatPreparationManager.start({
       sessionId,
+      epoch: sessionInterruptionEpoch,
       messageId: assistantMsgId,
       agentId,
       agentName,
@@ -7832,19 +8249,22 @@ app.post('/api/chat/regenerate', async (req, res) => {
       startedAt: Date.now(),
     });
     pendingPreparationActive = true;
-    pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
+    pendingChatPreparationManager.attachClient(sessionId, res, {
+      announceAttach: true,
+      expectedEpoch: sessionInterruptionEpoch,
+    });
 
     const client = await getConnection(sessionId);
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
       : `agent:${agentId}:chat:${sessionId}`;
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
-    assertSessionResetEpoch(sessionId, sessionResetEpoch);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
       sessionKey: sessionId,
@@ -7852,11 +8272,11 @@ app.post('/api/chat/regenerate', async (req, res) => {
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
-    if (getSessionResetEpoch(sessionId) !== sessionResetEpoch) {
+    if (getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch) {
       try {
         await client.abortChat({ sessionKey: finalSessionKey, runId });
       } catch {}
-      throw new SessionResetInterruptedError(sessionId);
+      throw new SessionInterruptedError(sessionId);
     }
 
     const run = activeRunManager.startRun(
@@ -7872,24 +8292,24 @@ app.post('/api/chat/regenerate', async (req, res) => {
       preRunHistorySnapshot
     );
 
-    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId);
+    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
     pendingClients.forEach((clientRes) => {
       activeRunManager.attachClient(sessionId, clientRes);
     });
 
   } catch (error: any) {
-    const resetInterrupted = error instanceof SessionResetInterruptedError || getSessionResetEpoch(sessionId) !== sessionResetEpoch;
+    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.cancel(sessionId);
+        pendingChatPreparationManager.cancel(sessionId, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else if (res.headersSent) {
         try {
           res.end();
         } catch {}
       } else {
-        res.status(409).json(buildStructuredChatHttpError('Session was reset during processing.'));
+        res.status(409).json(buildStructuredChatHttpError('Session was interrupted during processing.'));
       }
       return;
     }
@@ -7929,7 +8349,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
       ));
     } else {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.fail(sessionId, structuredError);
+        pendingChatPreparationManager.fail(sessionId, structuredError, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else {
         res.write(`data: ${JSON.stringify({
@@ -7946,27 +8366,38 @@ app.post('/api/chat/regenerate', async (req, res) => {
   }
 });
 
-app.get('/api/chat/attach/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  const pendingPreparation = pendingChatPreparationManager.get(sessionId);
-  const run = activeRunManager.getRun(sessionId);
-  if (!run && !pendingPreparation) {
-    // Return empty payload to indicate no active run
-    return res.status(200).json({ active: false });
+app.get('/api/chat/attach/:sessionId', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const pendingPreparation = pendingChatPreparationManager.get(sessionId);
+    const run = activeRunManager.getRun(sessionId);
+    if (!run && !pendingPreparation) {
+      await reconcileInactiveChatLatestMessage(sessionId);
+      // Return empty payload to indicate no active run
+      return res.status(200).json({ active: false });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    if (run) {
+      activeRunManager.attachClient(sessionId, res, { announceAttach: true });
+      return;
+    }
+
+    pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
+  } catch (error: any) {
+    if (!res.headersSent) {
+      res.status(500).json(buildStructuredChatHttpError(error?.message || 'Failed to attach chat stream.'));
+      return;
+    }
+    try {
+      res.end();
+    } catch {}
   }
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  if (run) {
-    activeRunManager.attachClient(sessionId, res, { announceAttach: true });
-    return;
-  }
-
-  pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
 });
 
 app.post('/api/chat/stop', async (req, res) => {
@@ -7977,7 +8408,12 @@ app.post('/api/chat/stop', async (req, res) => {
   }
 
   try {
-    const result = await activeRunManager.abortRun(String(sessionId));
+    const normalizedSessionId = String(sessionId);
+    const interruptedEpoch = getSessionInterruptionEpoch(normalizedSessionId);
+    bumpSessionInterruptionEpoch(normalizedSessionId);
+    pendingChatPreparationManager.cancel(normalizedSessionId, interruptedEpoch);
+    const result = await activeRunManager.abortRun(normalizedSessionId);
+    await reconcileInactiveChatLatestMessage(normalizedSessionId);
     res.json({ success: true, ...result });
   } catch (error: any) {
     res.status(500).json(buildStructuredChatHttpError(error?.message || 'Failed to stop chat run.'));
