@@ -4799,12 +4799,106 @@ const GROUP_RUNTIME_WORKSPACE_RESERVED_ROOT_ENTRIES = new Set([
   'TOOLS.md',
   'USER.md',
 ]);
+const AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES = new Set([
+  'AGENTS.md',
+  'BOOTSTRAP.md',
+  'HEARTBEAT.md',
+  'IDENTITY.md',
+  'SOUL.md',
+  'TOOLS.md',
+  'USER.md',
+]);
+const AGENT_STATE_RESET_PRESERVED_RELATIVE_FILE_PATHS = [
+  path.join('agent', 'auth-profiles.json'),
+] as const;
+const sessionResetEpochs = new Map<string, number>();
+
+class SessionResetInterruptedError extends Error {
+  constructor(sessionId: string) {
+    super(`Session "${sessionId}" was reset during processing.`);
+    this.name = 'SessionResetInterruptedError';
+  }
+}
+
+function getSessionResetEpoch(sessionId: string): number {
+  return sessionResetEpochs.get(sessionId) ?? 0;
+}
+
+function bumpSessionResetEpoch(sessionId: string): number {
+  const nextEpoch = getSessionResetEpoch(sessionId) + 1;
+  sessionResetEpochs.set(sessionId, nextEpoch);
+  return nextEpoch;
+}
+
+function assertSessionResetEpoch(sessionId: string, expectedEpoch: number): void {
+  if (getSessionResetEpoch(sessionId) !== expectedEpoch) {
+    throw new SessionResetInterruptedError(sessionId);
+  }
+}
 
 function disconnectConnection(sessionId: string): void {
   const client = connections.get(sessionId);
   if (!client) return;
   connections.delete(sessionId);
   client.disconnect();
+}
+
+function resetAgentWorkspaceToInitialState(workspacePath: string): void {
+  fs.mkdirSync(workspacePath, { recursive: true });
+
+  for (const entry of fs.readdirSync(workspacePath, { withFileTypes: true })) {
+    if (AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES.has(entry.name)) {
+      continue;
+    }
+
+    fs.rmSync(path.join(workspacePath, entry.name), { recursive: true, force: true });
+  }
+
+  fs.mkdirSync(path.join(workspacePath, 'uploads'), { recursive: true });
+  fs.mkdirSync(path.join(workspacePath, 'memory'), { recursive: true });
+}
+
+function readPreservedAgentStateFiles(agentStatePath: string): Map<string, Buffer> {
+  const preservedFiles = new Map<string, Buffer>();
+
+  for (const relativePath of AGENT_STATE_RESET_PRESERVED_RELATIVE_FILE_PATHS) {
+    const absolutePath = path.join(agentStatePath, relativePath);
+    if (!fs.existsSync(absolutePath)) {
+      continue;
+    }
+
+    try {
+      if (fs.statSync(absolutePath).isFile()) {
+        preservedFiles.set(relativePath, fs.readFileSync(absolutePath));
+      }
+    } catch {}
+  }
+
+  return preservedFiles;
+}
+
+function restorePreservedAgentStateFiles(agentStatePath: string, preservedFiles: Map<string, Buffer>): void {
+  for (const [relativePath, fileContent] of preservedFiles) {
+    const absolutePath = path.join(agentStatePath, relativePath);
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, fileContent);
+  }
+}
+
+function resetAgentRuntimeStateToInitialState(agentId: string): void {
+  disconnectConnection(agentId);
+
+  const agentStatePath = getAgentStatePath(agentId);
+  const preservedFiles = readPreservedAgentStateFiles(agentStatePath);
+  if (fs.existsSync(agentStatePath)) {
+    fs.rmSync(agentStatePath, { recursive: true, force: true });
+  }
+  restorePreservedAgentStateFiles(agentStatePath, preservedFiles);
+
+  const memoryDbPath = getAgentMemoryDbPath(agentId);
+  if (fs.existsSync(memoryDbPath)) {
+    fs.rmSync(memoryDbPath, { force: true });
+  }
 }
 
 function createMigratedConflictPath(targetPath: string): string {
@@ -5311,6 +5405,8 @@ function broadcastGroupReconciliationActions(groupId: string, actions: GroupReco
 }
 
 function removeAgentRuntimeState(agentId: string): void {
+  disconnectConnection(agentId);
+
   const agentStatePath = getAgentStatePath(agentId);
   if (fs.existsSync(agentStatePath)) {
     fs.rmSync(agentStatePath, { recursive: true, force: true });
@@ -6683,7 +6779,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
   }
 });
 
-// Reset session (clear history, files, context but keep session entity)
+// Reset session back to its initialized runtime state while keeping the session entity.
 app.post('/api/sessions/:id/reset', async (req, res) => {
   const session = sessionManager.getSession(req.params.id);
   if (!session) {
@@ -6692,31 +6788,31 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
 
   try {
     const agentId = session.agentId;
+    bumpSessionResetEpoch(req.params.id);
+    pendingChatPreparationManager.cancel(req.params.id);
+
+    try {
+      await activeRunManager.abortRun(req.params.id);
+    } catch {}
+    disconnectConnection(req.params.id);
 
     // Clear database records
     db.deleteMessagesBySession(req.params.id);
-    db.deleteFilesBySession(req.params.id);
+    clearStoredFilesBySessionKey(req.params.id);
 
     // Clear agent workspace uploads directory
     if (agentId) {
       const workspacePath = agentProvisioner.getWorkspacePath(agentId);
-      const uploadsPath = path.join(workspacePath, 'uploads');
-      if (fs.existsSync(uploadsPath)) {
-        fs.rmSync(uploadsPath, { recursive: true, force: true });
-        fs.mkdirSync(uploadsPath, { recursive: true });
-      }
-
-      // Clear agent state directory
-      const agentStatePath = path.join(process.env.HOME || '.', '.openclaw', 'agents', agentId);
-      if (fs.existsSync(agentStatePath)) {
-        fs.rmSync(agentStatePath, { recursive: true, force: true });
-      }
-
-      // Clear agent memory database
-      const memoryDbPath = path.join(process.env.HOME || '.', '.openclaw', 'memory', `${agentId}.sqlite`);
-      if (fs.existsSync(memoryDbPath)) {
-        fs.rmSync(memoryDbPath, { force: true });
-      }
+      const modelConfig = agentProvisioner.readAgentModelConfig(agentId);
+      resetAgentWorkspaceToInitialState(workspacePath);
+      resetAgentRuntimeStateToInitialState(agentId);
+      await agentProvisioner.provision({
+        agentId,
+        workspaceDir: workspacePath,
+        model: modelConfig.modelOverride || undefined,
+        fallbackMode: modelConfig.fallbackMode,
+        fallbacks: modelConfig.fallbacks,
+      });
     }
 
     res.json({ success: true });
@@ -6899,6 +6995,20 @@ class PendingChatPreparationManager {
     if (!preparation) return [];
     this.pending.delete(sessionId);
     return preparation.clients.filter((client) => isStreamingClientOpen(client));
+  }
+
+  cancel(sessionId: string) {
+    const preparation = this.pending.get(sessionId);
+    if (!preparation) return;
+
+    this.pending.delete(sessionId);
+    preparation.clients
+      .filter((client) => isStreamingClientOpen(client))
+      .forEach((res) => {
+        try {
+          res.end();
+        } catch {}
+      });
   }
 
   fail(sessionId: string, payload: {
@@ -7442,6 +7552,8 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId or message'));
   }
 
+  const sessionResetEpoch = getSessionResetEpoch(String(sessionId));
+
   let userMsgId: number | undefined;
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
@@ -7515,7 +7627,9 @@ app.post('/api/chat', async (req, res) => {
     pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
 
     const client = await getConnection(sessionId);
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
 
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
@@ -7523,6 +7637,7 @@ app.post('/api/chat', async (req, res) => {
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
       sessionKey: sessionId,
@@ -7530,6 +7645,12 @@ app.post('/api/chat', async (req, res) => {
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
+    if (getSessionResetEpoch(sessionId) !== sessionResetEpoch) {
+      try {
+        await client.abortChat({ sessionKey: finalSessionKey, runId });
+      } catch {}
+      throw new SessionResetInterruptedError(sessionId);
+    }
 
     const run = activeRunManager.startRun(
       sessionId,
@@ -7550,6 +7671,21 @@ app.post('/api/chat', async (req, res) => {
     });
 
   } catch (error: any) {
+    const resetInterrupted = error instanceof SessionResetInterruptedError || getSessionResetEpoch(sessionId) !== sessionResetEpoch;
+    if (resetInterrupted) {
+      if (pendingPreparationActive) {
+        pendingChatPreparationManager.cancel(sessionId);
+        pendingPreparationActive = false;
+      } else if (res.headersSent) {
+        try {
+          res.end();
+        } catch {}
+      } else {
+        res.status(409).json(buildStructuredChatHttpError('Session was reset during processing.'));
+      }
+      return;
+    }
+
     const structuredErrorInput = resolveStructuredChatErrorInput(error);
     const structuredError = createStructuredChatError(
       structuredErrorInput.rawDetail,
@@ -7609,6 +7745,8 @@ app.post('/api/chat/regenerate', async (req, res) => {
   if (!sessionId || !message || !parentId) {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId, message, or parentId'));
   }
+
+  const sessionResetEpoch = getSessionResetEpoch(String(sessionId));
 
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
@@ -7697,13 +7835,16 @@ app.post('/api/chat/regenerate', async (req, res) => {
     pendingChatPreparationManager.attachClient(sessionId, res, { announceAttach: true });
 
     const client = await getConnection(sessionId);
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
     const expectedSessionKey = sessionId.startsWith('agent:')
       ? sessionId
       : `agent:${agentId}:chat:${sessionId}`;
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
+    assertSessionResetEpoch(sessionId, sessionResetEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
       sessionKey: sessionId,
@@ -7711,6 +7852,12 @@ app.post('/api/chat/regenerate', async (req, res) => {
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
+    if (getSessionResetEpoch(sessionId) !== sessionResetEpoch) {
+      try {
+        await client.abortChat({ sessionKey: finalSessionKey, runId });
+      } catch {}
+      throw new SessionResetInterruptedError(sessionId);
+    }
 
     const run = activeRunManager.startRun(
       sessionId,
@@ -7732,6 +7879,21 @@ app.post('/api/chat/regenerate', async (req, res) => {
     });
 
   } catch (error: any) {
+    const resetInterrupted = error instanceof SessionResetInterruptedError || getSessionResetEpoch(sessionId) !== sessionResetEpoch;
+    if (resetInterrupted) {
+      if (pendingPreparationActive) {
+        pendingChatPreparationManager.cancel(sessionId);
+        pendingPreparationActive = false;
+      } else if (res.headersSent) {
+        try {
+          res.end();
+        } catch {}
+      } else {
+        res.status(409).json(buildStructuredChatHttpError('Session was reset during processing.'));
+      }
+      return;
+    }
+
     const structuredErrorInput = resolveStructuredChatErrorInput(error);
     const structuredError = createStructuredChatError(
       structuredErrorInput.rawDetail,
@@ -8470,9 +8632,11 @@ app.delete('/api/groups/:id', async (req, res) => {
       return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
     }
 
+    groupChatEngine.markGroupReset(req.params.id);
     try {
       await groupChatEngine.abortGroupRun(req.params.id);
     } catch {}
+    groupChatEngine.forceResetGroupState(req.params.id);
     clearStoredFilesBySessionKey(req.params.id);
     cleanupGroupRuntimeAgent(req.params.id, { removeConfig: true });
     deleteGroupWorkspace(req.params.id);
@@ -8483,7 +8647,7 @@ app.delete('/api/groups/:id', async (req, res) => {
   }
 });
 
-// Reset group (clear history but keep group entity and members)
+// Reset group back to its initialized runtime state while keeping the team entity and members.
 app.post('/api/groups/:id/reset', async (req, res) => {
   try {
     const group = db.getGroupChat(req.params.id);
@@ -8491,16 +8655,17 @@ app.post('/api/groups/:id/reset', async (req, res) => {
       return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
     }
 
+    groupChatEngine.markGroupReset(req.params.id);
     try {
       await groupChatEngine.abortGroupRun(req.params.id);
     } catch {}
+    groupChatEngine.forceResetGroupState(req.params.id);
 
-    // Clear group messages
+    // Restore the team runtime baseline while keeping the team definition.
     db.deleteGroupMessagesByGroup(req.params.id);
     clearStoredFilesBySessionKey(req.params.id);
-    cleanupGroupRuntimeAgent(req.params.id);
+    cleanupGroupRuntimeAgent(req.params.id, { removeConfig: true });
     resetGroupWorkspace(req.params.id);
-    // Keep source agents intact; resetting a group should only clear group runtime clones.
 
     res.json({ success: true });
   } catch (err: any) {

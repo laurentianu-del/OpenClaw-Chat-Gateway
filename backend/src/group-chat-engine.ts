@@ -83,6 +83,13 @@ type PendingGroupRun = {
   text: string;
 };
 
+class GroupResetInterruptedError extends Error {
+  constructor(groupId: string) {
+    super(`Group "${groupId}" was reset during processing.`);
+    this.name = 'GroupResetInterruptedError';
+  }
+}
+
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
 }
@@ -178,6 +185,7 @@ export class GroupChatEngine extends EventEmitter {
   private getClient: (sessionId: string) => Promise<OpenClawClient>;
   private getAgentModel: (agentId: string) => string;
   private processingGroups = new Set<string>();
+  private resetEpochs = new Map<string, number>();
   private prepareGroupRuntime: (groupId: string, agentId: string) => Promise<{
       runtimeAgentId: string;
       workspacePath: string;
@@ -249,6 +257,44 @@ export class GroupChatEngine extends EventEmitter {
     if (runId && current.runId !== runId) return;
     this.activeRuns.delete(groupId);
     this.emitRunState(groupId);
+  }
+
+  private getResetEpoch(groupId: string): number {
+    return this.resetEpochs.get(groupId) ?? 0;
+  }
+
+  private throwIfGroupReset(groupId: string, expectedEpoch: number): void {
+    if (this.getResetEpoch(groupId) !== expectedEpoch) {
+      throw new GroupResetInterruptedError(groupId);
+    }
+  }
+
+  markGroupReset(groupId: string): number {
+    const nextEpoch = this.getResetEpoch(groupId) + 1;
+    this.resetEpochs.set(groupId, nextEpoch);
+    return nextEpoch;
+  }
+
+  forceResetGroupState(groupId: string): void {
+    const activeRun = this.activeRuns.get(groupId);
+    const pendingRun = this.pendingRuns.get(groupId);
+    const affectedAgentIds = new Set<string>();
+
+    if (activeRun?.agentId) {
+      affectedAgentIds.add(activeRun.agentId);
+    }
+    if (pendingRun?.agentId) {
+      affectedAgentIds.add(pendingRun.agentId);
+    }
+
+    this.processingGroups.delete(groupId);
+    this.pendingRuns.delete(groupId);
+    this.activeRuns.delete(groupId);
+    this.emitRunState(groupId);
+
+    for (const agentId of affectedAgentIds) {
+      this.emit('typing_done', { groupId, agentId });
+    }
   }
 
   getGroupRunState(groupId: string) {
@@ -458,13 +504,16 @@ export class GroupChatEngine extends EventEmitter {
       throw error;
     }
 
+    const resetEpoch = this.getResetEpoch(groupId);
     this.processingGroups.add(groupId);
     this.emitRunState(groupId);
 
     try {
+      this.throwIfGroupReset(groupId, resetEpoch);
       const group = this.db.getGroupChat(groupId);
       if (!group) throw new Error('团队不存在');
 
+      this.throwIfGroupReset(groupId, resetEpoch);
       const members = this.resolveMembers(this.db.getGroupMembers(groupId));
       if (members.length === 0) throw new Error('团队没有成员');
 
@@ -507,8 +556,13 @@ export class GroupChatEngine extends EventEmitter {
       // Send to each targeted agent sequentially so group history stays linear.
       let currentParentId: number | undefined = userMsgId;
       for (const agentId of targetAgentIds) {
-        const res = await this.sendToAgent(groupId, group.name, agentId, content, '用户', 0, currentParentId);
+        this.throwIfGroupReset(groupId, resetEpoch);
+        const res = await this.sendToAgent(groupId, group.name, agentId, content, '用户', 0, currentParentId, resetEpoch);
         if (res !== undefined) currentParentId = res;
+      }
+    } catch (error) {
+      if (!(error instanceof GroupResetInterruptedError)) {
+        throw error;
       }
     } finally {
       this.processingGroups.delete(groupId);
@@ -530,8 +584,11 @@ export class GroupChatEngine extends EventEmitter {
     triggerMsg: string,
     triggerSenderName: string,
     depth: number,
-    parentId?: number
+    parentId?: number,
+    resetEpoch?: number
   ): Promise<number | undefined> {
+    const effectiveResetEpoch = resetEpoch ?? this.getResetEpoch(groupId);
+    this.throwIfGroupReset(groupId, effectiveResetEpoch);
 
     // Keep the agent reply chain attached to the latest valid message even if the incoming parent is stale.
     parentId = this.resolveGroupParentId(groupId, parentId);
@@ -625,6 +682,7 @@ export class GroupChatEngine extends EventEmitter {
       const group = this.db.getGroupChat(groupId);
       const groupSysPrompt = group?.system_prompt || group?.description || '';
       const runtimeContext = await this.prepareGroupRuntime(groupId, agentId);
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
       
       // Token Optimization: OpenClaw gateway natively remembers history for 'sessionKey'.
       // If we send the last 20 messages every turn, token usage explodes exponentially O(N^2).
@@ -663,6 +721,7 @@ export class GroupChatEngine extends EventEmitter {
           console.error('[GroupChatEngine] Failed to prepare managed document tooling runtime:', error);
         }
       }
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const imageInspectionContext = isResetCommand
         ? ''
         : buildImageUploadInspectionContext(rewrittenTrigger.linkedUploads);
@@ -674,6 +733,7 @@ export class GroupChatEngine extends EventEmitter {
         : buildAudioTranscriptContext(
           await prepareAudioTranscriptsFromUploads(rewrittenTrigger.linkedUploads, runtimeContext.runtimeAgentId)
         );
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const promptInput = [rewrittenTrigger.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
 
       const prompt = isResetCommand 
@@ -698,12 +758,14 @@ export class GroupChatEngine extends EventEmitter {
       // Tools (browser, code execution, etc.) are granted via agentId, not sessionKey.
       const sessionKey = getGroupRuntimeSessionKey(groupId);
       const client = await this.getClient(runtimeContext.runtimeAgentId);
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const expectedSessionKey = sessionKey.startsWith('agent:')
         ? sessionKey
         : `agent:${runtimeContext.runtimeAgentId}:chat:${sessionKey}`;
       const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, GROUP_HISTORY_COMPLETION_PROBE_LIMIT)
         .then((history) => getHistorySnapshot(history))
         .catch(() => ({ length: 0, latestSignature: '' }));
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
 
       // Start streaming response
       const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
@@ -712,6 +774,12 @@ export class GroupChatEngine extends EventEmitter {
         agentId: runtimeContext.runtimeAgentId,
         attachments: rewrittenTrigger.attachments,
       });
+      if (this.getResetEpoch(groupId) !== effectiveResetEpoch) {
+        try {
+          await client.abortChat({ sessionKey: finalSessionKey, runId });
+        } catch {}
+        throw new GroupResetInterruptedError(groupId);
+      }
       const runStartedAt = Date.now();
       activeRunId = runId;
       this.setActiveRun({
@@ -1003,6 +1071,7 @@ export class GroupChatEngine extends EventEmitter {
       });
 
       // Update DB with final content
+      this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const protectedResponse = selectPreferredTextSnapshot(
         selectPreferredTextSnapshot(finalOutput, response),
         finalEventText,
@@ -1086,13 +1155,17 @@ export class GroupChatEngine extends EventEmitter {
       if (mentionedIds.length > 0) {
         for (const nextAgentId of mentionedIds) {
           if (nextAgentId !== agentId) { // Don't send to self
-            const res = await this.sendToAgent(groupId, groupName, nextAgentId, canonicalResponse, member.display_name, depth + 1, lastMsgId);
+            const res = await this.sendToAgent(groupId, groupName, nextAgentId, canonicalResponse, member.display_name, depth + 1, lastMsgId, effectiveResetEpoch);
             if (res !== undefined) lastMsgId = res;
           }
         }
       }
       return lastMsgId;
     } catch (err: any) {
+      if (err instanceof GroupResetInterruptedError || this.getResetEpoch(groupId) !== effectiveResetEpoch) {
+        return parentId;
+      }
+
       if (activeRunId) {
         this.clearActiveRun(groupId, activeRunId);
       }
