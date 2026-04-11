@@ -373,22 +373,35 @@ export class AgentProvisioner {
       }
 
 
+      let createdWorkspaceArtifacts = false;
+      let copiedAuthProfile = false;
       const workspaceDir = opts.workspaceDir || this.getWorkspacePath(opts.agentId);
       const agentDir = path.join(this.openclawDir, 'agents', opts.agentId, 'agent');
       const memoryDir = path.join(workspaceDir, 'memory');
       
       // 1. Create workspace directory structure
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      fs.mkdirSync(memoryDir, { recursive: true });
-      fs.mkdirSync(agentDir, { recursive: true });
+      const ensureDir = (dirPath: string) => {
+        if (!fs.existsSync(dirPath)) {
+          fs.mkdirSync(dirPath, { recursive: true });
+          createdWorkspaceArtifacts = true;
+        }
+      };
+
+      ensureDir(workspaceDir);
+      ensureDir(memoryDir);
+      ensureDir(agentDir);
 
       // 2. Write workspace files
       const writeFileSafe = (filename: string, content: string | undefined, defaultContent?: string) => {
         const filePath = path.join(workspaceDir, filename);
         if (content !== undefined) {
-          fs.writeFileSync(filePath, content);
+          if (!fs.existsSync(filePath) || fs.readFileSync(filePath, 'utf-8') !== content) {
+            fs.writeFileSync(filePath, content);
+            createdWorkspaceArtifacts = true;
+          }
         } else if (defaultContent !== undefined && !fs.existsSync(filePath)) {
           fs.writeFileSync(filePath, defaultContent);
+          createdWorkspaceArtifacts = true;
         }
       };
 
@@ -404,6 +417,7 @@ export class AgentProvisioner {
       const agentAuthPath = path.join(agentDir, 'auth-profiles.json');
       if (fs.existsSync(mainAuthPath) && !fs.existsSync(agentAuthPath)) {
         fs.copyFileSync(mainAuthPath, agentAuthPath);
+        copiedAuthProfile = true;
       }
 
       // 4. Update openclaw.json agents.list[]
@@ -415,7 +429,9 @@ export class AgentProvisioner {
         opts.fallbacks
       );
 
-      console.log(`[AgentProvisioner] Provisioned agent "${opts.agentId}" at ${workspaceDir}`);
+      if (configChanged || createdWorkspaceArtifacts || copiedAuthProfile) {
+        console.log(`[AgentProvisioner] Provisioned agent "${opts.agentId}" at ${workspaceDir}`);
+      }
       return configChanged;
     } catch (error) {
       console.error('Failed to provision agent:', error);

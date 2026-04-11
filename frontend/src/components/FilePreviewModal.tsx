@@ -30,7 +30,35 @@ const TEXT_SELECTION_STYLE = {
   WebkitTouchCallout: 'default' as const,
 };
 
+const DOCUMENT_PREVIEW_SCROLL_CLASS = 'w-full h-full overflow-y-auto';
+const DOCUMENT_PREVIEW_SURFACE_CLASS = 'w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200';
+const DOCUMENT_PREVIEW_BODY_CLASS = 'p-6 sm:p-10';
+
+function extractRenderableDocumentBody(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  if (!/<(?:!doctype|html|head|body)\b/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (typeof DOMParser === 'undefined') {
+    return trimmed;
+  }
+
+  try {
+    const document = new DOMParser().parseFromString(trimmed, 'text/html');
+    document.querySelectorAll('script, noscript, style, meta, link, title, base').forEach((node) => node.remove());
+    return document.body?.innerHTML?.trim() || trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 function buildRenderedHtmlDocument(content: string): string {
+  const normalizedContent = extractRenderableDocumentBody(content);
   return `
     <style>
       .preview-root {
@@ -40,6 +68,8 @@ function buildRenderedHtmlDocument(content: string): string {
         user-select: text;
         -webkit-user-select: text;
       }
+      .preview-root > :first-child { margin-top: 0 !important; }
+      .preview-root > :last-child { margin-bottom: 0 !important; }
       .preview-root h1 { font-size: 24px; font-weight: 800; margin: 24px 0 12px; color: #111827; }
       .preview-root h2 { font-size: 20px; font-weight: 700; margin: 20px 0 10px; color: #1f2937; }
       .preview-root h3 { font-size: 17px; font-weight: 600; margin: 16px 0 8px; color: #374151; }
@@ -60,7 +90,7 @@ function buildRenderedHtmlDocument(content: string): string {
         -webkit-user-select: text;
       }
     </style>
-    <div class="preview-root">${content}</div>
+    <div class="preview-root">${normalizedContent}</div>
   `;
 }
 
@@ -875,9 +905,9 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         )}
 
         {preview.status === 'ready' && preview.type === 'html' && !isHtmlFile && (
-          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+          <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
             <div
-              className="w-full max-w-5xl mx-auto overflow-hidden bg-white sm:rounded-2xl p-4 sm:p-10 sm:border border-gray-200 cursor-text"
+              className={`${DOCUMENT_PREVIEW_SURFACE_CLASS} ${DOCUMENT_PREVIEW_BODY_CLASS} overflow-hidden cursor-text`}
               style={TEXT_SELECTION_STYLE}
               dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
             />
@@ -885,9 +915,9 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         )}
 
         {preview.status === 'ready' && isHtmlFile && isRenderedMode && (
-          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+          <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
             <div
-              className="w-full max-w-5xl mx-auto bg-white sm:bg-slate-50 sm:rounded-2xl sm:border border-gray-200 overflow-hidden p-4 sm:p-10 cursor-text"
+              className={`${DOCUMENT_PREVIEW_SURFACE_CLASS} ${DOCUMENT_PREVIEW_BODY_CLASS} overflow-hidden cursor-text`}
               style={TEXT_SELECTION_STYLE}
               dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
             />
@@ -895,9 +925,9 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         )}
 
         {preview.status === 'ready' && isMarkdownFile && isRenderedMode && (
-          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
+          <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
             <div
-              className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 p-5 sm:p-10 cursor-text"
+              className={`${DOCUMENT_PREVIEW_SURFACE_CLASS} ${DOCUMENT_PREVIEW_BODY_CLASS} cursor-text`}
               style={TEXT_SELECTION_STYLE}
             >
               <div className="prose prose-sm sm:prose-base max-w-none prose-slate break-words select-text">
@@ -910,10 +940,10 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         )}
 
         {preview.status === 'ready' && (preview.type === 'text' || preview.type === 'code') && !isRenderedMode && (
-          <div className="w-full h-full overflow-y-auto px-0 sm:px-0 py-0">
-            <div className="w-full max-w-5xl mx-auto flex-1 bg-white sm:bg-slate-50 sm:rounded-2xl sm:border border-gray-200">
+          <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
+            <div className={DOCUMENT_PREVIEW_SURFACE_CLASS}>
               <pre
-                className="p-6 sm:p-10 leading-relaxed text-slate-800 font-mono whitespace-pre-wrap break-words transition-all duration-200 cursor-text select-text"
+                className={`${DOCUMENT_PREVIEW_BODY_CLASS} leading-relaxed text-slate-800 font-mono whitespace-pre-wrap break-words transition-all duration-200 cursor-text select-text`}
                 style={TEXT_SELECTION_STYLE}
               >
                 {preview.content}

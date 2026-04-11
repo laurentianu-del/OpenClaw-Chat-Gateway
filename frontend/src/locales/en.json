@@ -270,6 +270,7 @@
     "preview": "Preview",
     "deleteMessageTitle": "Delete this message?",
     "deleteMessageDescription": "This action will permanently remove the message from the conversation history and cannot be undone.",
+    "deleteMessageFailed": "Failed to delete message",
     "fileProcessingFailed": "File processing failed",
     "historyPagePromptOlder": "Scroll up again to view the earlier {{count}} rounds",
     "historyPagePromptNewer": "Scroll down again to view the newer {{count}} rounds",

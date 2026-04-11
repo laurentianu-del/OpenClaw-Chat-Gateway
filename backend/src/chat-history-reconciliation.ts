@@ -19,6 +19,13 @@ export type AssistantOutcomeRecord =
   | { kind: 'text'; text: string; timestampMs: number | null }
   | { kind: 'error'; error: string; timestampMs: number | null };
 
+export type HistoryTailActivity = {
+  hasChanges: boolean;
+  latestSignature: string;
+  latestTimestampMs: number | null;
+  length: number;
+};
+
 const NON_TERMINAL_ASSISTANT_STOP_REASONS = new Set([
   'tooluse',
   'tool_use',
@@ -32,6 +39,15 @@ function getMessageStopReason(message: any): string {
   const normalizedMessage = normalizeOpenClawMessageRecord(message);
   const stopReason = [normalizedMessage?.stopReason, normalizedMessage?.stop_reason].find((value) => typeof value === 'string');
   return typeof stopReason === 'string' ? stopReason.trim().toLowerCase() : '';
+}
+
+export function isNonTerminalAssistantMessage(message: any): boolean {
+  const normalizedMessage = normalizeOpenClawMessageRecord(message);
+  if (normalizedMessage?.role !== 'assistant') {
+    return false;
+  }
+
+  return NON_TERMINAL_ASSISTANT_STOP_REASONS.has(getMessageStopReason(normalizedMessage));
 }
 
 function getMessageTimestampMs(message: any): number | null {
@@ -124,6 +140,18 @@ export function getHistorySnapshot(historyPayload: any): ChatHistorySnapshot {
   return {
     length: messages.length,
     latestSignature: createHistoryMessageSignature(latestMessage),
+  };
+}
+
+export function getHistoryTailActivity(historyPayload: any, baseline: ChatHistorySnapshot): HistoryTailActivity {
+  const messages = Array.isArray(historyPayload?.messages) ? historyPayload.messages : [];
+  const latestMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+
+  return {
+    hasChanges: hasHistoryTailChanges(messages, baseline),
+    latestSignature: createHistoryMessageSignature(latestMessage),
+    latestTimestampMs: getMessageTimestampMs(latestMessage),
+    length: messages.length,
   };
 }
 

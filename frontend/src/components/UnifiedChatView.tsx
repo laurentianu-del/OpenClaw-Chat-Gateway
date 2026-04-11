@@ -662,6 +662,7 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [messageToDelete, setMessageToDelete] = useState<string | null>(null);
+  const [deleteErrorMessage, setDeleteErrorMessage] = useState('');
   const [fileErrorModalOpen, setFileErrorModalOpen] = useState(false);
   const [fileErrorMessage, setFileErrorMessage] = useState('');
   const [isInitialLoading, setIsInitialLoading] = useState(false);
@@ -2372,9 +2373,27 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
             setTypingAgents(new Map());
           }
         } else if (parsed.type === 'delete') {
-          dropQueuedMessagePatch(String(parsed.id));
-          setActiveLeafId(prev => prev === String(parsed.id) ? (parsed.parent_id ? String(parsed.parent_id) : null) : prev);
-          setMessages(prev => prev.filter(m => m.id !== String(parsed.id)));
+          const deletedIds = Array.isArray(parsed.deletedIds)
+            ? parsed.deletedIds.map((id: number | string) => String(id))
+            : (parsed.id !== undefined ? [String(parsed.id)] : []);
+          const deletedIdSet = new Set(deletedIds);
+          const fallbackParentId = typeof parsed.fallbackParentId === 'number' || typeof parsed.fallbackParentId === 'string'
+            ? String(parsed.fallbackParentId)
+            : (parsed.parent_id ? String(parsed.parent_id) : null);
+          deletedIds.forEach((id: string) => dropQueuedMessagePatch(id));
+          setMessages(prev => {
+            const nextMessages = prev.filter((message) => !deletedIdSet.has(message.id));
+            setActiveLeafId((prevLeaf) => {
+              if (!prevLeaf || !deletedIdSet.has(prevLeaf)) {
+                return prevLeaf;
+              }
+              if (fallbackParentId && nextMessages.some((message) => message.id === fallbackParentId)) {
+                return fallbackParentId;
+              }
+              return getPreferredLeafId(nextMessages);
+            });
+            return nextMessages;
+          });
         } else if (parsed.type === 'delta') {
           if (!messagesRef.current.some(message => message.id === String(parsed.id))) {
             upsertGroupStreamMessage(parsed);
@@ -2530,26 +2549,65 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
 
   const handleQuote = (msg: ChatMessage) => { setQuotedMessage(msg); textareaRef.current?.focus(); };
 
-  const handleDeleteMessage = (msgId: string) => { setMessageToDelete(msgId); setIsDeleteModalOpen(true); };
+  const handleDeleteMessage = (msgId: string) => {
+    setDeleteErrorMessage('');
+    setMessageToDelete(msgId);
+    setIsDeleteModalOpen(true);
+  };
 
   const confirmDeleteMessage = async () => {
     if (!messageToDelete) return;
+    let didDelete = false;
     try {
       clearNewerHistoryWindowTrail();
       if (isChat) {
         const res = await fetch(`/api/messages/${messageToDelete}`, { method: 'DELETE' });
         const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          const deletedIds = Array.isArray(data?.deletedIds)
-            ? new Set<string>(data.deletedIds.map((id: number | string) => String(id)))
-            : new Set<string>([messageToDelete]);
-          setMessages(prev => prev.filter(m => !deletedIds.has(m.id)));
+        if (!res.ok) {
+          throw new Error(typeof data?.error === 'string' ? data.error : '');
         }
+        const deletedIds = Array.isArray(data?.deletedIds)
+          ? new Set<string>(data.deletedIds.map((id: number | string) => String(id)))
+          : new Set<string>([messageToDelete]);
+        setMessages(prev => prev.filter(m => !deletedIds.has(m.id)));
+        didDelete = true;
       } else if (isGroup && currentGroup) {
-        await fetch(`/api/groups/${currentGroup.id}/messages/${messageToDelete}`, { method: 'DELETE' });
+        const res = await fetch(`/api/groups/${currentGroup.id}/messages/${messageToDelete}`, { method: 'DELETE' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(typeof data?.error === 'string' ? data.error : '');
+        }
+        const deletedIds = Array.isArray(data?.deletedIds)
+          ? new Set<string>(data.deletedIds.map((id: number | string) => String(id)))
+          : new Set<string>([messageToDelete]);
+        const fallbackParentId = typeof data?.fallbackParentId === 'number' || typeof data?.fallbackParentId === 'string'
+          ? String(data.fallbackParentId)
+          : null;
+        setMessages(prev => {
+          const nextMessages = prev.filter((message) => !deletedIds.has(message.id));
+          setActiveLeafId((prevLeaf) => {
+            if (!prevLeaf || !deletedIds.has(prevLeaf)) {
+              return prevLeaf;
+            }
+            if (fallbackParentId && nextMessages.some((message) => message.id === fallbackParentId)) {
+              return fallbackParentId;
+            }
+            return getPreferredLeafId(nextMessages);
+          });
+          return nextMessages;
+        });
+        didDelete = true;
       }
-    } catch {}
-    finally { setIsDeleteModalOpen(false); setMessageToDelete(null); }
+    } catch (error: any) {
+      const detail = typeof error?.message === 'string' ? error.message.trim() : '';
+      setDeleteErrorMessage(detail ? `${t('unifiedChat.deleteMessageFailed')}\n${detail}` : t('unifiedChat.deleteMessageFailed'));
+    } finally {
+      if (didDelete) {
+        setDeleteErrorMessage('');
+        setIsDeleteModalOpen(false);
+        setMessageToDelete(null);
+      }
+    }
   };
 
   const handleSaveEdit = async () => {
@@ -3021,6 +3079,16 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
         if (response.ok) {
           setGroupRunState({ active: false, agentId: null, runId: null, startedAt: null });
           setTypingAgents(new Map());
+          await recoverLatestGroupMessages(true);
+          const recovery = await recoverGroupActiveRun();
+          if (recovery.runState) {
+            setGroupRunState(recovery.runState);
+          } else {
+            setGroupRunState({ active: false, agentId: null, runId: null, startedAt: null });
+          }
+          if (!recovery.active) {
+            setTypingAgents(new Map());
+          }
         }
       } catch {}
       return;
@@ -3606,7 +3674,36 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                 <div className="mx-4 mt-3 mb-1 px-3 py-2 bg-gray-100 rounded-lg relative group flex items-start justify-between animate-in fade-in slide-in-from-bottom-2">
                   <div className="flex-1 min-w-0 pr-4">
                     <span className="text-[11px] font-bold text-gray-500 mb-0.5 block tracking-wider">{t('unifiedChat.quotedContent')}</span>
-                    <div className="text-[13px] text-gray-700 line-clamp-2 break-words text-ellipsis overflow-hidden">{quotedMessage.content}</div>
+                    <div className="max-h-28 overflow-hidden prose prose-sm max-w-none prose-slate text-[13px] text-gray-700 break-words">
+                      {(() => {
+                        const processStart = (isGroup ? currentGroup?.process_start_tag : currentSession?.process_start_tag) || '[执行工作_Start]';
+                        const processEnd = (isGroup ? currentGroup?.process_end_tag : currentSession?.process_end_tag) || '[执行工作_End]';
+                        const processed = normalizeProcessBlocks(quotedMessage.content, processStart, processEnd);
+                        const previewComponents: any = {
+                          pre({ children }: any) { return <>{children}</>; },
+                          code({ node, inline, className, children, ...props }: any) {
+                            const match = /language-([^\s]+)/.exec(className || '');
+                            const codeText = children ? String(children).replace(/\n$/, '') : '';
+                            if (!inline && match && (match[1] === 'process_step_thought' || match[1] === 'process_step_thought_streaming')) {
+                              return (
+                                <ProcessStepBlock
+                                  content={codeText.trim()}
+                                  initiallyExpanded={false}
+                                  isExtractingProcess={match[1] === 'process_step_thought_streaming'}
+                                  isDense
+                                />
+                              );
+                            }
+                            return <code className={className} {...props}>{children}</code>;
+                          }
+                        };
+                        return (
+                          <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={previewComponents}>
+                            {processed}
+                          </ReactMarkdown>
+                        );
+                      })()}
+                    </div>
                   </div>
                   <button type="button" onClick={() => setQuotedMessage(null)} className="p-1.5 text-gray-400 hover:text-gray-700 rounded-full hover:bg-gray-200 transition-all flex-shrink-0"><X className="w-4 h-4" /></button>
                 </div>
@@ -3716,15 +3813,20 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       {/* Delete Confirmation Modal */}
       {isDeleteModalOpen && (
         <div className="fixed inset-0 z-[300] flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity animate-in fade-in duration-200" onClick={() => setIsDeleteModalOpen(false)}></div>
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity animate-in fade-in duration-200" onClick={() => { setDeleteErrorMessage(''); setIsDeleteModalOpen(false); }}></div>
           <div className="bg-white rounded-[32px] border border-gray-200 w-full max-w-[340px] max-h-[calc(100vh-2rem)] overflow-y-auto relative z-10 animate-in fade-in zoom-in-95 duration-200">
             <div className="p-8 text-center">
               <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-3xl bg-red-50 mb-6 border border-red-100"><Trash2 className="h-8 w-8 text-red-500" /></div>
               <h3 className="text-xl font-black text-gray-900 mb-2 tracking-tight">{t('unifiedChat.deleteMessageTitle')}</h3>
               <p className="text-sm text-gray-500 leading-relaxed px-2">{t('unifiedChat.deleteMessageDescription')}</p>
+              {deleteErrorMessage ? (
+                <p className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-left text-sm whitespace-pre-line text-red-600">
+                  {deleteErrorMessage}
+                </p>
+              ) : null}
             </div>
             <div className="p-5 bg-gray-50/80 flex gap-3 border-t border-gray-100">
-              <button type="button" onClick={() => setIsDeleteModalOpen(false)} className="flex-1 px-4 py-3 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 active:scale-95 rounded-2xl font-bold text-sm transition-all">{t('common.cancel')}</button>
+              <button type="button" onClick={() => { setDeleteErrorMessage(''); setIsDeleteModalOpen(false); }} className="flex-1 px-4 py-3 text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 active:scale-95 rounded-2xl font-bold text-sm transition-all">{t('common.cancel')}</button>
               <button type="button" onClick={confirmDeleteMessage} className="flex-1 px-4 py-3 text-white bg-red-600 hover:bg-red-700 active:scale-95 rounded-2xl font-bold text-sm transition-all">{t('common.confirmDelete')}</button>
             </div>
           </div>

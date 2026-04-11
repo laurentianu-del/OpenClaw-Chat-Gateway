@@ -23,6 +23,7 @@ import {
   getGroupRuntimeAgentPrefix,
   getLegacyGroupRuntimeAgentId,
   getGroupRuntimeAgentId,
+  removeGroupWorkspaceBootstrapFiles,
   getSharedGroupRuntimeAgentId,
   resetGroupWorkspace,
   validateGroupId,
@@ -50,7 +51,9 @@ import {
   type ChatHistorySnapshot,
   extractLatestAssistantOutcomeRecord,
   extractSettledAssistantOutcome,
+  getHistoryTailActivity,
   getHistorySnapshot,
+  isNonTerminalAssistantMessage,
   shouldPreferSettledAssistantText,
 } from './chat-history-reconciliation';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
@@ -248,6 +251,7 @@ const CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS = 30000;
 const CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS = 500;
 const CHAT_FINAL_EVENT_SETTLE_GRACE_MS = 1500;
 const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const CHAT_HISTORY_ACTIVITY_GRACE_MS = 2 * 60 * 1000;
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
 const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
@@ -4973,6 +4977,7 @@ if (mainRegistered) {
 for (const group of db.getGroupChats()) {
   try {
     cleanupLegacyGroupRuntimeArtifacts(group.id);
+    removeGroupWorkspaceBootstrapFiles(group.id);
   } catch (error) {
     console.error(`[Startup] Failed to cleanup legacy runtime artifacts for group ${group.id}:`, error);
   }
@@ -5044,17 +5049,6 @@ async function prepareOutgoingMessage(
 }
 
 const connections = new Map<string, OpenClawClient>();
-const GROUP_RUNTIME_WORKSPACE_RESERVED_ROOT_ENTRIES = new Set([
-  '.git',
-  '.openclaw',
-  'AGENTS.md',
-  'BOOTSTRAP.md',
-  'HEARTBEAT.md',
-  'IDENTITY.md',
-  'SOUL.md',
-  'TOOLS.md',
-  'USER.md',
-]);
 const AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES = new Set([
   'AGENTS.md',
   'BOOTSTRAP.md',
@@ -5157,67 +5151,6 @@ function resetAgentRuntimeStateToInitialState(agentId: string): void {
   }
 }
 
-function createMigratedConflictPath(targetPath: string): string {
-  const parsed = path.parse(targetPath);
-  let attempt = 0;
-
-  while (true) {
-    attempt += 1;
-    const candidate = path.join(parsed.dir, `${parsed.name}.migrated-${attempt}${parsed.ext}`);
-    if (!fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-}
-
-function migrateGroupRuntimeWorkspaceContents(sourceDir: string, targetDir: string, rootLevel = true): void {
-  if (!fs.existsSync(sourceDir) || sourceDir === targetDir) return;
-
-  fs.mkdirSync(targetDir, { recursive: true });
-
-  for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
-    if (rootLevel && GROUP_RUNTIME_WORKSPACE_RESERVED_ROOT_ENTRIES.has(entry.name)) {
-      continue;
-    }
-
-    const sourcePath = path.join(sourceDir, entry.name);
-    const targetPath = path.join(targetDir, entry.name);
-
-    if (entry.isDirectory()) {
-      if (!fs.existsSync(targetPath)) {
-        fs.renameSync(sourcePath, targetPath);
-        continue;
-      }
-
-      if (!fs.statSync(targetPath).isDirectory()) {
-        fs.renameSync(sourcePath, createMigratedConflictPath(targetPath));
-        continue;
-      }
-
-      migrateGroupRuntimeWorkspaceContents(sourcePath, targetPath, false);
-      if (fs.existsSync(sourcePath) && fs.readdirSync(sourcePath).length === 0) {
-        fs.rmdirSync(sourcePath);
-      }
-      continue;
-    }
-
-    if (entry.isFile()) {
-      if (!fs.existsSync(targetPath)) {
-        fs.renameSync(sourcePath, targetPath);
-      } else {
-        fs.renameSync(sourcePath, createMigratedConflictPath(targetPath));
-      }
-      continue;
-    }
-
-    if (!fs.existsSync(targetPath)) {
-      fs.renameSync(sourcePath, targetPath);
-    } else {
-      fs.rmSync(sourcePath, { recursive: true, force: true });
-    }
-  }
-}
-
 function readRuntimeSessionCwd(sessionFilePath: string): string | null {
   if (!fs.existsSync(sessionFilePath)) return null;
 
@@ -5254,6 +5187,9 @@ function runtimeAgentSessionsNeedWorkspaceReset(agentId: string, workspacePath: 
         const sessionFile = typeof (record as { sessionFile?: unknown }).sessionFile === 'string'
           ? (record as { sessionFile: string }).sessionFile
           : null;
+        if (sessionFile && !fs.existsSync(sessionFile)) {
+          return true;
+        }
         const cwd = sessionFile ? readRuntimeSessionCwd(sessionFile) : null;
         if (cwd && path.resolve(cwd) !== expectedWorkspace) {
           return true;
@@ -5403,9 +5339,96 @@ type GroupReconciliationAction =
 
 const DEFAULT_PROCESS_START_TAG = '[执行工作_Start]';
 const DEFAULT_PROCESS_END_TAG = '[执行工作_End]';
+const GROUP_RECONCILIATION_RETRY_COOLDOWN_MS = 8000;
+const groupReconciliationInFlight = new Map<string, Promise<GroupReconciliationAction[]>>();
+const groupReconciliationCooldown = new Map<string, { fingerprint: string; attemptedAt: number }>();
 
 function escapeRegExpForPattern(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function getGroupReconciliationFingerprint(
+  latestMessageId: number,
+  currentContent: string,
+  sourceAgentId: string,
+  staleMessageIds: number[],
+  isFailureRecovery: boolean,
+): string {
+  const normalized = currentContent.trim();
+  const head = normalized.slice(0, 120);
+  const tail = normalized.length > 120 ? normalized.slice(-120) : normalized;
+  const staleIdsKey = staleMessageIds.length > 0 ? staleMessageIds.join(',') : '-';
+  return [
+    latestMessageId,
+    sourceAgentId || '-',
+    isFailureRecovery ? 'failure' : 'history',
+    normalized.length,
+    staleIdsKey,
+    head,
+    tail,
+  ].join('|');
+}
+
+function shouldSkipGroupReconciliation(groupId: string, fingerprint: string): boolean {
+  const cached = groupReconciliationCooldown.get(groupId);
+  if (!cached) return false;
+  if (cached.fingerprint !== fingerprint) return false;
+  return (Date.now() - cached.attemptedAt) < GROUP_RECONCILIATION_RETRY_COOLDOWN_MS;
+}
+
+function rememberGroupReconciliationAttempt(groupId: string, fingerprint: string): void {
+  groupReconciliationCooldown.set(groupId, {
+    fingerprint,
+    attemptedAt: Date.now(),
+  });
+}
+
+function createNextGroupRuntimeSessionEpoch(previousEpoch?: number | null): number {
+  const current = Date.now();
+  const normalizedPrevious = Number.isFinite(previousEpoch as number) ? Math.floor(Number(previousEpoch)) : 0;
+  return current > normalizedPrevious ? current : normalizedPrevious + 1;
+}
+
+function getGroupRuntimeContext(groupId: string, sourceAgentId: string): {
+  runtimeAgentId: string;
+  workspacePath: string;
+  uploadsPath: string;
+  outputPath: string;
+} {
+  const { workspacePath, uploadsPath, outputPath } = ensureGroupWorkspace(groupId);
+  return {
+    runtimeAgentId: getGroupRuntimeAgentId(groupId, sourceAgentId),
+    workspacePath,
+    uploadsPath,
+    outputPath,
+  };
+}
+
+async function readGroupRuntimeHistoryForReconciliation(groupId: string, sourceAgentId: string): Promise<{
+  runtimeContext: {
+    runtimeAgentId: string;
+    workspacePath: string;
+    uploadsPath: string;
+    outputPath: string;
+  };
+  history: any[];
+}> {
+  const runtimeContext = getGroupRuntimeContext(groupId, sourceAgentId);
+  const group = db.getGroupChat(groupId);
+  const finalSessionKey = `agent:${runtimeContext.runtimeAgentId}:chat:${getGroupRuntimeSessionKey(groupId, group?.runtime_session_epoch)}`;
+
+  try {
+    const client = await getConnection(runtimeContext.runtimeAgentId);
+    const history = await client.getChatHistory(finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+    return { runtimeContext, history };
+  } catch (error) {
+    const preparedRuntimeContext = await prepareGroupRuntimeAgent(groupId, sourceAgentId);
+    const preparedGroup = db.getGroupChat(groupId);
+    const preparedFinalSessionKey = `agent:${preparedRuntimeContext.runtimeAgentId}:chat:${getGroupRuntimeSessionKey(groupId, preparedGroup?.runtime_session_epoch)}`;
+    const client = await getConnection(preparedRuntimeContext.runtimeAgentId);
+    const history = await client.getChatHistory(preparedFinalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+    return { runtimeContext: preparedRuntimeContext, history };
+  }
 }
 
 function getGroupProcessTagPairs(groupId: string, agentId?: string): Array<{ startTag: string; endTag: string }> {
@@ -5499,6 +5522,7 @@ async function reconcileInactiveGroupLatestMessage(groupId: string): Promise<Gro
   if (!latestAgentLikeMessage?.id) {
     return actions;
   }
+  const latestAgentLikeMessageId = latestAgentLikeMessage.id;
 
   const latestNonSystemAgentMessage = [...recentMessages].reverse().find((message) => (
     message.sender_type === 'agent'
@@ -5506,11 +5530,6 @@ async function reconcileInactiveGroupLatestMessage(groupId: string): Promise<Gro
     && !!message.sender_id
     && message.sender_id !== 'system'
   ));
-  const latestStoredMessage = recentMessages.length > 0 ? recentMessages[recentMessages.length - 1] : null;
-  const latestStoredMessageIsAgent = !!latestStoredMessage
-    && typeof latestStoredMessage.id === 'number'
-    && latestStoredMessage.id === latestAgentLikeMessage.id
-    && latestStoredMessage.sender_type === 'agent';
   const currentContent = typeof latestAgentLikeMessage.content === 'string' ? latestAgentLikeMessage.content : '';
   const currentStructured = getStructuredGroupMessage(currentContent);
   const isLatestSystemFailureMessage = latestAgentLikeMessage.sender_id === 'system'
@@ -5538,108 +5557,132 @@ async function reconcileInactiveGroupLatestMessage(groupId: string): Promise<Gro
     ? (latestAgentLikeMessage.sender_name || sourceAgentId)
     : (matchedMember?.display_name || sourceAgentName || latestNonSystemAgentMessage?.sender_name || sourceAgentId);
   const processTagPairs = getGroupProcessTagPairs(groupId, sourceAgentId);
-  const shouldAttemptHistoryReconciliation = latestStoredMessageIsAgent
-    || actions.length > 0
-    || isLikelyStaleInactiveGroupMessage(currentContent, processTagPairs);
+  const currentMessageLooksStale = isLikelyStaleInactiveGroupMessage(currentContent, processTagPairs);
+  const shouldAttemptHistoryReconciliation = actions.length > 0 || currentMessageLooksStale;
   const shouldAttemptFailureRecovery = isLatestSystemFailureMessage;
 
   if (!shouldAttemptHistoryReconciliation && !shouldAttemptFailureRecovery) {
     return actions;
   }
 
-  try {
-    const runtimeContext = await prepareGroupRuntimeAgent(groupId, sourceAgentId);
-    const client = await getConnection(runtimeContext.runtimeAgentId);
-    const finalSessionKey = `agent:${runtimeContext.runtimeAgentId}:chat:${getGroupRuntimeSessionKey(groupId)}`;
-    const history = await client.getChatHistory(finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
-    const latestOutcomeRecord = extractLatestAssistantOutcomeRecord(history);
-    const latestOutcome = latestOutcomeRecord.kind === 'text'
-      ? { kind: 'text' as const, text: latestOutcomeRecord.text }
-      : latestOutcomeRecord.kind === 'error'
-        ? { kind: 'error' as const, error: latestOutcomeRecord.error }
-        : { kind: 'none' as const };
-    const latestMessageCreatedAtMs = Date.parse(latestAgentLikeMessage.created_at || '');
-    const historyIsNewerThanCurrentMessage = latestOutcomeRecord.timestampMs !== null
-      && Number.isFinite(latestMessageCreatedAtMs)
-      && latestOutcomeRecord.timestampMs > latestMessageCreatedAtMs;
+  const reconciliationFingerprint = getGroupReconciliationFingerprint(
+    latestAgentLikeMessageId,
+    currentContent,
+    sourceAgentId,
+    staleMessageIds,
+    shouldAttemptFailureRecovery,
+  );
+  if (shouldSkipGroupReconciliation(groupId, reconciliationFingerprint)) {
+    return actions;
+  }
 
-    if (latestOutcome.kind === 'none') {
-      return actions;
-    }
+  const inFlightKey = `${groupId}:${reconciliationFingerprint}`;
+  const existingInFlight = groupReconciliationInFlight.get(inFlightKey);
+  if (existingInFlight) {
+    const sharedActions = await existingInFlight;
+    return actions.concat(sharedActions);
+  }
 
-    if (latestOutcome.kind === 'error') {
-      const { content, messageCode, messageParams, rawDetail } = createAgentResponseFailedMessage(
-        sourceAgentDisplayName,
-        latestOutcome.error,
+  const reconciliationPromise = (async (): Promise<GroupReconciliationAction[]> => {
+    const reconciliationActions: GroupReconciliationAction[] = [];
+    try {
+      const { history } = await readGroupRuntimeHistoryForReconciliation(groupId, sourceAgentId);
+      const latestOutcomeRecord = extractLatestAssistantOutcomeRecord(history);
+      const latestOutcome = latestOutcomeRecord.kind === 'text'
+        ? { kind: 'text' as const, text: latestOutcomeRecord.text }
+        : latestOutcomeRecord.kind === 'error'
+          ? { kind: 'error' as const, error: latestOutcomeRecord.error }
+          : { kind: 'none' as const };
+      const latestMessageCreatedAtMs = Date.parse(latestAgentLikeMessage.created_at || '');
+      const historyIsNewerThanCurrentMessage = latestOutcomeRecord.timestampMs !== null
+        && Number.isFinite(latestMessageCreatedAtMs)
+        && latestOutcomeRecord.timestampMs > latestMessageCreatedAtMs;
+
+      if (latestOutcome.kind === 'none') {
+        return reconciliationActions;
+      }
+
+      if (latestOutcome.kind === 'error') {
+        const { content, messageCode, messageParams, rawDetail } = createAgentResponseFailedMessage(
+          sourceAgentDisplayName,
+          latestOutcome.error,
+        );
+
+        if (
+          latestAgentLikeMessage.content.trim() !== content.trim()
+          || latestAgentLikeMessage.sender_id !== 'system'
+          || latestAgentLikeMessage.sender_name !== '系统'
+        ) {
+          const modelUsed = latestAgentLikeMessage.model_used || agentProvisioner.readAgentModel(sourceAgentId) || undefined;
+          db.updateGroupMessage(latestAgentLikeMessageId, content, modelUsed, null);
+          db.updateGroupMessageSender(latestAgentLikeMessageId, 'system', '系统');
+          reconciliationActions.push({
+            type: 'edit',
+            data: {
+              groupId,
+              id: latestAgentLikeMessageId,
+              parent_id: typeof latestAgentLikeMessage.parent_id === 'number' ? latestAgentLikeMessage.parent_id : null,
+              sender_type: 'agent',
+              sender_id: 'system',
+              sender_name: '系统',
+              content,
+              model_used: modelUsed,
+              messageCode,
+              messageParams,
+              rawDetail,
+              created_at: latestAgentLikeMessage.created_at || new Date().toISOString(),
+            },
+          });
+        }
+
+        return reconciliationActions;
+      }
+
+      const allowShorterHistoryReplacement = isLatestSystemFailureMessage && historyIsNewerThanCurrentMessage;
+      const preferredLatestText = selectPreferredTextSnapshot(currentContent, latestOutcome.text, {
+        allowShorterReplacement: allowShorterHistoryReplacement,
+      });
+      const shouldReplaceWithHistoryText = preferredLatestText === latestOutcome.text && (
+        shouldPreferSettledAssistantText(currentContent, latestOutcome.text)
+        || (
+          currentMessageLooksStale
+          && latestOutcome.text.trim() !== currentContent.trim()
+        )
+        || allowShorterHistoryReplacement
       );
 
-      if (
-        latestAgentLikeMessage.content.trim() !== content.trim()
-        || latestAgentLikeMessage.sender_id !== 'system'
-        || latestAgentLikeMessage.sender_name !== '系统'
-      ) {
+      if (shouldReplaceWithHistoryText) {
         const modelUsed = latestAgentLikeMessage.model_used || agentProvisioner.readAgentModel(sourceAgentId) || undefined;
-        db.updateGroupMessage(latestAgentLikeMessage.id, content, modelUsed, null);
-        db.updateGroupMessageSender(latestAgentLikeMessage.id, 'system', '系统');
-        actions.push({
+        db.updateGroupMessage(latestAgentLikeMessageId, preferredLatestText, modelUsed, latestAgentLikeMessage.mentions || null);
+        db.updateGroupMessageSender(latestAgentLikeMessageId, sourceAgentId, sourceAgentDisplayName);
+        reconciliationActions.push({
           type: 'edit',
           data: {
             groupId,
-            id: latestAgentLikeMessage.id,
+            id: latestAgentLikeMessageId,
             parent_id: typeof latestAgentLikeMessage.parent_id === 'number' ? latestAgentLikeMessage.parent_id : null,
             sender_type: 'agent',
-            sender_id: 'system',
-            sender_name: '系统',
-            content,
+            sender_id: sourceAgentId,
+            sender_name: sourceAgentDisplayName,
+            content: preferredLatestText,
             model_used: modelUsed,
-            messageCode,
-            messageParams,
-            rawDetail,
             created_at: latestAgentLikeMessage.created_at || new Date().toISOString(),
           },
         });
       }
-
-      return actions;
+    } catch (error) {
+      console.warn(`[GroupReconcile] Failed to reconcile latest inactive message for group ${groupId}:`, error);
+    } finally {
+      rememberGroupReconciliationAttempt(groupId, reconciliationFingerprint);
+      groupReconciliationInFlight.delete(inFlightKey);
     }
 
-    const allowShorterHistoryReplacement = isLatestSystemFailureMessage && historyIsNewerThanCurrentMessage;
-    const preferredLatestText = selectPreferredTextSnapshot(currentContent, latestOutcome.text, {
-      allowShorterReplacement: allowShorterHistoryReplacement,
-    });
-    const shouldReplaceWithHistoryText = preferredLatestText === latestOutcome.text && (
-      shouldPreferSettledAssistantText(currentContent, latestOutcome.text)
-      || (
-        isLikelyStaleInactiveGroupMessage(currentContent, processTagPairs)
-        && latestOutcome.text.trim() !== currentContent.trim()
-      )
-      || allowShorterHistoryReplacement
-    );
+    return reconciliationActions;
+  })();
 
-    if (shouldReplaceWithHistoryText) {
-      const modelUsed = latestAgentLikeMessage.model_used || agentProvisioner.readAgentModel(sourceAgentId) || undefined;
-      db.updateGroupMessage(latestAgentLikeMessage.id, preferredLatestText, modelUsed, latestAgentLikeMessage.mentions || null);
-      db.updateGroupMessageSender(latestAgentLikeMessage.id, sourceAgentId, sourceAgentDisplayName);
-      actions.push({
-        type: 'edit',
-        data: {
-          groupId,
-          id: latestAgentLikeMessage.id,
-          parent_id: typeof latestAgentLikeMessage.parent_id === 'number' ? latestAgentLikeMessage.parent_id : null,
-          sender_type: 'agent',
-          sender_id: sourceAgentId,
-          sender_name: sourceAgentDisplayName,
-          content: preferredLatestText,
-          model_used: modelUsed,
-          created_at: latestAgentLikeMessage.created_at || new Date().toISOString(),
-        },
-      });
-    }
-  } catch (error) {
-    console.warn(`[GroupReconcile] Failed to reconcile latest inactive message for group ${groupId}:`, error);
-  }
-
-  return actions;
+  groupReconciliationInFlight.set(inFlightKey, reconciliationPromise);
+  const reconciliationActions = await reconciliationPromise;
+  return actions.concat(reconciliationActions);
 }
 
 function broadcastGroupReconciliationActions(groupId: string, actions: GroupReconciliationAction[], targetClients?: Iterable<express.Response>) {
@@ -5760,28 +5803,19 @@ async function prepareGroupRuntimeAgent(groupId: string, sourceAgentId: string):
 }> {
   const { workspacePath, uploadsPath, outputPath } = ensureGroupWorkspace(groupId);
   const runtimeAgentId = getGroupRuntimeAgentId(groupId, sourceAgentId);
-  const runtimeDefaultWorkspacePath = agentProvisioner.getWorkspacePath(runtimeAgentId);
+  const runtimeWorkspacePath = agentProvisioner.getWorkspacePath(sourceAgentId);
   const sourceModelConfig = agentProvisioner.readAgentModelConfig(sourceAgentId);
 
   cleanupLegacyGroupRuntimeArtifacts(groupId);
+  removeGroupWorkspaceBootstrapFiles(groupId);
 
-  const hasLegacyRuntimeWorkspace = (
-    runtimeDefaultWorkspacePath !== workspacePath
-    && fs.existsSync(runtimeDefaultWorkspacePath)
-  );
-
-  if (hasLegacyRuntimeWorkspace) {
-    migrateGroupRuntimeWorkspaceContents(runtimeDefaultWorkspacePath, workspacePath);
-    fs.rmSync(runtimeDefaultWorkspacePath, { recursive: true, force: true });
-  }
-
-  if (hasLegacyRuntimeWorkspace || runtimeAgentSessionsNeedWorkspaceReset(runtimeAgentId, workspacePath)) {
+  if (runtimeAgentSessionsNeedWorkspaceReset(runtimeAgentId, runtimeWorkspacePath)) {
     resetRuntimeAgentSessions(runtimeAgentId);
   }
 
   await agentProvisioner.provision({
     agentId: runtimeAgentId,
-    workspaceDir: workspacePath,
+    workspaceDir: runtimeWorkspacePath,
     soulContent: agentProvisioner.readSoul(sourceAgentId) || undefined,
     userContent: agentProvisioner.readAgentFile(sourceAgentId, 'USER.md', ''),
     agentsContent: agentProvisioner.readAgentFile(sourceAgentId, 'AGENTS.md', ''),
@@ -5792,10 +5826,6 @@ async function prepareGroupRuntimeAgent(groupId: string, sourceAgentId: string):
     fallbackMode: sourceModelConfig.fallbackMode,
     fallbacks: sourceModelConfig.fallbacks,
   });
-
-  if (runtimeDefaultWorkspacePath !== workspacePath && fs.existsSync(runtimeDefaultWorkspacePath)) {
-    fs.rmSync(runtimeDefaultWorkspacePath, { recursive: true, force: true });
-  }
 
   return {
     runtimeAgentId,
@@ -7185,6 +7215,9 @@ interface ActiveRun {
   finalEventGeneration: number;
   settledCalibrationGeneration: number;
   latestFinalEventAt?: number;
+  lastObservedHistoryLength: number;
+  lastObservedHistorySignature: string;
+  lastObservedHistoryActivityAt?: number;
   pendingErrorDetail?: string;
   clientRef?: OpenClawClient;
   cleanedUp?: boolean;
@@ -7202,6 +7235,9 @@ interface PendingChatPreparation {
 }
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
+  if (isNonTerminalAssistantMessage(message)) {
+    return '';
+  }
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
 }
 
@@ -7430,6 +7466,9 @@ class ActiveRunManager {
       finalEventGeneration: 0,
       settledCalibrationGeneration: 0,
       latestFinalEventAt: undefined,
+      lastObservedHistoryLength: historySnapshot.length,
+      lastObservedHistorySignature: historySnapshot.latestSignature,
+      lastObservedHistoryActivityAt: undefined,
       pendingErrorDetail: undefined,
       clientRef
     };
@@ -7459,13 +7498,13 @@ class ActiveRunManager {
         if (terminalFinalText) {
           run.finalEventText = selectPreferredTextSnapshot(run.finalEventText, terminalFinalText);
           run.text = selectPreferredTextSnapshot(run.text, terminalFinalText);
+          run.latestFinalEventAt = finalEventObservedAt;
+          run.finalEventGeneration += 1;
+          this.emitVisibleFinal(run, run.finalEventText || run.text);
         } else if (data.text) {
           run.text = selectPreferredTextSnapshot(run.text, data.text);
         }
-        run.latestFinalEventAt = finalEventObservedAt;
-        run.finalEventGeneration += 1;
         this.resetIdleTimeout(run);
-        this.emitVisibleFinal(run, run.finalEventText || run.text);
         this.scheduleCompletionProbe(run, 0);
       }
     };
@@ -7618,6 +7657,19 @@ class ActiveRunManager {
         const historyProbeStartedAt = Date.now();
         while ((Date.now() - historyProbeStartedAt) < CHAT_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS) {
           const history = await run.clientRef.getChatHistory(run.finalSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT);
+          const historyTailActivity = getHistoryTailActivity(history, run.historySnapshot);
+          if (
+            historyTailActivity.hasChanges
+            && (
+              historyTailActivity.length !== run.lastObservedHistoryLength
+              || historyTailActivity.latestSignature !== run.lastObservedHistorySignature
+            )
+          ) {
+            run.lastObservedHistoryLength = historyTailActivity.length;
+            run.lastObservedHistorySignature = historyTailActivity.latestSignature;
+            run.lastObservedHistoryActivityAt = Date.now();
+            this.resetIdleTimeout(run);
+          }
           const settledAssistantOutcome = extractSettledAssistantOutcome(history, run.historySnapshot);
           if (settledAssistantOutcome.kind === 'error') {
             settledErrorDetail = settledAssistantOutcome.error;
@@ -7684,6 +7736,16 @@ class ActiveRunManager {
 
       const isAwaitingInitialTerminalEvidence = run.finalEventGeneration === 0 && !hasSettledAssistantText;
       const isAwaitingSettledFinalCalibration = run.finalEventGeneration > run.settledCalibrationGeneration;
+      const hasRecentHistoryActivity = run.lastObservedHistoryActivityAt !== undefined
+        && (Date.now() - run.lastObservedHistoryActivityAt) < CHAT_HISTORY_ACTIVITY_GRACE_MS;
+
+      if (
+        (shouldRetryForEmptyCompletion || isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration)
+        && hasRecentHistoryActivity
+      ) {
+        this.scheduleCompletionProbe(run, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS);
+        return;
+      }
 
       if (
         shouldRetryForEmptyCompletion
@@ -7700,6 +7762,14 @@ class ActiveRunManager {
         && (Date.now() - run.firstCompletionWaitResolvedAt) < CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS
       ) {
         this.scheduleCompletionProbe(run, CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS);
+        return;
+      }
+
+      if ((isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration) && completedOutput.trim() && !pendingErrorDetail) {
+        console.warn(
+          `[ActiveRunManager] Finalizing run ${run.runId} for session ${run.sessionId} using streamed text fallback because terminal assistant evidence never settled.`,
+        );
+        this.finalizeRun(run, completedOutput);
         return;
       }
 
@@ -8970,6 +9040,7 @@ app.post('/api/groups', (req, res) => {
       process_start_tag: process_start_tag || '',
       process_end_tag: process_end_tag || '',
       max_chain_depth: max_chain_depth !== undefined ? max_chain_depth : 6,
+      runtime_session_epoch: createNextGroupRuntimeSessionEpoch(),
       position: maxPosition + 1,
       created_at: now,
       updated_at: now,
@@ -9022,6 +9093,7 @@ app.put('/api/groups/:id', (req, res) => {
       process_start_tag: process_start_tag ?? existing.process_start_tag,
       process_end_tag: process_end_tag ?? existing.process_end_tag,
       max_chain_depth: max_chain_depth ?? existing.max_chain_depth ?? 6,
+      runtime_session_epoch: existing.runtime_session_epoch ?? 0,
       position: existing.position ?? 0,
       updated_at: new Date().toISOString(),
     });
@@ -9098,6 +9170,11 @@ app.post('/api/groups/:id/reset', async (req, res) => {
     groupChatEngine.forceResetGroupState(req.params.id);
 
     // Restore the team runtime baseline while keeping the team definition.
+    db.saveGroupChat({
+      ...group,
+      runtime_session_epoch: createNextGroupRuntimeSessionEpoch(group.runtime_session_epoch),
+      updated_at: new Date().toISOString(),
+    });
     db.deleteGroupMessagesByGroup(req.params.id);
     clearStoredFilesBySessionKey(req.params.id);
     cleanupGroupRuntimeAgent(req.params.id, { removeConfig: true });
@@ -9216,28 +9293,31 @@ app.post('/api/groups/:id/stop', async (req, res) => {
       return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
     }
 
-    const result = await groupChatEngine.abortGroupRun(req.params.id);
+    groupChatEngine.markGroupReset(req.params.id);
+    const result = await groupChatEngine.abortGroupRun(req.params.id).catch((error) => {
+      console.warn(`[GroupStop] Failed to abort active run for group ${req.params.id}:`, error);
+      return { aborted: false };
+    });
+    groupChatEngine.forceResetGroupState(req.params.id);
     const cleanedMessageIds: number[] = [];
 
-    if (!result.aborted) {
-      const recentMessages = db.getRecentGroupMessages(req.params.id, 20);
-      const staleMessages = recentMessages.filter((message) => (
-        message.sender_type === 'agent'
-        && typeof message.content === 'string'
-        && message.content.trim() === ''
-      ));
+    const recentMessages = db.getRecentGroupMessages(req.params.id, 20);
+    const staleMessages = recentMessages.filter((message) => (
+      message.sender_type === 'agent'
+      && typeof message.content === 'string'
+      && message.content.trim() === ''
+    ));
 
-      if (staleMessages.length > 0) {
-        const clients = groupSSEClients.get(req.params.id);
-        for (const staleMessage of staleMessages) {
-          if (typeof staleMessage.id !== 'number') continue;
-          db.deleteGroupMessage(staleMessage.id);
-          cleanedMessageIds.push(staleMessage.id);
-          if (clients) {
-            const data = JSON.stringify({ type: 'delete', id: staleMessage.id, parent_id: staleMessage.parent_id ?? null });
-            for (const client of clients) {
-              try { client.write(`data: ${data}\n\n`); } catch {}
-            }
+    if (staleMessages.length > 0) {
+      const clients = groupSSEClients.get(req.params.id);
+      for (const staleMessage of staleMessages) {
+        if (typeof staleMessage.id !== 'number') continue;
+        db.deleteGroupMessage(staleMessage.id);
+        cleanedMessageIds.push(staleMessage.id);
+        if (clients) {
+          const data = JSON.stringify({ type: 'delete', id: staleMessage.id, parent_id: staleMessage.parent_id ?? null });
+          for (const client of clients) {
+            try { client.write(`data: ${data}\n\n`); } catch {}
           }
         }
       }
@@ -9269,14 +9349,20 @@ app.put('/api/groups/:id/messages/:msgId', (req, res) => {
 
 app.delete('/api/groups/:id/messages/:msgId', (req, res) => {
   try {
-    db.deleteGroupMessage(Number(req.params.msgId));
-    res.json({ success: true });
+    const deletedRows = db.deleteGroupMessage(Number(req.params.msgId)) as Array<{ id: number; parent_id: number | null }>;
+    if (!deletedRows.length) {
+      return res.status(404).json({ success: false, error: 'Message not found' });
+    }
+
+    const deletedIds = deletedRows.map((row) => row.id);
+    const fallbackParentId = deletedRows[0]?.parent_id ?? null;
+    res.json({ success: true, deletedIds, fallbackParentId });
 
     // Broadcast delete event
     const clients = groupSSEClients.get(req.params.id);
     if (clients) {
       clients.forEach(client => {
-        client.write(`data: ${JSON.stringify({ type: 'delete', id: Number(req.params.msgId) })}\n\n`);
+        client.write(`data: ${JSON.stringify({ type: 'delete', deletedIds, fallbackParentId })}\n\n`);
       });
     }
   } catch (err: any) {

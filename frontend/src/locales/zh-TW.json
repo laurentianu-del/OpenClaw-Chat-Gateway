@@ -270,6 +270,7 @@
     "preview": "預覽",
     "deleteMessageTitle": "確認刪除訊息？",
     "deleteMessageDescription": "此操作將永久從對話歷史中移除此訊息，且無法撤銷。",
+    "deleteMessageFailed": "刪除訊息失敗",
     "fileProcessingFailed": "檔案處理失敗",
     "historyPagePromptOlder": "繼續上滾查看更早的 {{count}} 輪",
     "historyPagePromptNewer": "繼續下滾查看更新的 {{count}} 輪",

@@ -7,6 +7,14 @@ const GROUP_RUNTIME_AGENT_PREFIX = 'group-';
 const LEGACY_GROUP_RUNTIME_AGENT_PREFIX = '__clawui_group_runtime__';
 const GROUP_RUNTIME_SESSION_PREFIX = 'group-session-';
 const GROUP_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const GROUP_WORKSPACE_BOOTSTRAP_FILENAMES = [
+  'SOUL.md',
+  'AGENTS.md',
+  'IDENTITY.md',
+  'USER.md',
+  'TOOLS.md',
+  'HEARTBEAT.md',
+] as const;
 
 export type GroupIdValidationIssue = 'required' | 'whitespace' | 'invalid';
 
@@ -74,6 +82,7 @@ export function ensureGroupWorkspace(groupId: string): GroupWorkspacePaths {
   fs.mkdirSync(workspacePath, { recursive: true });
   fs.mkdirSync(uploadsPath, { recursive: true });
   fs.mkdirSync(outputPath, { recursive: true });
+  removeGroupWorkspaceBootstrapFiles(groupId);
 
   return {
     workspacePath,
@@ -94,6 +103,20 @@ export function deleteGroupWorkspace(groupId: string): void {
   const workspacePath = getGroupWorkspacePath(groupId);
   if (fs.existsSync(workspacePath)) {
     fs.rmSync(workspacePath, { recursive: true, force: true });
+  }
+}
+
+export function removeGroupWorkspaceBootstrapFiles(groupId: string): void {
+  const workspacePath = getGroupWorkspacePath(groupId);
+  if (!fs.existsSync(workspacePath)) {
+    return;
+  }
+
+  for (const filename of GROUP_WORKSPACE_BOOTSTRAP_FILENAMES) {
+    const filePath = path.join(workspacePath, filename);
+    if (fs.existsSync(filePath)) {
+      fs.rmSync(filePath, { force: true });
+    }
   }
 }
 
@@ -118,8 +141,14 @@ export function getGroupRuntimeAgentId(groupId: string, sourceAgentId: string): 
   return `${getGroupRuntimeAgentPrefix(groupId)}${encodeRuntimeAgentSegment(sourceAgentId)}`;
 }
 
-export function getGroupRuntimeSessionKey(groupId: string): string {
+export function getGroupRuntimeSessionKey(groupId: string, runtimeSessionEpoch?: number | null): string {
   const normalizedId = assertValidGroupId(groupId);
+  const normalizedEpoch = Number.isFinite(runtimeSessionEpoch as number) && Number(runtimeSessionEpoch) > 0
+    ? Math.floor(Number(runtimeSessionEpoch))
+    : 0;
+  if (normalizedEpoch > 0) {
+    return `${GROUP_RUNTIME_SESSION_PREFIX}${normalizedId}-${normalizedEpoch}`;
+  }
   return `${GROUP_RUNTIME_SESSION_PREFIX}${normalizedId}`;
 }
 

@@ -8,7 +8,9 @@ import { extractOpenClawMessageText, type OpenClawClient } from './openclaw-clie
 import {
   type ChatHistorySnapshot,
   extractSettledAssistantOutcome,
+  getHistoryTailActivity,
   getHistorySnapshot,
+  isNonTerminalAssistantMessage,
   shouldPreferSettledAssistantText,
 } from './chat-history-reconciliation';
 import { EventEmitter } from 'events';
@@ -41,7 +43,14 @@ const GROUP_STREAM_COMPLETION_WAIT_TIMEOUT_MS = 1500;
 const GROUP_HISTORY_COMPLETION_PROBE_LIMIT = 60;
 const GROUP_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS = 30000;
 const GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS = 500;
+const GROUP_FINAL_EVENT_SETTLE_GRACE_MS = 1500;
 const GROUP_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
+const GROUP_HISTORY_ACTIVITY_GRACE_MS = 2 * 60 * 1000;
+const GROUP_CONTEXT_MESSAGE_MAX_CHARS = 900;
+const GROUP_CONTEXT_MESSAGE_HEAD_CHARS = 380;
+const GROUP_CONTEXT_MESSAGE_TAIL_CHARS = 380;
+const GROUP_CONTEXT_RECENT_WINDOW = 15;
+const GROUP_CONTEXT_EVIDENCE_LINE_PATTERN = /(`|https?:\/\/|\/|\\|\.|已执行|执行|启动|运行|浏览器|监听|地址|端口|日志|结果|存在|生成|导出|输出|完成|成功|失败|校验|验证|测试|created|running|started|output|result|verified|browser|url|path|port|listen)/i;
 const MAX_CHAIN_DEPTH_MESSAGE_CODE = 'group.maxChainDepthReached' as const;
 const MAX_CHAIN_DEPTH_MESSAGE_REGEX = /^链式转发已达到最大深度 \((\d+) 轮\)$/;
 const AGENT_RESPONSE_FAILED_MESSAGE_CODE = 'group.agentResponseFailed' as const;
@@ -91,7 +100,86 @@ class GroupResetInterruptedError extends Error {
 }
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
+  if (isNonTerminalAssistantMessage(message)) {
+    return '';
+  }
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
+}
+
+function escapeRegExpForPrompt(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeGroupPromptText(value: string): string {
+  return value
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function truncateGroupContextMessage(content: string): string {
+  const normalizedContent = normalizeGroupPromptText(content);
+  if (normalizedContent.length <= GROUP_CONTEXT_MESSAGE_MAX_CHARS) {
+    return normalizedContent;
+  }
+
+  const head = normalizedContent.slice(0, GROUP_CONTEXT_MESSAGE_HEAD_CHARS).trimEnd();
+  const tail = normalizedContent.slice(-GROUP_CONTEXT_MESSAGE_TAIL_CHARS).trimStart();
+  return `${head}\n...(中间省略)...\n${tail}`.trim();
+}
+
+function summarizeGroupProcessEvidence(content: string): string {
+  const normalizedContent = normalizeGroupPromptText(content);
+  if (!normalizedContent) return '';
+
+  const rawLines = normalizedContent
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (rawLines.length === 0) return '';
+
+  const evidenceLines = rawLines.filter(line => GROUP_CONTEXT_EVIDENCE_LINE_PATTERN.test(line));
+  const prioritizedLines = evidenceLines.length > 0 ? evidenceLines : rawLines;
+  return truncateGroupContextMessage(prioritizedLines.join('\n'));
+}
+
+function buildGroupContextMessageSummary(content: string, processStartTag?: string, processEndTag?: string): string {
+  const normalizedContent = normalizeGroupPromptText(content);
+  if (!normalizedContent) return '';
+
+  const startTag = processStartTag?.trim();
+  const endTag = processEndTag?.trim();
+  if (!startTag || !endTag) {
+    return truncateGroupContextMessage(normalizedContent);
+  }
+
+  const processRegex = new RegExp(
+    `${escapeRegExpForPrompt(startTag)}([\\s\\S]*?)(?:${escapeRegExpForPrompt(endTag)}|$)`,
+    'g',
+  );
+  const outsideProcessContent = normalizeGroupPromptText(normalizedContent.replace(processRegex, '\n\n'));
+  const processContent = Array.from(normalizedContent.matchAll(processRegex))
+    .map(match => normalizeGroupPromptText(match[1] || ''))
+    .filter(Boolean)
+    .join('\n\n');
+  const processEvidenceSummary = summarizeGroupProcessEvidence(processContent);
+
+  if (outsideProcessContent && processEvidenceSummary) {
+    return truncateGroupContextMessage(
+      `${outsideProcessContent}\n\n[过程证据摘要]\n${processEvidenceSummary}`,
+    );
+  }
+
+  if (outsideProcessContent) {
+    return truncateGroupContextMessage(outsideProcessContent);
+  }
+
+  if (processEvidenceSummary) {
+    return processEvidenceSummary;
+  }
+
+  return truncateGroupContextMessage(normalizedContent);
 }
 
 function isGroupHostTakeoverEnabled(): boolean {
@@ -421,8 +509,8 @@ export class GroupChatEngine extends EventEmitter {
       const normalizedContent = uploadsPath
         ? rewriteMessageWithWorkspaceUploads(m.content, uploadsPath, { extractImageAttachments: false }).text
         : m.content;
-      const truncated = normalizedContent.length > 500 ? normalizedContent.slice(0, 500) + '...(已截断)' : normalizedContent;
-      return `[${name}]: ${truncated}`;
+      const summary = buildGroupContextMessageSummary(normalizedContent, processStartTag, processEndTag);
+      return `[${name}]: ${summary}`;
     }).join('\n');
 
     // Build the dynamic contextual prompt
@@ -437,6 +525,8 @@ export class GroupChatEngine extends EventEmitter {
     if (hasProcessTags) {
       formatHeader += `规则${ruleIdx++}: 【工作记录汇报】在回复中，用以下标签包裹你的实际执行步骤、操作记录和中间结果（就像团队成员汇报工作进度一样）：\n${processStartTag}\n（在这里写你做了什么、执行了哪些操作、看到了什么结果）\n${processEndTag}\n标签外面写最终结论或给人的回复。这是团队协作的标准汇报格式，必须遵守！\n`;
     }
+
+    formatHeader += `规则${ruleIdx++}: 【以上下文为准】如果你之前的记忆、你自己更早的回复、或 OpenClaw 历史记忆，与下面提供的“团队对话历史 / 最新任务”冲突，必须以下面提供的内容为准，并明确纠正旧结论，不能抱着旧判断不放。\n`;
 
     if (remainingDepth === 0) {
       formatHeader += `规则${ruleIdx++}: 【禁止@他人】严禁在回复中出现 "@任何人" 的内容。必须独立完成任务，直接给出结论。\n`;
@@ -684,27 +774,14 @@ export class GroupChatEngine extends EventEmitter {
       const runtimeContext = await this.prepareGroupRuntime(groupId, agentId);
       this.throwIfGroupReset(groupId, effectiveResetEpoch);
       
-      // Token Optimization: OpenClaw gateway natively remembers history for 'sessionKey'.
-      // If we send the last 20 messages every turn, token usage explodes exponentially O(N^2).
-      // Solution: Only send messages that occurred SINCE this agent last spoke.
-      const allRecent = this.db.getGroupMessages(groupId, 100); 
-      let lastSpokeIdx = -1;
-      for (let i = allRecent.length - 1; i >= 0; i--) {
-        if (allRecent[i].sender_type === 'agent' && allRecent[i].sender_id === agentId) {
-          lastSpokeIdx = i;
-          break;
-        }
-      }
-      
-      let deltaMessages = [];
-      if (lastSpokeIdx === -1) {
-        // First time speaking in recent history, give initial context
-        deltaMessages = allRecent.slice(-15);
-      } else {
-        // Only include messages after the agent's last reply
-        deltaMessages = allRecent.slice(lastSpokeIdx + 1);
-        if (deltaMessages.length > 20) deltaMessages = deltaMessages.slice(-20);
-      }
+      // Always replay a recent summarized history window into the prompt.
+      // Relying on delta-only memory makes agents cling to stale session context after
+      // edits, resets, prompt-shaping fixes, or earlier misreads, and can also drop
+      // history entirely if the current placeholder message is included in the scan.
+      const allRecent = this.db
+        .getGroupMessages(groupId, 100)
+        .filter(message => message.id !== msgId);
+      const promptContextMessages = allRecent.slice(-GROUP_CONTEXT_RECENT_WINDOW);
       
       const isResetCommand = triggerMsg.trim() === '/new';
       const remainingDepth = maxDepth === 0 ? 0 : Math.max(0, maxDepth - depth);
@@ -743,7 +820,7 @@ export class GroupChatEngine extends EventEmitter {
           groupSysPrompt,
           member,
           members,
-          deltaMessages,
+          promptContextMessages,
           promptInput,
           triggerSenderName,
           processStartTag,
@@ -756,7 +833,7 @@ export class GroupChatEngine extends EventEmitter {
 
       // Use the group's ID as the session key so it isolates memory per group
       // Tools (browser, code execution, etc.) are granted via agentId, not sessionKey.
-      const sessionKey = getGroupRuntimeSessionKey(groupId);
+      const sessionKey = getGroupRuntimeSessionKey(groupId, group?.runtime_session_epoch);
       const client = await this.getClient(runtimeContext.runtimeAgentId);
       this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const expectedSessionKey = sessionKey.startsWith('agent:')
@@ -810,7 +887,11 @@ export class GroupChatEngine extends EventEmitter {
         let firstCompletionWaitResolvedAt: number | null = null;
         let finalEventGeneration = 0;
         let settledCalibrationGeneration = 0;
+        let latestFinalEventAt: number | null = null;
         let pendingErrorDetail = '';
+        let lastObservedHistoryLength = preRunHistorySnapshot.length;
+        let lastObservedHistorySignature = preRunHistorySnapshot.latestSignature;
+        let lastObservedHistoryActivityAt: number | null = null;
 
         const clearIdleTimeout = () => {
           if (idleTimeout) {
@@ -886,25 +967,55 @@ export class GroupChatEngine extends EventEmitter {
             let completedOutput = selectPreferredTextSnapshot(finalOutput, finalEventText);
             let settledErrorDetail = '';
             let shouldRetryForEmptyCompletion = false;
-            let sawSettledAssistantText = false;
+            let bestSettledAssistantText = '';
+            const visibleFinalGraceDeadline = probeFinalGeneration > 0
+              && completedOutput.trim()
+              && latestFinalEventAt !== null
+              ? latestFinalEventAt + GROUP_FINAL_EVENT_SETTLE_GRACE_MS
+              : null;
             try {
-              let bestSettledAssistantText = '';
               const historyProbeStartedAt = Date.now();
               while (!settled && (Date.now() - historyProbeStartedAt) < GROUP_HISTORY_COMPLETION_SETTLE_TIMEOUT_MS) {
                 const history = await client.getChatHistory(finalSessionKey, GROUP_HISTORY_COMPLETION_PROBE_LIMIT);
+                const historyTailActivity = getHistoryTailActivity(history, preRunHistorySnapshot);
+                if (
+                  historyTailActivity.hasChanges
+                  && (
+                    historyTailActivity.length !== lastObservedHistoryLength
+                    || historyTailActivity.latestSignature !== lastObservedHistorySignature
+                  )
+                ) {
+                  lastObservedHistoryLength = historyTailActivity.length;
+                  lastObservedHistorySignature = historyTailActivity.latestSignature;
+                  lastObservedHistoryActivityAt = Date.now();
+                  resetIdleTimeout();
+                }
                 const settledAssistantOutcome = extractSettledAssistantOutcome(history, preRunHistorySnapshot);
                 if (settledAssistantOutcome.kind === 'error') {
                   settledErrorDetail = settledAssistantOutcome.error;
                   break;
                 }
                 if (settledAssistantOutcome.kind === 'text') {
-                  sawSettledAssistantText = true;
                   bestSettledAssistantText = settledAssistantOutcome.text;
+                  const settledMatchesCurrent = settledAssistantOutcome.text.trim() === completedOutput.trim();
                   if (shouldPreferSettledAssistantText(completedOutput, settledAssistantOutcome.text)) {
                     completedOutput = selectPreferredTextSnapshot(completedOutput, settledAssistantOutcome.text);
                     break;
                   }
+                  if (settledMatchesCurrent) {
+                    break;
+                  }
                 }
+
+                if (visibleFinalGraceDeadline !== null) {
+                  const remainingVisibleFinalGraceMs = visibleFinalGraceDeadline - Date.now();
+                  if (remainingVisibleFinalGraceMs <= 0) {
+                    break;
+                  }
+                  await new Promise((resolve) => setTimeout(resolve, Math.min(GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS, remainingVisibleFinalGraceMs)));
+                  continue;
+                }
+
                 await new Promise((resolve) => setTimeout(resolve, GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS));
               }
 
@@ -927,15 +1038,30 @@ export class GroupChatEngine extends EventEmitter {
 
             completedOutput = selectPreferredTextSnapshot(completedOutput, finalEventText);
 
+            const hasSettledAssistantText = bestSettledAssistantText.trim().length > 0;
+            const hasStableVisibleFinalText = probeFinalGeneration > 0
+              && probeFinalGeneration === finalEventGeneration
+              && completedOutput.trim().length > 0
+              && latestFinalEventAt !== null
+              && Date.now() >= (latestFinalEventAt + GROUP_FINAL_EVENT_SETTLE_GRACE_MS);
+
             if (
               probeFinalGeneration > 0
               && probeFinalGeneration === finalEventGeneration
-              && (sawSettledAssistantText || !!finalEventText.trim())
+              && (hasSettledAssistantText || hasStableVisibleFinalText)
             ) {
               settledCalibrationGeneration = Math.max(settledCalibrationGeneration, probeFinalGeneration);
             }
 
-            if (finalEventGeneration > settledCalibrationGeneration) {
+            const isAwaitingInitialTerminalEvidence = finalEventGeneration === 0 && !hasSettledAssistantText;
+            const isAwaitingSettledFinalCalibration = finalEventGeneration > settledCalibrationGeneration;
+            const hasRecentHistoryActivity = lastObservedHistoryActivityAt !== null
+              && (Date.now() - lastObservedHistoryActivityAt) < GROUP_HISTORY_ACTIVITY_GRACE_MS;
+
+            if (
+              (shouldRetryForEmptyCompletion || isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration)
+              && hasRecentHistoryActivity
+            ) {
               scheduleCompletionProbe(GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS);
               return;
             }
@@ -946,6 +1072,33 @@ export class GroupChatEngine extends EventEmitter {
               && (Date.now() - firstCompletionWaitResolvedAt) < GROUP_EMPTY_COMPLETION_RETRY_WINDOW_MS
             ) {
               scheduleCompletionProbe(GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS);
+              return;
+            }
+
+            if (
+              (isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration)
+              && firstCompletionWaitResolvedAt !== null
+              && (Date.now() - firstCompletionWaitResolvedAt) < GROUP_EMPTY_COMPLETION_RETRY_WINDOW_MS
+            ) {
+              scheduleCompletionProbe(GROUP_HISTORY_COMPLETION_SETTLE_POLL_MS);
+              return;
+            }
+
+            if ((isAwaitingInitialTerminalEvidence || isAwaitingSettledFinalCalibration) && completedOutput.trim() && !pendingErrorDetail) {
+              console.warn(
+                `[GroupChatEngine] Finalizing run ${runId} for group ${groupId}, agent ${agentId} using streamed text fallback because terminal assistant evidence never settled.`,
+              );
+              resolveOnce(completedOutput);
+              return;
+            }
+
+            if (isAwaitingInitialTerminalEvidence) {
+              rejectOnce(new Error(pendingErrorDetail || 'Run completed without a terminal assistant response.'));
+              return;
+            }
+
+            if (isAwaitingSettledFinalCalibration) {
+              rejectOnce(new Error(pendingErrorDetail || 'Run completed but the final assistant response never settled.'));
               return;
             }
 
@@ -1004,35 +1157,40 @@ export class GroupChatEngine extends EventEmitter {
 
         const onFinal = (data: { sessionKey: string; runId: string; text: string; message: any }) => {
           if (data.sessionKey === finalSessionKey && data.runId === runId) {
+            const finalEventObservedAt = Date.now();
             const terminalFinalText = resolveChatFinalTextSnapshot(data.text, data.message);
             if (terminalFinalText) {
               finalEventText = selectPreferredTextSnapshot(finalEventText, terminalFinalText);
               finalOutput = selectPreferredTextSnapshot(finalOutput, terminalFinalText);
               this.updateActiveRunText(groupId, runId, finalOutput);
+              latestFinalEventAt = finalEventObservedAt;
+              finalEventGeneration += 1;
             } else if (data.text) {
               finalOutput = selectPreferredTextSnapshot(finalOutput, data.text);
               this.updateActiveRunText(groupId, runId, finalOutput);
             }
-            finalEventGeneration += 1;
-            const immediateFinalText = selectPreferredTextSnapshot(finalOutput, finalEventText);
-            const visibleImmediateFinalText = rewriteVisibleFileLinks(immediateFinalText, {
-              workspacePath: runtimeContext.workspacePath,
-            }).trim();
-            const nextVisibleFinalOutput = selectPreferredTextSnapshot(visibleFinalOutput, visibleImmediateFinalText);
-            if (msgId !== undefined && nextVisibleFinalOutput && visibleFinalOutput !== nextVisibleFinalOutput) {
-              visibleFinalOutput = nextVisibleFinalOutput;
-              this.db.updateGroupMessage(msgId, immediateFinalText, modelUsed);
-              this.emit('edit', {
-                groupId,
-                id: msgId,
-                parent_id: parentId,
-                sender_type: 'agent',
-                sender_id: agentId,
-                sender_name: member.display_name,
-                content: nextVisibleFinalOutput,
-                model_used: modelUsed,
-                created_at: placeholderCreatedAt,
-              });
+
+            if (terminalFinalText) {
+              const immediateFinalText = selectPreferredTextSnapshot(finalOutput, finalEventText);
+              const visibleImmediateFinalText = rewriteVisibleFileLinks(immediateFinalText, {
+                workspacePath: runtimeContext.workspacePath,
+              }).trim();
+              const nextVisibleFinalOutput = selectPreferredTextSnapshot(visibleFinalOutput, visibleImmediateFinalText);
+              if (msgId !== undefined && nextVisibleFinalOutput && visibleFinalOutput !== nextVisibleFinalOutput) {
+                visibleFinalOutput = nextVisibleFinalOutput;
+                this.db.updateGroupMessage(msgId, immediateFinalText, modelUsed);
+                this.emit('edit', {
+                  groupId,
+                  id: msgId,
+                  parent_id: parentId,
+                  sender_type: 'agent',
+                  sender_id: agentId,
+                  sender_name: member.display_name,
+                  content: nextVisibleFinalOutput,
+                  model_used: modelUsed,
+                  created_at: placeholderCreatedAt,
+                });
+              }
             }
             resetIdleTimeout();
             scheduleCompletionProbe(0);

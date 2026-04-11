@@ -10,6 +10,7 @@ export type GroupChatRow = {
   process_start_tag?: string;
   process_end_tag?: string;
   max_chain_depth?: number;
+  runtime_session_epoch?: number;
   position?: number;
   created_at?: string;
   updated_at?: string;
@@ -187,6 +188,7 @@ export class DB {
         process_start_tag TEXT DEFAULT '',
         process_end_tag TEXT DEFAULT '',
         max_chain_depth INTEGER DEFAULT 6,
+        runtime_session_epoch INTEGER DEFAULT 0,
         position INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -226,6 +228,7 @@ export class DB {
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN process_end_tag TEXT DEFAULT ''"); } catch (e) {}
     // Migration: add max_chain_depth
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN max_chain_depth INTEGER DEFAULT 6"); } catch (e) {}
+    try { this.db.exec("ALTER TABLE group_chats ADD COLUMN runtime_session_epoch INTEGER DEFAULT 0"); } catch (e) {}
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN position INTEGER DEFAULT 0"); } catch (e) {}
 
     // Backfill stable ordering for legacy group rows that predate the position column.
@@ -544,8 +547,8 @@ export class DB {
   // --- Group Chats ---
   saveGroupChat(group: GroupChatRow) {
     this.db
-      .prepare('INSERT INTO group_chats (id, name, description, system_prompt, process_start_tag, process_end_tag, max_chain_depth, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, system_prompt=excluded.system_prompt, process_start_tag=excluded.process_start_tag, process_end_tag=excluded.process_end_tag, max_chain_depth=excluded.max_chain_depth, position=excluded.position, updated_at=excluded.updated_at')
-      .run(group.id, group.name, group.description || '', group.system_prompt || '', group.process_start_tag || '', group.process_end_tag || '', group.max_chain_depth ?? 6, group.position ?? 0, group.created_at || new Date().toISOString(), group.updated_at || new Date().toISOString());
+      .prepare('INSERT INTO group_chats (id, name, description, system_prompt, process_start_tag, process_end_tag, max_chain_depth, runtime_session_epoch, position, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, description=excluded.description, system_prompt=excluded.system_prompt, process_start_tag=excluded.process_start_tag, process_end_tag=excluded.process_end_tag, max_chain_depth=excluded.max_chain_depth, runtime_session_epoch=excluded.runtime_session_epoch, position=excluded.position, updated_at=excluded.updated_at')
+      .run(group.id, group.name, group.description || '', group.system_prompt || '', group.process_start_tag || '', group.process_end_tag || '', group.max_chain_depth ?? 6, group.runtime_session_epoch ?? 0, group.position ?? 0, group.created_at || new Date().toISOString(), group.updated_at || new Date().toISOString());
   }
 
   getGroupChat(id: string): GroupChatRow | undefined {
@@ -618,7 +621,32 @@ export class DB {
   }
 
   deleteGroupMessage(id: number) {
-    return this.db.prepare('DELETE FROM group_messages WHERE id = ?').run(id);
+    const selectDescendantRows = this.db.prepare(`
+      WITH RECURSIVE subtree(id, parent_id) AS (
+        SELECT id, parent_id
+        FROM group_messages
+        WHERE id = ?
+        UNION ALL
+        SELECT child.id, child.parent_id
+        FROM group_messages child
+        JOIN subtree ON child.parent_id = subtree.id
+      )
+      SELECT id, parent_id FROM subtree
+    `);
+
+    const deleteMany = this.db.transaction((messageId: number) => {
+      const rows = selectDescendantRows.all(messageId) as Array<{ id: number; parent_id: number | null }>;
+      if (rows.length === 0) {
+        return [];
+      }
+
+      const ids = rows.map((row) => row.id);
+      const placeholders = ids.map(() => '?').join(', ');
+      this.db.prepare(`DELETE FROM group_messages WHERE id IN (${placeholders})`).run(...ids);
+      return rows;
+    });
+
+    return deleteMany(id);
   }
 
   updateGroupMessageParent(id: number, parentId?: number | null) {
