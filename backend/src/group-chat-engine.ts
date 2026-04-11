@@ -32,6 +32,7 @@ import {
 import { rewriteVisibleFileLinks } from './file-link-rewrite';
 import { getGroupRuntimeSessionKey } from './group-workspace';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
+import { canonicalizeAssistantWorkspaceArtifacts } from './workspace-artifact-rewrite';
 
 const DEFAULT_MAX_CHAIN_DEPTH = 6;
 const GROUP_STREAM_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -711,6 +712,7 @@ export class GroupChatEngine extends EventEmitter {
         agentId: runtimeContext.runtimeAgentId,
         attachments: rewrittenTrigger.attachments,
       });
+      const runStartedAt = Date.now();
       activeRunId = runId;
       this.setActiveRun({
         groupId,
@@ -719,7 +721,7 @@ export class GroupChatEngine extends EventEmitter {
         runId,
         sessionKey: finalSessionKey,
         client,
-        startedAt: Date.now(),
+        startedAt: runStartedAt,
         messageId: msgId,
         parentId: parentId,
         modelUsed,
@@ -1005,8 +1007,12 @@ export class GroupChatEngine extends EventEmitter {
         selectPreferredTextSnapshot(finalOutput, response),
         finalEventText,
       );
-      const mentionedIds = this.parseMentions(protectedResponse, members);
-      if (!protectedResponse.trim() && msgId !== undefined) {
+      const canonicalResponse = canonicalizeAssistantWorkspaceArtifacts(protectedResponse, {
+        workspacePath: runtimeContext.workspacePath,
+        startedAtMs: runStartedAt,
+      });
+      const mentionedIds = this.parseMentions(canonicalResponse, members);
+      if (!canonicalResponse.trim() && msgId !== undefined) {
         if (isResetCommand) {
           this.db.deleteGroupMessage(msgId);
           this.emit('delete', {
@@ -1051,13 +1057,13 @@ export class GroupChatEngine extends EventEmitter {
 
       this.db.updateGroupMessage(
         msgId, 
-        protectedResponse, 
+        canonicalResponse, 
         this.getAgentModel(agentId), 
         mentionedIds.length > 0 ? JSON.stringify(mentionedIds) : null
       );
       const visibleResponse = selectPreferredTextSnapshot(
         visibleFinalOutput,
-        rewriteVisibleFileLinks(protectedResponse, { workspacePath: runtimeContext.workspacePath }).trim(),
+        rewriteVisibleFileLinks(canonicalResponse, { workspacePath: runtimeContext.workspacePath }).trim(),
       );
       if (visibleResponse !== visibleFinalOutput) {
         this.emit('edit', {
@@ -1080,7 +1086,7 @@ export class GroupChatEngine extends EventEmitter {
       if (mentionedIds.length > 0) {
         for (const nextAgentId of mentionedIds) {
           if (nextAgentId !== agentId) { // Don't send to self
-            const res = await this.sendToAgent(groupId, groupName, nextAgentId, protectedResponse, member.display_name, depth + 1, lastMsgId);
+            const res = await this.sendToAgent(groupId, groupName, nextAgentId, canonicalResponse, member.display_name, depth + 1, lastMsgId);
             if (res !== undefined) lastMsgId = res;
           }
         }

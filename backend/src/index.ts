@@ -33,6 +33,7 @@ import net from 'net';
 import sharp from 'sharp';
 import { buildImageUploadInspectionContext, rewriteMessageWithWorkspaceUploads } from './message-upload-rewrite';
 import { rewriteVisibleFileLinks } from './file-link-rewrite';
+import { canonicalizeAssistantWorkspaceArtifacts } from './workspace-artifact-rewrite';
 import {
   buildAudioTranscriptContext,
   ensureManagedLocalAudioRuntimeReady,
@@ -6808,6 +6809,7 @@ interface ActiveRun {
   agentName: string;
   modelUsed: string;
   messageId: number;
+  startedAt: number;
   workspacePath: string;
   finalSessionKey: string;
   historySnapshot: ChatHistorySnapshot;
@@ -6951,7 +6953,11 @@ class ActiveRunManager {
       runId: run.runId,
     });
 
-    const rewritten = rewriteOpenClawMediaPaths(run.text || '', run.workspacePath);
+    const canonicalText = canonicalizeAssistantWorkspaceArtifacts(run.text || '', {
+      workspacePath: run.workspacePath,
+      startedAtMs: run.startedAt,
+    });
+    const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
     this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
 
     run.clients.forEach((res) => {
@@ -6968,7 +6974,13 @@ class ActiveRunManager {
     if (protectedFinalText) {
       run.text = protectedFinalText;
     }
-    const rewritten = rewriteOpenClawMediaPaths(protectedFinalText || run.text, run.workspacePath);
+    const canonicalText = options?.end
+      ? canonicalizeAssistantWorkspaceArtifacts(protectedFinalText || run.text, {
+          workspacePath: run.workspacePath,
+          startedAtMs: run.startedAt,
+        })
+      : (protectedFinalText || run.text);
+    const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
     const nextVisibleFinalText = selectPreferredTextSnapshot(run.visibleFinalText, rewritten);
     if (!nextVisibleFinalText.trim()) {
       if (options?.end) {
@@ -7019,6 +7031,7 @@ class ActiveRunManager {
       agentName,
       modelUsed,
       messageId,
+      startedAt: Date.now(),
       workspacePath,
       finalSessionKey,
       historySnapshot,
@@ -7145,10 +7158,14 @@ class ActiveRunManager {
     run.idleTimeout = setTimeout(() => {
       const errorMsg = run.text ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
       const finalText = run.text || errorMsg;
-      const rewritten = rewriteOpenClawMediaPaths(finalText, run.workspacePath);
+      const canonicalText = canonicalizeAssistantWorkspaceArtifacts(finalText, {
+        workspacePath: run.workspacePath,
+        startedAtMs: run.startedAt,
+      });
+      const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
       
       this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
-      this.emitVisibleFinal(run, finalText, { end: true });
+      this.emitVisibleFinal(run, canonicalText, { end: true });
       this.cleanupRun(run.sessionId);
     }, 600000); // 10 minutes
   }
@@ -7334,14 +7351,18 @@ class ActiveRunManager {
     if (protectedFinalText) {
       run.text = protectedFinalText;
     }
-    const rewritten = rewriteOpenClawMediaPaths(protectedFinalText || run.text, run.workspacePath);
+    const canonicalText = canonicalizeAssistantWorkspaceArtifacts(protectedFinalText || run.text, {
+      workspacePath: run.workspacePath,
+      startedAtMs: run.startedAt,
+    });
+    const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
     if (!rewritten.trim()) {
       this.failRun(run, 'No text output returned from the run.');
       return;
     }
 
     this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
-    this.emitVisibleFinal(run, protectedFinalText || run.text, { end: true });
+    this.emitVisibleFinal(run, canonicalText, { end: true });
     this.cleanupRun(run.sessionId);
   }
 
