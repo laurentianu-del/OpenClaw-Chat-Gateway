@@ -250,6 +250,27 @@ type HostTakeoverStatus = {
   rawDetail: string | null;
 };
 
+type DevicePairingPendingRequest = {
+  requestId: string;
+  deviceId: string | null;
+  displayName: string | null;
+  clientId: string | null;
+  clientMode: string | null;
+  role: string | null;
+  roles: string[];
+  scopes: string[];
+  remoteIp: string | null;
+  isRepair: boolean;
+  ts: number | null;
+};
+
+type DevicePairingStatus = {
+  pending: DevicePairingPendingRequest[];
+  latestPending: DevicePairingPendingRequest | null;
+  pairedCount: number | null;
+  rawDetail: string | null;
+};
+
 type AppVersionInfo = {
   appName: string;
   version: string;
@@ -519,10 +540,12 @@ const BROWSER_REPAIR_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 18, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
   'read-status': { progress: 28, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
   'enable-permissions': { progress: 42, labelKey: 'settings.gateway.browserTaskPhases.enablePermissions' },
+  'sync-browser-settings': { progress: 52, labelKey: 'settings.gateway.browserTaskPhases.syncBrowserSettings' },
   'restart-gateway': { progress: 58, labelKey: 'settings.gateway.browserTaskPhases.restartGateway' },
   'stop-browser': { progress: 70, labelKey: 'settings.gateway.browserTaskPhases.stopBrowser' },
   'start-browser': { progress: 82, labelKey: 'settings.gateway.browserTaskPhases.startBrowser' },
   'wait-running': { progress: 90, labelKey: 'settings.gateway.browserTaskPhases.waitRunning' },
+  'reset-profile': { progress: 96, labelKey: 'settings.gateway.browserTaskPhases.resetProfile' },
   'open-validation': { progress: 96, labelKey: 'settings.gateway.browserTaskPhases.openValidation' },
   'capture-snapshot': { progress: 99, labelKey: 'settings.gateway.browserTaskPhases.captureSnapshot' },
   'finalize': { progress: 100, labelKey: 'settings.gateway.browserTaskPhases.finalizeRepair' },
@@ -592,6 +615,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [maxPermissions, setMaxPermissions] = useState(false);
   const [isTogglingPermissions, setIsTogglingPermissions] = useState(false);
   const [hostTakeoverStatus, setHostTakeoverStatus] = useState<HostTakeoverStatus | null>(null);
+  const [devicePairingStatus, setDevicePairingStatus] = useState<DevicePairingStatus | null>(null);
+  const [hasLoadedMaxPermissionsState, setHasLoadedMaxPermissionsState] = useState(false);
+  const [isApprovingDevicePairing, setIsApprovingDevicePairing] = useState(false);
+  const [permissionsNotice, setPermissionsNotice] = useState<{ tone: 'success' | 'warning'; message: string } | null>(null);
   const [permissionsError, setPermissionsError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [permissionsPasswordModalOpen, setPermissionsPasswordModalOpen] = useState(false);
   const [permissionsPassword, setPermissionsPassword] = useState('');
@@ -2225,9 +2252,27 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     });
   };
 
-  const applyMaxPermissionsState = (data: { enabled?: unknown; hostTakeover?: unknown }) => {
+  const browserHealthRequiresPairing = (snapshot: BrowserHealthSnapshot | null) => {
+    if (!snapshot) {
+      return false;
+    }
+
+    const detail = [
+      snapshot.validationDetail,
+      snapshot.rawDetail,
+      snapshot.runtime?.detectError,
+      snapshot.detectError,
+    ].filter(Boolean).join('\n').toLowerCase();
+
+    return detail.includes('pairing required');
+  };
+
+  const applyMaxPermissionsState = (data: { enabled?: unknown; hostTakeover?: unknown; devicePairing?: unknown }) => {
     setMaxPermissions(!!data.enabled);
     setHostTakeoverStatus((data.hostTakeover as HostTakeoverStatus | null) || null);
+    if ('devicePairing' in data) {
+      setDevicePairingStatus((data.devicePairing as DevicePairingStatus | null) || null);
+    }
   };
 
   const fetchBrowserHeadedModeState = async () => {
@@ -2251,16 +2296,54 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   };
 
   const fetchMaxPermissionsState = async () => {
-    const res = await fetch('/api/config/max-permissions');
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.maxPermissionsLoadFailed');
-      setPermissionsError(display);
-      throw new Error(display.detail || display.message);
+    try {
+      const res = await fetch('/api/config/max-permissions');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const display = resolveStructuredErrorDisplay(data, t, 'settings.gateway.maxPermissionsLoadFailed');
+        setPermissionsError(display);
+        throw new Error(display.detail || display.message);
+      }
+      applyMaxPermissionsState(data);
+      setPermissionsError(EMPTY_INLINE_ERROR);
+      return !!data.enabled;
+    } finally {
+      setHasLoadedMaxPermissionsState(true);
     }
-    applyMaxPermissionsState(data);
+  };
+
+  const handleApproveLatestDevicePairing = async () => {
+    setIsApprovingDevicePairing(true);
     setPermissionsError(EMPTY_INLINE_ERROR);
-    return !!data.enabled;
+    setPermissionsNotice(null);
+
+    try {
+      const res = await fetch('/api/config/max-permissions/device-pairing/approve', {
+        method: 'POST',
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.success) {
+        if (data.devicePairing) {
+          setDevicePairingStatus(data.devicePairing as DevicePairingStatus);
+        } else {
+          await fetchMaxPermissionsState().catch(() => {});
+        }
+        setPermissionsNotice({
+          tone: 'success',
+          message: t('settings.gateway.devicePairingApproveSuccess'),
+        });
+      } else {
+        setPermissionsError(resolveStructuredErrorDisplay(data, t, 'gateway.devicePairingApproveFailed'));
+      }
+    } catch (err) {
+      setPermissionsError({
+        message: t('gateway.devicePairingApproveFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    } finally {
+      setIsApprovingDevicePairing(false);
+    }
   };
 
   const closePermissionsPasswordModal = () => {
@@ -2289,6 +2372,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setMaxPermissions(nextEnabled);
     setIsTogglingPermissions(true);
     setPermissionsError(EMPTY_INLINE_ERROR);
+    setPermissionsNotice(null);
     setBrowserHealthNotice(null);
     setGatewayRestartNoticeSource(null);
     setBrowserHealthError(EMPTY_INLINE_ERROR);
@@ -2349,6 +2433,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setIsSubmittingPermissionsPassword(true);
     setPermissionsPasswordError(EMPTY_INLINE_ERROR);
     setPermissionsError(EMPTY_INLINE_ERROR);
+    setPermissionsNotice(null);
 
     try {
       const { res, data } = await requestMaxPermissionsChange(true, permissionsPassword);
@@ -2417,7 +2502,11 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       const res = await fetch('/api/config/browser-health');
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success && data.health) {
-        applyBrowserHealthSnapshot(data.health as BrowserHealthSnapshot);
+        const snapshot = data.health as BrowserHealthSnapshot;
+        applyBrowserHealthSnapshot(snapshot);
+        if (browserHealthRequiresPairing(snapshot)) {
+          await fetchMaxPermissionsState().catch(() => {});
+        }
       } else {
         setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserHealthFailed'));
       }
@@ -2537,16 +2626,19 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setBrowserHealthError(EMPTY_INLINE_ERROR);
     setBrowserHealthNotice(null);
     try {
-      const res = await fetch('/api/config/browser-health/self-heal', { method: 'POST' });
+      const res = await fetch('/api/config/browser-health/self-heal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lastKnownIssue: browserHealth?.issue || null,
+        }),
+      });
       const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success && data.after) {
-        const nextSnapshot = data.after as BrowserHealthSnapshot;
-        applyBrowserHealthSnapshot(nextSnapshot);
+      if (res.ok && data.success) {
+        setBrowserHealth(null);
         setBrowserHealthNotice({
-          tone: nextSnapshot.healthy ? 'success' : 'warning',
-          message: nextSnapshot.healthy
-            ? t('settings.gateway.browserSelfHealSuccess')
-            : t('settings.gateway.browserSelfHealNeedsAttention'),
+          tone: 'success',
+          message: t('settings.gateway.browserSelfHealSuccess'),
         });
       } else {
         setBrowserHealthError(resolveStructuredErrorDisplay(data, t, 'gateway.browserSelfHealFailed'));
@@ -3894,6 +3986,30 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     && hostTakeoverMode !== 'ready'
     && hostTakeoverMode !== 'disabled'
     && hostTakeoverStatus?.autoInstallSupported === false;
+  const latestDevicePairing = devicePairingStatus?.latestPending ?? null;
+  const devicePairingPairedCount = devicePairingStatus?.pairedCount ?? null;
+  const devicePairingMode = !hasLoadedMaxPermissionsState
+    ? 'loading'
+    : latestDevicePairing
+      ? 'pending'
+      : devicePairingPairedCount === null
+        ? 'unavailable'
+        : devicePairingPairedCount > 0
+          ? 'paired'
+          : 'idle';
+  const devicePairingToneClass = devicePairingMode === 'pending'
+    ? 'border-amber-200 bg-amber-50 text-amber-700'
+    : devicePairingMode === 'paired'
+      ? 'border-green-200 bg-green-50 text-green-700'
+      : devicePairingMode === 'unavailable'
+        ? 'border-red-200 bg-red-50 text-red-700'
+        : 'border-gray-200 bg-gray-50 text-gray-600';
+  const latestDevicePairingRoleText = latestDevicePairing
+    ? (latestDevicePairing.role
+      || latestDevicePairing.roles.join(', ')
+      || t('common.unknown'))
+    : '';
+  const latestDevicePairingScopeText = latestDevicePairing?.scopes.join(', ') || '';
   const headerTitle = settingsTab === 'gateway'
     ? t('settings.gateway.headerTitle')
     : settingsTab === 'general'
@@ -4074,6 +4190,100 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                         </div>
                       )}
                     </div>
+
+                    <div className={`mt-4 rounded-xl border px-4 py-3 text-sm ${devicePairingToneClass}`}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-gray-900">{t('settings.gateway.devicePairingStatusLabel')}</span>
+                        <span className="rounded-full border border-current/15 px-2 py-0.5 text-xs font-semibold uppercase tracking-wide">
+                          {t(`settings.gateway.devicePairingModes.${devicePairingMode}`)}
+                        </span>
+                      </div>
+                      <p className="mt-2 text-sm leading-6 text-current">
+                        {devicePairingMode === 'loading'
+                          ? t('settings.gateway.devicePairingDescriptions.loading')
+                          : devicePairingMode === 'pending'
+                          ? t('settings.gateway.devicePairingDescriptions.pending', { count: devicePairingStatus?.pending.length || 0 })
+                          : devicePairingMode === 'paired'
+                            ? t('settings.gateway.devicePairingDescriptions.paired', { count: devicePairingStatus?.pairedCount || 0 })
+                            : devicePairingMode === 'unavailable'
+                              ? t('settings.gateway.devicePairingDescriptions.unavailable')
+                              : t('settings.gateway.devicePairingDescriptions.idle')}
+                      </p>
+                      {latestDevicePairing && (
+                        <>
+                          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                            <div>
+                              <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                                {t('settings.gateway.devicePairingRequestLabel')}
+                              </div>
+                              <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 font-mono text-xs text-gray-700 break-all">
+                                {latestDevicePairing.requestId}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                                {t('settings.gateway.devicePairingDeviceLabel')}
+                              </div>
+                              <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-xs text-gray-700 break-all">
+                                {latestDevicePairing.displayName || latestDevicePairing.deviceId || t('common.unknown')}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                                {t('settings.gateway.devicePairingRoleLabel')}
+                              </div>
+                              <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-xs text-gray-700 break-all">
+                                {latestDevicePairingRoleText}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                                {t('settings.gateway.devicePairingScopeLabel')}
+                              </div>
+                              <div className="mt-1 rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-xs text-gray-700 break-all whitespace-pre-wrap">
+                                {latestDevicePairingScopeText || t('common.unknown')}
+                              </div>
+                            </div>
+                          </div>
+                          <div className="mt-3 flex flex-wrap items-center gap-3">
+                            <button
+                              type="button"
+                              onClick={handleApproveLatestDevicePairing}
+                              disabled={isApprovingDevicePairing || isTogglingPermissions || isSubmittingPermissionsPassword}
+                              className={secondaryActionButtonClass}
+                            >
+                              {isApprovingDevicePairing
+                                ? <Loader2 className="w-4 h-4 animate-spin" />
+                                : <Link2 className="w-4 h-4" />}
+                              {isApprovingDevicePairing
+                                ? t('settings.gateway.devicePairingApprovingLatest')
+                                : t('settings.gateway.devicePairingApproveLatest')}
+                            </button>
+                            {latestDevicePairing.remoteIp && (
+                              <span className="text-xs text-gray-600">
+                                {t('settings.gateway.devicePairingIpLabel')}: {latestDevicePairing.remoteIp}
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      )}
+                      {devicePairingStatus?.rawDetail && (
+                        <div className="mt-3">
+                          <div className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                            {t('settings.gateway.devicePairingDetailLabel')}
+                          </div>
+                          <div className="mt-1 rounded-xl border border-current/10 bg-white/70 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap">
+                            {devicePairingStatus.rawDetail}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {permissionsNotice && (
+                      <div className={`mt-4 rounded-xl border px-3 py-2 text-sm ${permissionsNotice.tone === 'success' ? 'border-green-200 bg-green-50 text-green-700' : 'border-amber-200 bg-amber-50 text-amber-700'}`}>
+                        {permissionsNotice.message}
+                      </div>
+                    )}
 
                     {permissionsError.message && (
                       <div className="mt-4 rounded-xl border border-red-100 bg-red-50 px-3 py-3 text-sm text-red-600 flex items-start gap-2">

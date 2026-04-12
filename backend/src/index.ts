@@ -6,6 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import { createServer } from 'http';
 import multer from 'multer';
+import { pathToFileURL } from 'url';
 import { WebSocket } from 'ws';
 import OpenClawClient, { extractOpenClawMessageText } from './openclaw-client';
 import SessionManager from './session-manager';
@@ -202,6 +203,8 @@ const GATEWAY_MAX_PERMISSIONS_UPDATE_FAILED_ERROR_CODE = 'gateway.maxPermissions
 const GATEWAY_HOST_TAKEOVER_CREDENTIALS_REQUIRED_ERROR_CODE = 'gateway.hostTakeoverCredentialsRequired';
 const GATEWAY_HOST_TAKEOVER_INSTALL_FAILED_ERROR_CODE = 'gateway.hostTakeoverInstallFailed';
 const GATEWAY_HOST_TAKEOVER_SERVICE_NOT_FOUND_ERROR_CODE = 'gateway.hostTakeoverServiceNotFound';
+const GATEWAY_DEVICE_PAIRING_APPROVE_FAILED_ERROR_CODE = 'gateway.devicePairingApproveFailed';
+const GATEWAY_DEVICE_PAIRING_NO_PENDING_ERROR_CODE = 'gateway.devicePairingNoPending';
 const FILE_PREVIEW_CONVERSION_TIMED_OUT_ERROR_CODE = 'filePreview.conversionTimedOut';
 const AGENT_ID_REQUIRED_ERROR_CODE = 'agents.idRequired';
 const AGENT_ID_CONTAINS_WHITESPACE_ERROR_CODE = 'agents.idContainsWhitespace';
@@ -262,8 +265,8 @@ const BROWSER_HEALTH_START_TIMEOUT_MS = 30000;
 const BROWSER_HEALTH_OPEN_TIMEOUT_MS = 40000;
 const BROWSER_HEALTH_SNAPSHOT_TIMEOUT_MS = 45000;
 const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
-const BROWSER_SELF_HEAL_POLL_TIMEOUT_MS = 25000;
-const BROWSER_SELF_HEAL_POLL_INTERVAL_MS = 1000;
+const BROWSER_SELF_HEAL_RESET_PROFILE_TIMEOUT_MS = 45000;
+const OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS = 15000;
 const BROWSER_POST_RESTART_WARMUP_DELAY_MS = 8000;
 const BROWSER_POST_RESTART_WARMUP_MARKER_MAX_AGE_MS = 30 * 60 * 1000;
 const BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS = 3 * 60 * 1000;
@@ -472,6 +475,60 @@ type HostTakeoverStatus = {
   autoInstallMode: HostTakeoverAutoInstallMode;
   manualInstallCommand: string | null;
   rawDetail: string | null;
+};
+
+type DevicePairingPendingRequestSummary = {
+  requestId: string;
+  deviceId: string | null;
+  displayName: string | null;
+  clientId: string | null;
+  clientMode: string | null;
+  role: string | null;
+  roles: string[];
+  scopes: string[];
+  remoteIp: string | null;
+  isRepair: boolean;
+  ts: number | null;
+};
+
+type DevicePairingStatusSnapshot = {
+  pending: DevicePairingPendingRequestSummary[];
+  latestPending: DevicePairingPendingRequestSummary | null;
+  pairedCount: number | null;
+  rawDetail: string | null;
+};
+
+type DevicePairingGatewayConnectionConfig = {
+  gatewayUrl: string;
+  token?: string;
+  password?: string;
+};
+
+type OpenClawLocalDevicePairingList = {
+  pending?: unknown[];
+  paired?: unknown[];
+};
+
+type OpenClawLocalDevicePairingApproveResult =
+  | {
+      status: 'approved';
+      device?: {
+        deviceId?: string;
+        displayName?: string;
+      } | null;
+    }
+  | {
+      status: 'forbidden';
+      missingScope?: string;
+    }
+  | null;
+
+type OpenClawLocalDevicePairingApi = {
+  listDevicePairing: () => Promise<OpenClawLocalDevicePairingList>;
+  approveDevicePairing: (
+    requestId: string,
+    options?: { callerScopes?: readonly string[] },
+  ) => Promise<OpenClawLocalDevicePairingApproveResult>;
 };
 
 type ActiveOpenClawUpdateProcess = {
@@ -2904,6 +2961,233 @@ async function safeReadHostTakeoverStatus(enabled = readMaxPermissionsEnabled() 
   }
 }
 
+function normalizeCliStringArray(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => normalizeCliText(entry))
+    .filter(Boolean);
+}
+
+function normalizeDevicePairingPendingRequest(value: any): DevicePairingPendingRequestSummary | null {
+  const requestId = normalizeCliText(value?.requestId);
+  if (!requestId) {
+    return null;
+  }
+
+  const roles = normalizeCliStringArray(value?.roles);
+  const scopes = normalizeCliStringArray(value?.scopes);
+  const ts = Number.isFinite(value?.ts) ? Number(value.ts) : null;
+
+  return {
+    requestId,
+    deviceId: normalizeCliText(value?.deviceId) || null,
+    displayName: normalizeCliText(value?.displayName) || null,
+    clientId: normalizeCliText(value?.clientId) || null,
+    clientMode: normalizeCliText(value?.clientMode) || null,
+    role: normalizeCliText(value?.role) || (roles[0] || null),
+    roles,
+    scopes,
+    remoteIp: normalizeCliText(value?.remoteIp) || null,
+    isRepair: value?.isRepair === true,
+    ts,
+  };
+}
+
+function selectLatestPendingDevicePairingRequest(pending: DevicePairingPendingRequestSummary[]) {
+  if (pending.length === 0) {
+    return null;
+  }
+
+  return pending.reduce((latest, current) => {
+    const latestTs = latest.ts ?? 0;
+    const currentTs = current.ts ?? 0;
+    return currentTs > latestTs ? current : latest;
+  });
+}
+
+function normalizeDevicePairingStatusSnapshot(raw: any, rawDetail?: string | null): DevicePairingStatusSnapshot {
+  const pending = Array.isArray(raw?.pending)
+    ? raw.pending
+        .map((entry: any) => normalizeDevicePairingPendingRequest(entry))
+        .filter((entry: DevicePairingPendingRequestSummary | null): entry is DevicePairingPendingRequestSummary => !!entry)
+    : [];
+
+  return {
+    pending,
+    latestPending: selectLatestPendingDevicePairingRequest(pending),
+    pairedCount: Array.isArray(raw?.paired) ? raw.paired.length : 0,
+    rawDetail: normalizeCliText(rawDetail) || null,
+  };
+}
+
+let cachedOpenClawLocalDevicePairingApiPromise: Promise<OpenClawLocalDevicePairingApi> | null = null;
+
+function readConfiguredDevicePairingGatewayConnection(): DevicePairingGatewayConnectionConfig {
+  const config = configManager.getConfig();
+  return {
+    gatewayUrl: normalizeCliText(config.gatewayUrl) || 'ws://127.0.0.1:18789',
+    token: normalizeCliText(config.token) || undefined,
+    password: normalizeCliText(config.password) || undefined,
+  };
+}
+
+function shouldUseLocalDevicePairingFallback(
+  config: DevicePairingGatewayConnectionConfig,
+  error: unknown,
+) {
+  const detail = normalizeCliText(readCliErrorDetail(error) || (error as any)?.message).toLowerCase();
+  if (!detail.includes('pairing required')) {
+    return false;
+  }
+
+  const gatewayTarget = parseGatewayUrlForStatusProbe(config.gatewayUrl);
+  if (!gatewayTarget || !isLoopbackHostname(gatewayTarget.hostname)) {
+    return false;
+  }
+
+  return evaluateLocalGatewayCredentialMatch(config, gatewayTarget) !== false;
+}
+
+async function loadOpenClawLocalDevicePairingApi(): Promise<OpenClawLocalDevicePairingApi> {
+  if (!cachedOpenClawLocalDevicePairingApiPromise) {
+    cachedOpenClawLocalDevicePairingApiPromise = (async () => {
+      const packageRoots = new Set<string>(collectOpenClawPackageRoots());
+
+      try {
+        const executablePath = await ensureResolvedOpenClawExecutablePath();
+        const resolvedExecutablePath = fs.realpathSync(executablePath);
+        if (path.basename(resolvedExecutablePath) === 'openclaw.mjs') {
+          packageRoots.add(path.dirname(resolvedExecutablePath));
+        }
+      } catch {}
+
+      for (const packageRoot of packageRoots) {
+        const apiPath = path.join(packageRoot, 'dist', 'extensions', 'device-pair', 'api.js');
+        if (!fs.existsSync(apiPath)) {
+          continue;
+        }
+
+        const imported = await import(pathToFileURL(apiPath).href) as Partial<OpenClawLocalDevicePairingApi>;
+        if (
+          typeof imported.listDevicePairing === 'function'
+          && typeof imported.approveDevicePairing === 'function'
+        ) {
+          return imported as OpenClawLocalDevicePairingApi;
+        }
+      }
+
+      throw new Error('OpenClaw official device-pair API is not available in the local install.');
+    })();
+  }
+
+  try {
+    return await cachedOpenClawLocalDevicePairingApiPromise;
+  } catch (error) {
+    cachedOpenClawLocalDevicePairingApiPromise = null;
+    throw error;
+  }
+}
+
+async function listDevicePairingStatusFromGatewayOrLocalFallback() {
+  const connection = readConfiguredDevicePairingGatewayConnection();
+  const client = new OpenClawClient(connection);
+
+  try {
+    const list = await client.call('device.pair.list', {}, OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS);
+    return normalizeDevicePairingStatusSnapshot(list);
+  } catch (error) {
+    if (!shouldUseLocalDevicePairingFallback(connection, error)) {
+      throw error;
+    }
+
+    const localApi = await loadOpenClawLocalDevicePairingApi();
+    const localList = await localApi.listDevicePairing();
+    return normalizeDevicePairingStatusSnapshot(localList);
+  } finally {
+    client.disconnect();
+  }
+}
+
+async function approveDevicePairingRequestFromGatewayOrLocalFallback(requestId: string) {
+  const connection = readConfiguredDevicePairingGatewayConnection();
+  const client = new OpenClawClient(connection);
+
+  try {
+    return await client.call(
+      'device.pair.approve',
+      { requestId },
+      OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS,
+    );
+  } catch (error) {
+    if (!shouldUseLocalDevicePairingFallback(connection, error)) {
+      throw error;
+    }
+
+    const localApi = await loadOpenClawLocalDevicePairingApi();
+    return await localApi.approveDevicePairing(requestId, { callerScopes: ['operator.admin'] });
+  } finally {
+    client.disconnect();
+  }
+}
+
+async function readDevicePairingStatus(): Promise<DevicePairingStatusSnapshot> {
+  return listDevicePairingStatusFromGatewayOrLocalFallback();
+}
+
+async function safeReadDevicePairingStatus(): Promise<DevicePairingStatusSnapshot> {
+  try {
+    return await readDevicePairingStatus();
+  } catch (error: any) {
+    return {
+      pending: [],
+      latestPending: null,
+      pairedCount: null,
+      rawDetail: readCliErrorDetail(error) || 'Failed to inspect device pairing status.',
+    };
+  }
+}
+
+async function approveLatestDevicePairingRequest() {
+  const currentStatus = await readDevicePairingStatus();
+  const latestPending = currentStatus.latestPending;
+  if (!latestPending) {
+    throw new StructuredRequestError(
+      409,
+      GATEWAY_DEVICE_PAIRING_NO_PENDING_ERROR_CODE,
+      'No pending device pairing requests to approve.',
+    );
+  }
+
+  const approved = await approveDevicePairingRequestFromGatewayOrLocalFallback(latestPending.requestId);
+  if (approved?.status === 'forbidden') {
+    throw new StructuredRequestError(
+      403,
+      GATEWAY_DEVICE_PAIRING_APPROVE_FAILED_ERROR_CODE,
+      normalizeCliText(approved.missingScope)
+        ? `Missing scope: ${approved.missingScope}`
+        : 'Failed to approve the latest device pairing request.',
+    );
+  }
+
+  if (approved == null) {
+    throw new StructuredRequestError(
+      409,
+      GATEWAY_DEVICE_PAIRING_NO_PENDING_ERROR_CODE,
+      'No pending device pairing requests to approve.',
+    );
+  }
+
+  return {
+    approvedRequestId: latestPending.requestId,
+    approvedDeviceId: normalizeCliText(approved?.device?.deviceId) || latestPending.deviceId,
+    approvedDeviceName: normalizeCliText(approved?.device?.displayName) || latestPending.displayName,
+    devicePairing: await safeReadDevicePairingStatus(),
+  };
+}
+
 function buildHostTakeoverChatInstruction() {
   const currentUser = getCurrentUserName();
   return [
@@ -3460,6 +3744,64 @@ function normalizeConfiguredBrowserProfile(config: any): string {
     || BROWSER_HEALTH_PROFILE;
 }
 
+function applyBrowserRepairSettingsToOpenClawConfig(config: any): boolean {
+  if (!config || typeof config !== 'object') {
+    return false;
+  }
+
+  if (!config.browser || typeof config.browser !== 'object') {
+    config.browser = {};
+  }
+
+  const currentPolicy = config.browser.ssrfPolicy && typeof config.browser.ssrfPolicy === 'object'
+    ? { ...config.browser.ssrfPolicy }
+    : {};
+  const desiredAllowPrivateNetwork = true;
+  let changed = false;
+
+  if ('allowPrivateNetwork' in currentPolicy) {
+    delete currentPolicy.allowPrivateNetwork;
+    changed = true;
+  }
+
+  if (currentPolicy.dangerouslyAllowPrivateNetwork !== desiredAllowPrivateNetwork) {
+    currentPolicy.dangerouslyAllowPrivateNetwork = desiredAllowPrivateNetwork;
+    changed = true;
+  }
+
+  if (changed) {
+    config.browser.ssrfPolicy = currentPolicy;
+  }
+
+  return changed;
+}
+
+function synchronizeConfiguredBrowserRepairSettings() {
+  const config = readOpenClawConfig();
+  if (!config) {
+    return {
+      changed: false,
+    };
+  }
+
+  const changed = applyBrowserRepairSettingsToOpenClawConfig(config);
+  if (changed) {
+    writeOpenClawConfig(config);
+  }
+
+  return {
+    changed,
+  };
+}
+
+function synchronizeConfiguredBrowserRepairSettingsBestEffort() {
+  try {
+    synchronizeConfiguredBrowserRepairSettings();
+  } catch (error) {
+    console.error('Failed to synchronize browser repair settings into openclaw.json:', error);
+  }
+}
+
 function readBrowserConfigState(): BrowserConfigState {
   const config = readOpenClawConfig();
   const profile = normalizeConfiguredBrowserProfile(config);
@@ -3669,7 +4011,7 @@ function applyMaxPermissionsConfig(config: any, enabled: boolean) {
 
     if (!config.browser) config.browser = {};
     config.browser.enabled = true;
-    delete config.browser.ssrfPolicy;
+    applyBrowserRepairSettingsToOpenClawConfig(config);
   } else {
     config.tools = { profile: 'coding' };
   }
@@ -3780,6 +4122,7 @@ setImmediate(() => {
   synchronizeOpenClawExecPreflightBypassBestEffort(maxPermissionsEnabled);
   synchronizeOpenClawBrowserFillCompatBestEffort();
   if (maxPermissionsEnabled) {
+    synchronizeConfiguredBrowserRepairSettingsBestEffort();
     warmManagedHostToolingInBackground();
   }
 });
@@ -3837,6 +4180,25 @@ async function stopOpenClawBrowserBestEffort() {
   } catch (error) {
     // Browser may already be stopped or the CLI may time out; self-heal should continue.
   }
+}
+
+async function resetOpenClawBrowserProfile() {
+  const browserConfig = readBrowserConfigState();
+  await runOpenClawBrowserCommand(
+    buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_SELF_HEAL_RESET_PROFILE_TIMEOUT_MS), 'reset-profile']),
+    BROWSER_SELF_HEAL_RESET_PROFILE_TIMEOUT_MS + 3000
+  );
+}
+
+function shouldRetryBrowserRepairWithProfileReset(lastKnownIssue: BrowserHealthIssue | null) {
+  const browserConfig = readBrowserConfigState();
+  if (browserConfig.attachOnly === true) {
+    return false;
+  }
+
+  return lastKnownIssue === 'detect-error'
+    || lastKnownIssue === 'timeout'
+    || lastKnownIssue === 'unknown';
 }
 
 function sleep(ms: number) {
@@ -3921,23 +4283,6 @@ async function runBrowserRuntimeReadinessCheck(reportProgress?: BrowserTaskProgr
       detail,
     };
   }
-}
-
-async function waitForBrowserHealth(timeoutMs: number, reportProgress?: BrowserTaskProgressReporter) {
-  const deadline = Date.now() + timeoutMs;
-  let terminalFailure = false;
-
-  while (Date.now() < deadline) {
-    const readiness = await runBrowserRuntimeReadinessCheck(reportProgress);
-    if (readiness.ready) {
-      return runBrowserHealthCheck(reportProgress);
-    }
-    terminalFailure = readiness.terminalFailure;
-    if (terminalFailure) break;
-    await sleep(BROWSER_SELF_HEAL_POLL_INTERVAL_MS);
-  }
-
-  return runBrowserHealthCheck(reportProgress);
 }
 
 async function runDeferredBrowserWarmupOnce(): Promise<{ ready: boolean; detail: string | null }> {
@@ -6365,6 +6710,7 @@ app.post('/api/config/browser-headed-mode', (req, res) => {
 app.post('/api/config/browser-health/self-heal', async (_req, res) => {
   let taskStarted = false;
   try {
+    const lastKnownIssue = _req.body?.lastKnownIssue;
     ensureBrowserTaskIdle();
     updateBrowserTaskSnapshot({
       status: 'repairing',
@@ -6381,21 +6727,38 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
       });
     };
 
-    const before = await runBrowserHealthCheck(reportRepairProgress);
-
     reportRepairProgress('enable-permissions');
     await configureMaxPermissionsState(true);
+    reportRepairProgress('sync-browser-settings');
+    synchronizeConfiguredBrowserRepairSettings();
     reportRepairProgress('restart-gateway');
     await restartGatewayService();
     reportRepairProgress('stop-browser');
     await stopOpenClawBrowserBestEffort();
-    const after = await waitForBrowserHealth(BROWSER_SELF_HEAL_POLL_TIMEOUT_MS, reportRepairProgress);
+
+    const shouldResetProfile = shouldRetryBrowserRepairWithProfileReset(
+      lastKnownIssue === 'permissions'
+      || lastKnownIssue === 'disabled'
+      || lastKnownIssue === 'stopped'
+      || lastKnownIssue === 'detect-error'
+      || lastKnownIssue === 'timeout'
+      || lastKnownIssue === 'unknown'
+        ? lastKnownIssue
+        : null
+    );
+
+    if (shouldResetProfile) {
+      reportRepairProgress('reset-profile');
+      await stopOpenClawBrowserBestEffort();
+      await resetOpenClawBrowserProfile();
+    }
+
+    reportRepairProgress('finalize');
 
     res.json({
       success: true,
-      before,
-      after,
       gatewayRestarted: true,
+      resetProfile: shouldResetProfile,
     });
   } catch (error: any) {
     if (isStructuredRequestError(error)) {
@@ -6414,8 +6777,11 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
 
 app.get('/api/config/max-permissions', async (_req, res) => {
   const enabled = readMaxPermissionsEnabled() === true;
-  const hostTakeover = await safeReadHostTakeoverStatus(enabled);
-  res.json({ enabled, hostTakeover });
+  const [hostTakeover, devicePairing] = await Promise.all([
+    safeReadHostTakeoverStatus(enabled),
+    safeReadDevicePairingStatus(),
+  ]);
+  res.json({ enabled, hostTakeover, devicePairing });
 });
 
 app.post('/api/config/max-permissions', async (req, res) => {
@@ -6424,15 +6790,20 @@ app.post('/api/config/max-permissions', async (req, res) => {
 
   try {
     const result = await configureMaxPermissionsState(requestedEnabled, { systemPassword });
+    const devicePairing = await safeReadDevicePairingStatus();
     res.json({
       success: true,
       enabled: result.enabled,
       restartRequired: true,
       hostTakeover: result.hostTakeover,
+      devicePairing,
     });
   } catch (error: any) {
     const currentEnabled = readMaxPermissionsEnabled() === true;
-    const hostTakeover = await safeReadHostTakeoverStatus(requestedEnabled || currentEnabled);
+    const [hostTakeover, devicePairing] = await Promise.all([
+      safeReadHostTakeoverStatus(requestedEnabled || currentEnabled),
+      safeReadDevicePairingStatus(),
+    ]);
     hostTakeover.enabled = currentEnabled;
 
     if (isStructuredRequestError(error)) {
@@ -6440,6 +6811,7 @@ app.post('/api/config/max-permissions', async (req, res) => {
         ...error.payload,
         enabled: currentEnabled,
         hostTakeover,
+        devicePairing,
       });
     }
 
@@ -6450,7 +6822,30 @@ app.post('/api/config/max-permissions', async (req, res) => {
       ),
       enabled: currentEnabled,
       hostTakeover,
+      devicePairing,
     });
+  }
+});
+
+app.post('/api/config/max-permissions/device-pairing/approve', async (_req, res) => {
+  try {
+    const result = await approveLatestDevicePairingRequest();
+    res.json({
+      success: true,
+      approvedRequestId: result.approvedRequestId,
+      approvedDeviceId: result.approvedDeviceId,
+      approvedDeviceName: result.approvedDeviceName,
+      devicePairing: result.devicePairing,
+    });
+  } catch (error: any) {
+    if (isStructuredRequestError(error)) {
+      return res.status(error.status).json(error.payload);
+    }
+
+    res.status(500).json(buildStructuredApiError(
+      GATEWAY_DEVICE_PAIRING_APPROVE_FAILED_ERROR_CODE,
+      readCliErrorDetail(error) || error?.message || 'Failed to approve the latest device pairing request.',
+    ));
   }
 });
 
