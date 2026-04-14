@@ -190,6 +190,8 @@ type StructuredMessageParams = Record<string, string | number | boolean | null>;
 const CHAT_RUN_ERROR_CODE = 'chat.runError';
 const CHAT_GATEWAY_DISCONNECTED_CODE = 'chat.gatewayDisconnected';
 const CHAT_GATEWAY_DISCONNECTED_DETAIL = 'Connection to gateway lost. The process might have restarted.';
+const CHAT_LATEST_ROUND_ONLY_CODE = 'chat.latestRoundOnly';
+const CHAT_LATEST_ROUND_ONLY_DETAIL = 'Only the latest round can be edited or regenerated.';
 const CHAT_RUN_ERROR_PREFIX = '❌ Error: ';
 const GATEWAY_TEST_FAILED_ERROR_CODE = 'gateway.testFailed';
 const GATEWAY_RESTART_FAILED_ERROR_CODE = 'gateway.restartFailed';
@@ -5319,6 +5321,8 @@ if (mainRegistered) {
   console.log('[Startup] Main agent workspace registered in openclaw.json');
 }
 
+const connections = new Map<string, OpenClawClient>();
+
 for (const group of db.getGroupChats()) {
   try {
     cleanupLegacyGroupRuntimeArtifacts(group.id);
@@ -5393,7 +5397,6 @@ async function prepareOutgoingMessage(
   };
 }
 
-const connections = new Map<string, OpenClawClient>();
 const AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES = new Set([
   'AGENTS.md',
   'BOOTSTRAP.md',
@@ -7445,9 +7448,17 @@ app.delete('/api/sessions/:id', async (req, res) => {
   }
 
   const agentId = session.agentId;
+  const interruptedEpoch = getSessionInterruptionEpoch(req.params.id);
+  bumpSessionInterruptionEpoch(req.params.id);
+  pendingChatPreparationManager.cancel(req.params.id, interruptedEpoch);
+  try {
+    await activeRunManager.abortRun(req.params.id);
+  } catch {}
+  disconnectConnection(req.params.id);
   const success = sessionManager.deleteSession(req.params.id);
   
   if (success) {
+    sessionInterruptionEpochs.delete(req.params.id);
     if (agentId && agentId !== 'main') {
       const configChanged = await agentProvisioner.deprovision(agentId);
       if (configChanged) {
@@ -8272,6 +8283,41 @@ class ActiveRunManager {
 const activeRunManager = new ActiveRunManager(db);
 const pendingChatPreparationManager = new PendingChatPreparationManager();
 
+// Force overlapping requests for the same session onto a fresh interruption epoch so
+// stale pending work or an older run cannot keep mutating state after a newer send begins.
+async function interruptSessionStreamingStateForNewRun(sessionId: string): Promise<number> {
+  const interruptedEpoch = getSessionInterruptionEpoch(sessionId);
+  const nextEpoch = bumpSessionInterruptionEpoch(sessionId);
+  const pendingPreparation = pendingChatPreparationManager.get(sessionId, interruptedEpoch);
+  const activeRun = activeRunManager.getRun(sessionId);
+
+  if (pendingPreparation) {
+    pendingChatPreparationManager.cancel(sessionId, interruptedEpoch);
+    try {
+      db.deleteMessage(pendingPreparation.messageId);
+    } catch (error) {
+      console.warn(
+        `[chat] Failed to delete interrupted pending assistant message ${pendingPreparation.messageId} for session ${sessionId}:`,
+        error,
+      );
+    }
+  }
+
+  if (activeRun) {
+    try {
+      await activeRunManager.abortRun(sessionId);
+    } catch (error) {
+      console.warn(`[chat] Failed to abort previous run ${activeRun.runId} for session ${sessionId}:`, error);
+    }
+  }
+
+  if (pendingPreparation || activeRun) {
+    disconnectConnection(sessionId);
+  }
+
+  return nextEpoch;
+}
+
 async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<void> {
   if (activeRunManager.getRun(sessionId) || pendingChatPreparationManager.get(sessionId)) {
     return;
@@ -8398,6 +8444,82 @@ function getLatestChatRegenerateTarget(sessionId: string): {
   };
 }
 
+type ParsedChatCommand = {
+  command: string;
+  argsText: string;
+};
+
+type ResolvedChatCommandResult = {
+  content: string;
+  clearBeforeSave?: boolean;
+};
+
+function parseChatCommand(rawMessage: unknown): ParsedChatCommand | null {
+  const normalized = normalizeCliText(rawMessage);
+  if (!normalized.startsWith('/')) return null;
+  const [token = ''] = normalized.split(/\s+/, 1);
+  const command = token.toLowerCase();
+  if (!command.startsWith('/') || command.length < 2) return null;
+  return {
+    command,
+    argsText: normalized.slice(token.length).trim(),
+  };
+}
+
+function listConfiguredQuickCommands() {
+  return (db.getQuickCommands() as Array<{ command?: unknown; description?: unknown }>)
+    .map((entry) => ({
+      command: normalizeCliText(entry.command).toLowerCase(),
+      description: normalizeCliText(entry.description),
+    }))
+    .filter((entry) => entry.command.startsWith('/'));
+}
+
+const builtinChatCommandOptions: Record<string, { clearBeforeSave?: boolean }> = {
+  '/status': {},
+  '/help': {},
+  '/models': {},
+  '/clear': { clearBeforeSave: true },
+};
+
+async function resolveChatCommandResult(
+  parsed: ParsedChatCommand,
+  sessionId: string,
+): Promise<ResolvedChatCommandResult | null> {
+  const configuredCommands = listConfiguredQuickCommands();
+  const configuredCommandSet = new Set(configuredCommands.map((entry) => entry.command));
+  const builtinOptions = builtinChatCommandOptions[parsed.command];
+  const shouldExecuteAsNativeCommand = Boolean(builtinOptions) || configuredCommandSet.has(parsed.command);
+  if (!shouldExecuteAsNativeCommand) {
+    return null;
+  }
+
+  const commandLine = parsed.argsText ? `${parsed.command} ${parsed.argsText}` : parsed.command;
+
+  try {
+    const client = await getConnection(sessionId);
+    const sessionInfo = sessionManager.getSession(sessionId);
+    const nativeText = normalizeCliText(await client.sendChatMessage({
+      sessionKey: sessionId,
+      agentId: sessionInfo?.agentId || 'main',
+      message: commandLine,
+    }));
+    if (!nativeText || nativeText === 'No assistant text found in response.') {
+      throw new Error('No response text from native command runtime.');
+    }
+    return {
+      content: nativeText,
+      clearBeforeSave: builtinOptions?.clearBeforeSave,
+    };
+  } catch (error) {
+    const detail = readCliErrorDetail(error) || 'Native command execution failed.';
+    return {
+      content: `❌ ${detail}`,
+      clearBeforeSave: builtinOptions?.clearBeforeSave,
+    };
+  }
+}
+
 app.post('/api/chat', async (req, res) => {
   const { sessionId, message, parentId } = req.body;
 
@@ -8405,19 +8527,29 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId or message'));
   }
 
-  const sessionInterruptionEpoch = getSessionInterruptionEpoch(String(sessionId));
+  const normalizedSessionId = String(sessionId);
+  const sessionInterruptionEpoch = await interruptSessionStreamingStateForNewRun(normalizedSessionId);
 
   let userMsgId: number | undefined;
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
 
   try {
-    const sessionInfo = sessionManager.getSession(sessionId);
-    let finalMessage = String(message);
+    const rawMessage = String(message);
+    const parsedCommand = parseChatCommand(rawMessage);
+    const sessionInfo = sessionManager.getSession(normalizedSessionId);
+    let finalMessage = rawMessage;
     let injectedInstructions = '';
 
+    const agentId = sessionInfo?.agentId || 'main';
+    const allCharacters = db.getCharacters();
+    const character = allCharacters.find(c => c.agentId === agentId);
+    const agentName = sessionInfo?.name || character?.name || agentId;
+    const modelUsed = agentProvisioner.readAgentModel(agentId) ||
+      agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+
     if (sessionInfo) {
-      const history = db.getMessages(sessionId, 1);
+      const history = db.getMessages(normalizedSessionId, 1);
       if (history.length === 0 && sessionInfo.prompt) {
         injectedInstructions += `${sessionInfo.prompt}\n\n`;
       }
@@ -8433,23 +8565,62 @@ app.post('/api/chat', async (req, res) => {
       finalMessage = `${injectedInstructions}${finalMessage}`;
     }
 
+    if (parsedCommand) {
+      const commandResult = await resolveChatCommandResult(parsedCommand, normalizedSessionId);
+      if (commandResult) {
+        if (commandResult.clearBeforeSave) {
+          db.deleteMessagesBySession(normalizedSessionId);
+          clearStoredFilesBySessionKey(normalizedSessionId);
+        }
+
+        let finalParentId = parentId ? Number(parentId) : undefined;
+        if (finalParentId === undefined) {
+          const history = db.getMessages(normalizedSessionId, 1);
+          finalParentId = history.length > 0 ? history[history.length - 1].id : undefined;
+        }
+
+        userMsgId = Number(db.saveMessage({
+          session_key: normalizedSessionId,
+          parent_id: finalParentId,
+          role: 'user',
+          content: rawMessage,
+        }));
+
+        assistantMsgId = Number(db.saveMessage({
+          session_key: normalizedSessionId,
+          parent_id: userMsgId,
+          role: 'assistant',
+          content: commandResult.content,
+          model_used: modelUsed,
+          agent_id: agentId,
+          agent_name: agentName,
+        }));
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders();
+        res.write(':' + Array(2048).fill(' ').join('') + '\n\n');
+        res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId, assistantMsgId })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'final', text: commandResult.content })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Unknown slash command falls back to normal chat flow.
+    }
+
     let finalParentId = parentId ? Number(parentId) : undefined;
     if (finalParentId === undefined) {
-      const history = db.getMessages(sessionId, 1);
+      const history = db.getMessages(normalizedSessionId, 1);
       finalParentId = history.length > 0 ? history[history.length - 1].id : undefined;
     }
 
-    userMsgId = Number(db.saveMessage({ session_key: sessionId, parent_id: finalParentId, role: 'user', content: String(message) }));
-    const agentId = sessionInfo?.agentId || 'main';
-
-    const allCharacters = db.getCharacters();
-    const character = allCharacters.find(c => c.agentId === agentId);
-    const agentName = sessionInfo?.name || character?.name || agentId;
-    const modelUsed = agentProvisioner.readAgentModel(agentId) ||
-      agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
+    userMsgId = Number(db.saveMessage({ session_key: normalizedSessionId, parent_id: finalParentId, role: 'user', content: rawMessage }));
 
     assistantMsgId = Number(db.saveMessage({
-      session_key: sessionId,
+      session_key: normalizedSessionId,
       parent_id: userMsgId,
       role: 'assistant',
       content: '', // empty initially
@@ -8469,7 +8640,7 @@ app.post('/api/chat', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId, assistantMsgId })}\n\n`);
 
     pendingChatPreparationManager.start({
-      sessionId,
+      sessionId: normalizedSessionId,
       epoch: sessionInterruptionEpoch,
       messageId: assistantMsgId,
       agentId,
@@ -8478,60 +8649,66 @@ app.post('/api/chat', async (req, res) => {
       startedAt: Date.now(),
     });
     pendingPreparationActive = true;
-    pendingChatPreparationManager.attachClient(sessionId, res, {
+    pendingChatPreparationManager.attachClient(normalizedSessionId, res, {
       announceAttach: true,
       expectedEpoch: sessionInterruptionEpoch,
     });
 
-    const client = await getConnection(sessionId);
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    const client = await getConnection(normalizedSessionId);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
-    const expectedSessionKey = sessionId.startsWith('agent:')
-      ? sessionId
-      : `agent:${agentId}:chat:${sessionId}`;
+    const expectedSessionKey = normalizedSessionId.startsWith('agent:')
+      ? normalizedSessionId
+      : `agent:${agentId}:chat:${normalizedSessionId}`;
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
-      sessionKey: sessionId,
+      sessionKey: normalizedSessionId,
       message: outgoingMessage.text,
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
-    if (getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch) {
+    if (getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch) {
       try {
         await client.abortChat({ sessionKey: finalSessionKey, runId });
       } catch {}
-      throw new SessionInterruptedError(sessionId);
+      throw new SessionInterruptedError(normalizedSessionId);
     }
 
     const run = activeRunManager.startRun(
-      sessionId,
+      normalizedSessionId,
       runId,
       agentId,
       agentName,
       modelUsed,
       assistantMsgId,
-      getSessionWorkspacePath(sessionId),
+      getSessionWorkspacePath(normalizedSessionId),
       client,
       finalSessionKey,
       preRunHistorySnapshot
     );
-    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId, sessionInterruptionEpoch);
+    const pendingClients = pendingChatPreparationManager.promoteClients(normalizedSessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
     pendingClients.forEach((clientRes) => {
-      activeRunManager.attachClient(sessionId, clientRes);
+      activeRunManager.attachClient(normalizedSessionId, clientRes);
     });
 
   } catch (error: any) {
-    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
+    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.cancel(sessionId, sessionInterruptionEpoch);
+        if (typeof assistantMsgId === 'number') {
+          try {
+            db.deleteMessage(assistantMsgId);
+            assistantMsgId = undefined;
+          } catch {}
+        }
+        pendingChatPreparationManager.cancel(normalizedSessionId, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else if (res.headersSent) {
         try {
@@ -8548,7 +8725,7 @@ app.post('/api/chat', async (req, res) => {
       structuredErrorInput.rawDetail,
       structuredErrorInput.messageCode
     );
-    const sessionInfo = db.getSession(sessionId);
+    const sessionInfo = db.getSession(normalizedSessionId);
     const agentId = sessionInfo?.agentId || 'main';
     const character = db.getCharacters().find(c => c.agentId === agentId);
     const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
@@ -8561,7 +8738,7 @@ app.post('/api/chat', async (req, res) => {
     } else if (typeof userMsgId === 'number') {
       try {
         assistantMsgId = Number(db.saveMessage({
-          session_key: sessionId,
+          session_key: normalizedSessionId,
           parent_id: userMsgId,
           role: structuredError.role,
           content: structuredError.content,
@@ -8603,7 +8780,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId, message, or parentId'));
   }
 
-  const sessionInterruptionEpoch = getSessionInterruptionEpoch(String(sessionId));
+  const sessionInterruptionEpoch = await interruptSessionStreamingStateForNewRun(String(sessionId));
 
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
@@ -8615,35 +8792,28 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const latestUserId = Number(latestUserMessage?.id);
     const latestReplyId = Number(latestReplyMessage?.id);
     const latestReplyParentId = Number(latestReplyMessage?.parent_id);
-    let numericParentId = Number.isFinite(requestedParentId) ? requestedParentId : NaN;
-
-    if (
-      Number.isFinite(numericParentId)
-      && Number.isFinite(latestReplyId)
-      && numericParentId === latestReplyId
-      && Number.isFinite(latestReplyParentId)
-    ) {
-      numericParentId = latestReplyParentId;
+    const latestRoundTargetIds = new Set<number>();
+    if (Number.isFinite(latestUserId)) {
+      latestRoundTargetIds.add(latestUserId);
+    }
+    if (Number.isFinite(latestReplyId)) {
+      latestRoundTargetIds.add(latestReplyId);
     }
 
-    if (!Number.isFinite(numericParentId) && Number.isFinite(requestedTargetMessageId)) {
-      if (requestedTargetMessageId === latestUserId) {
-        numericParentId = latestUserId;
-      } else if (
-        Number.isFinite(latestReplyId)
-        && requestedTargetMessageId === latestReplyId
-        && Number.isFinite(latestReplyParentId)
-      ) {
-        numericParentId = latestReplyParentId;
-      }
-    }
+    const requestReferencesLatestRound = [requestedParentId, requestedTargetMessageId].some((candidateId) => (
+      Number.isFinite(candidateId) && latestRoundTargetIds.has(candidateId)
+    ));
+    const numericParentId = latestUserId;
 
     if (
       !Number.isFinite(numericParentId)
       || !latestUserMessage
-      || latestUserId !== numericParentId
+      || !requestReferencesLatestRound
     ) {
-      return res.status(409).json(buildStructuredChatHttpError('Regenerate is only allowed for the latest assistant reply.'));
+      return res.status(409).json(buildStructuredChatHttpError(
+        CHAT_LATEST_ROUND_ONLY_DETAIL,
+        CHAT_LATEST_ROUND_ONLY_CODE,
+      ));
     }
 
     if (
@@ -8767,6 +8937,12 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
+        if (typeof assistantMsgId === 'number') {
+          try {
+            db.deleteMessage(assistantMsgId);
+            assistantMsgId = undefined;
+          } catch {}
+        }
         pendingChatPreparationManager.cancel(sessionId, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else if (res.headersSent) {

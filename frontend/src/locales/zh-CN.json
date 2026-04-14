@@ -265,6 +265,7 @@
     "quotedContent": "引用内容",
     "quickCommands": "快捷指令",
     "resultsCount": "{{count}} 个结果",
+    "latestRoundOnly": "只能编辑或重新生成最后一轮对话。",
     "inputPlaceholder": "Enter 发送消息，Shift + Enter 换行",
     "requestFailed": "请求失败",
     "previewRender": "预览渲染效果",
@@ -281,8 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "处理过程",
-    "editMessagePlaceholder": "编辑消息内容...",
-    "editHint": "Enter 发送，Shift+Enter 换行"
+    "editMessagePlaceholder": "编辑消息内容..."
   },
   "settings": {
     "general": {

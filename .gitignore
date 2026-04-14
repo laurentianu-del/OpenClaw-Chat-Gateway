@@ -33,3 +33,7 @@ yarn-error.log*
 .clawui_release/
 .clawui-build.json
 /tmp/
+backend/clawui.db
+backend/database.sqlite
+backend/nohup.out
+test-results/

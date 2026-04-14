@@ -265,6 +265,7 @@
     "quotedContent": "引用內容",
     "quickCommands": "快捷指令",
     "resultsCount": "{{count}} 個結果",
+    "latestRoundOnly": "只能編輯或重新生成最後一輪對話。",
     "inputPlaceholder": "Enter 送出訊息，Shift + Enter 換行",
     "requestFailed": "請求失敗",
     "previewRender": "預覽渲染效果",
@@ -281,8 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "處理過程",
-    "editMessagePlaceholder": "編輯訊息內容...",
-    "editHint": "Enter 送出，Shift+Enter 換行"
+    "editMessagePlaceholder": "編輯訊息內容..."
   },
   "settings": {
     "general": {

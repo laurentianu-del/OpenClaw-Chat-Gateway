@@ -176,6 +176,7 @@ export class DB {
       VALUES ('char_coder', '代码专家', 'coder', 'You are an expert software engineer and architect.');
 
       -- Insert default commands if they don't exist
+      INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/status', '查看 OpenClaw 网关状态');
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/models', '列出模型供应商可进一步变更模型');
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/help', '帮助信息');
       INSERT OR IGNORE INTO quick_commands (command, description) VALUES ('/clear', '清空当前会话');

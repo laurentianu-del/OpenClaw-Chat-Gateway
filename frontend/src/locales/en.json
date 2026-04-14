@@ -265,6 +265,7 @@
     "quotedContent": "Quoted Content",
     "quickCommands": "Quick Commands",
     "resultsCount": "{{count}} results",
+    "latestRoundOnly": "Only the latest round can be edited or regenerated.",
     "inputPlaceholder": "Press Enter to send, Shift + Enter for newline",
     "requestFailed": "Request failed",
     "previewRender": "Preview rendered output",
@@ -281,8 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "Processing",
-    "editMessagePlaceholder": "Edit message content...",
-    "editHint": "Press Enter to send, Shift+Enter for newline"
+    "editMessagePlaceholder": "Edit message content..."
   },
   "settings": {
     "general": {

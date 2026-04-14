@@ -1491,12 +1491,19 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                   }}
                   placeholder={t('messageBubble.editMessagePlaceholder')}
                 />
-                <div className="flex items-center justify-between px-3 py-2 border-t border-gray-100 bg-gray-50/50">
-                  <div className="text-[13px] text-gray-400 font-medium">{t('messageBubble.editHint')}</div>
-                  <div className="flex items-center gap-2">
-                    <button onClick={onCancelEdit} className="px-3 py-1.5 rounded-lg text-gray-500 hover:bg-gray-100 text-sm font-medium transition-colors">{t('common.cancel')}</button>
-                    <button onClick={onSaveEdit} className="px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 text-sm font-medium transition-colors">{t('common.send')}</button>
-                  </div>
+                <div className="flex items-center justify-end gap-2 px-3 py-2 border-t border-gray-100 bg-gray-50/50">
+                  <button
+                    onClick={onCancelEdit}
+                    className="inline-flex min-w-[72px] flex-shrink-0 items-center justify-center whitespace-nowrap px-3 py-1.5 rounded-lg text-gray-500 hover:bg-gray-100 text-sm font-medium transition-colors"
+                  >
+                    {t('common.cancel')}
+                  </button>
+                  <button
+                    onClick={onSaveEdit}
+                    className="inline-flex min-w-[72px] flex-shrink-0 items-center justify-center whitespace-nowrap px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 text-sm font-medium transition-colors"
+                  >
+                    {t('common.send')}
+                  </button>
                 </div>
               </div>
             ) : (

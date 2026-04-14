@@ -756,6 +756,8 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
   const skipNextAutoScrollRef = useRef(false);
   const isNearBottomRef = useRef(true);
   const forceAutoScrollRef = useRef(false);
+  const wasChatLoadingRef = useRef(false);
+  const wasGroupBusyRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -848,6 +850,55 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     return Array.from(active);
   }, [groupRunState.active, groupRunState.agentId, isGroup, typingAgents]);
   const isGroupBusy = isGroup && (groupRunState.active || activeProcessingAgents.length > 0);
+
+  const focusMainInput = useCallback(() => {
+    window.setTimeout(() => {
+      if (!activeKey || editingMessageId || isLoading) return;
+      if (inputPreview) {
+        setInputPreview(false);
+        window.setTimeout(() => {
+          if (!activeKey || editingMessageId || isLoading) return;
+          const textarea = textareaRef.current;
+          if (!textarea) return;
+          textarea.focus();
+          const caret = textarea.value.length;
+          textarea.setSelectionRange(caret, caret);
+        }, 0);
+        return;
+      }
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      const caret = textarea.value.length;
+      textarea.setSelectionRange(caret, caret);
+    }, 0);
+  }, [activeKey, editingMessageId, inputPreview, isLoading]);
+
+  useEffect(() => {
+    if (!isChat) {
+      wasChatLoadingRef.current = false;
+      return;
+    }
+
+    const wasLoading = wasChatLoadingRef.current;
+    if (wasLoading && !isLoading) {
+      focusMainInput();
+    }
+    wasChatLoadingRef.current = isLoading;
+  }, [focusMainInput, isChat, isLoading]);
+
+  useEffect(() => {
+    if (!isGroup) {
+      wasGroupBusyRef.current = false;
+      return;
+    }
+
+    const wasBusy = wasGroupBusyRef.current;
+    if (wasBusy && !isGroupBusy) {
+      focusMainInput();
+    }
+    wasGroupBusyRef.current = isGroupBusy;
+  }, [focusMainInput, isGroup, isGroupBusy]);
 
   const formatMessageDate = useCallback((date: Date | string | number) => (
     new Date(date).toLocaleDateString(currentLocale, { year: 'numeric', month: 'long', day: 'numeric' })
@@ -2547,6 +2598,13 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     doCopy(text);
   };
 
+  const resetEditComposer = useCallback(() => {
+    setEditingMessageId(null);
+    setEditContent('');
+    setEditExistingAttachments([]);
+    setEditPendingFiles([]);
+  }, []);
+
   const handleQuote = (msg: ChatMessage) => { setQuotedMessage(msg); textareaRef.current?.focus(); };
 
   const handleDeleteMessage = (msgId: string) => {
@@ -2612,6 +2670,10 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
 
   const handleSaveEdit = async () => {
     if (!editingMessageId) return;
+    const targetMessageId = editingMessageId;
+    const currentEditContent = editContent.trim();
+    const currentExistingAttachments = [...editExistingAttachments];
+    const currentPendingFiles = [...editPendingFiles];
     clearNewerHistoryWindowTrail();
 
     const serializeAttachmentMarkdown = (attachment: { name?: string; url: string; isImage?: boolean }) => {
@@ -2619,55 +2681,59 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       return `${attachment.isImage ? '!' : ''}[${attachmentName}](${attachment.url})`;
     };
 
-    const existingAttachmentContent = editExistingAttachments
+    const existingAttachmentContent = currentExistingAttachments
       .map((attachment) => serializeAttachmentMarkdown(attachment))
       .join('\n');
-    const uploadedAttachmentContent = editPendingFiles.length > 0
-      ? await uploadFiles(editPendingFiles)
+    const uploadedAttachmentContent = currentPendingFiles.length > 0
+      ? await uploadFiles(currentPendingFiles)
       : '';
-    const nextContent = [existingAttachmentContent, uploadedAttachmentContent, editContent.trim()]
+    const nextContent = [existingAttachmentContent, uploadedAttachmentContent, currentEditContent]
       .filter(Boolean)
       .join('\n\n');
 
     if (!nextContent) return;
 
     // Optimistic UI Update
-    setMessages(prev => prev.map(m => m.id === editingMessageId ? { ...m, content: nextContent } : m));
+    setMessages(prev => prev.map(m => m.id === targetMessageId ? { ...m, content: nextContent } : m));
 
-    const editedMsg = messages.find(m => m.id === editingMessageId);
+    const currentMessages = messagesRef.current;
+    const editedMsg = currentMessages.find(m => m.id === targetMessageId);
+
+    resetEditComposer();
+    focusMainInput();
 
     if (isChat) {
       try {
-        await fetch(`/api/messages/${editingMessageId}`, {
+        await fetch(`/api/messages/${targetMessageId}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: nextContent })
         });
         
         // Auto-regenerate if it's a user message
         if (editedMsg && editedMsg.role === 'user') {
-          const latestReply = [...messages].reverse().find(message =>
+          const latestReply = [...currentMessages].reverse().find(message =>
             (message.role === 'assistant' || message.role === 'system')
-            && message.parentId === editingMessageId
+            && message.parentId === targetMessageId
           );
-          const regenerateTarget = latestReply ?? ({ id: `dummy-${Date.now()}`, role: 'assistant', parentId: editingMessageId } as ChatMessage);
+          const regenerateTarget = latestReply ?? ({ id: `dummy-${Date.now()}`, role: 'assistant', parentId: targetMessageId } as ChatMessage);
           await handleRegenerate(
             regenerateTarget,
             nextContent,
             {
-              explicitParentId: editingMessageId,
-              targetMessageId: editingMessageId,
+              explicitParentId: targetMessageId,
+              targetMessageId: latestReply && isPersistedMessageId(latestReply.id)
+                ? latestReply.id
+                : targetMessageId,
             },
           );
         }
       } catch {}
     } else if (isGroup && currentGroup) {
       try {
-        await fetch(`/api/groups/${currentGroup.id}/messages/${editingMessageId}`, {
+        await fetch(`/api/groups/${currentGroup.id}/messages/${targetMessageId}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: nextContent })
         });
       } catch {}
     }
-    
-    setEditingMessageId(null); setEditContent(''); setEditExistingAttachments([]); setEditPendingFiles([]);
   };
 
   const handleRegenerate = async (
@@ -2692,14 +2758,15 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       const updateAssistantMessages = (updater: (message: ChatMessage) => ChatMessage) => {
         setMessages(prev => prev.map(message => assistantTargetIds.has(message.id) ? updater(message) : message));
       };
+      const currentMessages = messagesRef.current;
       let parentId = options?.explicitParentId || msg.parentId;
       const requestTargetMessageId = options?.targetMessageId || msg.id;
-      if (!parentId) { const idx = messages.findIndex(m => m.id === msg.id); if (idx > 0) parentId = messages[idx - 1]?.id; }
+      if (!parentId) { const idx = currentMessages.findIndex(m => m.id === msg.id); if (idx > 0) parentId = currentMessages[idx - 1]?.id; }
       if (isLoading || !activeKey || !parentId) return;
       clearNewerHistoryWindowTrail();
       setIsLoading(true);
       try {
-        const parentUserMsg = messages.find(m => m.id === parentId);
+        const parentUserMsg = currentMessages.find(m => m.id === parentId);
         const contentStr = customParentContent || parentUserMsg?.content || 'Continue';
         const currentSession = sessions.find(s => s.id === activeKey);
         forceAutoScrollRef.current = true;
@@ -3598,7 +3665,7 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                     onSetEditExistingAttachments={setEditExistingAttachments} onSetEditPendingFiles={setEditPendingFiles}
                     onDropNewFiles={undefined}
                     onEditClick={(attachments, text) => { setEditingMessageId(msg.id); setEditContent(text); setEditExistingAttachments(attachments); setEditPendingFiles([]); }}
-                    onCancelEdit={() => { setEditingMessageId(null); setEditContent(''); setEditExistingAttachments([]); setEditPendingFiles([]); }}
+                    onCancelEdit={resetEditComposer}
                     onSaveEdit={handleSaveEdit}
                     onRegenerate={() => handleRegenerate(msg)}
                     onQuote={() => handleQuote(msg)}
