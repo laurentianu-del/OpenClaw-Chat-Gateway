@@ -1812,6 +1812,7 @@ function getExecApprovalsPath() {
 
 const OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER = 'openclaw-chat-gateway:max-permissions-exec-preflight-bypass';
 const OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE = 'async function validateScriptFileForShellBleed(params) {';
+const OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE_PATTERN = /async function validateScriptFileForShellBleed\s*\(\s*[^)]*\)\s*\{/;
 const OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE = `async function validateScriptFileForShellBleed(params) { return; /* ${OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER} */`;
 const OPENCLAW_EXEC_PREFLIGHT_PATCH_BACKUP_SUFFIX = '.clawui-max-permissions.exec-preflight.bak';
 const OPENCLAW_BROWSER_FILL_COMPAT_MARKER = 'openclaw-chat-gateway:browser-fill-compat';
@@ -2044,6 +2045,14 @@ function isOpenClawExecPreflightBypassPatched(source: string) {
     || source.includes(OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE);
 }
 
+function detectOpenClawExecPreflightValidatorSignature(source: string): string | null {
+  if (source.includes(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE)) {
+    return OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE;
+  }
+  const match = source.match(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE_PATTERN);
+  return match?.[0] || null;
+}
+
 function collectOpenClawExecPreflightPatchTargets(): OpenClawExecPreflightPatchTarget[] {
   const targets: OpenClawExecPreflightPatchTarget[] = [];
   const seen = new Set<string>();
@@ -2055,7 +2064,7 @@ function collectOpenClawExecPreflightPatchTargets(): OpenClawExecPreflightPatchT
     let entryNames: string[] = [];
     try {
       entryNames = fs.readdirSync(distDir)
-        .filter((entryName) => entryName.endsWith('.js'))
+        .filter((entryName) => entryName.endsWith('.js') || entryName.endsWith('.mjs'))
         .sort((left, right) => {
           const leftPriority = /^pi-embedded-.*\.js$/i.test(left) ? 0 : 1;
           const rightPriority = /^pi-embedded-.*\.js$/i.test(right) ? 0 : 1;
@@ -2076,7 +2085,7 @@ function collectOpenClawExecPreflightPatchTargets(): OpenClawExecPreflightPatchT
       if (!shouldInclude) {
         try {
           const source = readOpenClawExecPreflightSource(targetPath);
-          shouldInclude = source.includes(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE)
+          shouldInclude = detectOpenClawExecPreflightValidatorSignature(source) !== null
             || isOpenClawExecPreflightBypassPatched(source);
         } catch {
           shouldInclude = false;
@@ -2109,7 +2118,8 @@ function patchOpenClawExecPreflightBypassTarget(target: OpenClawExecPreflightPat
     return;
   }
 
-  if (!source.includes(OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE)) {
+  const validatorSignature = detectOpenClawExecPreflightValidatorSignature(source);
+  if (!validatorSignature) {
     throw new Error(`OpenClaw exec preflight validator signature not found in ${target.targetPath}.`);
   }
 
@@ -2118,8 +2128,8 @@ function patchOpenClawExecPreflightBypassTarget(target: OpenClawExecPreflightPat
   }
 
   const patchedSource = source.replace(
-    OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE,
-    OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE,
+    validatorSignature,
+    `${validatorSignature} return; /* ${OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER} */`,
   );
   if (patchedSource === source) {
     throw new Error(`Failed to patch OpenClaw exec preflight validator in ${target.targetPath}.`);
@@ -2147,8 +2157,11 @@ function restoreOpenClawExecPreflightBypassTarget(target: OpenClawExecPreflightP
   const restoredSource = source.replace(
     OPENCLAW_EXEC_PREFLIGHT_PATCHED_SIGNATURE,
     OPENCLAW_EXEC_PREFLIGHT_VALIDATOR_SIGNATURE,
+  ).replace(
+    new RegExp(`\\s*return; /\\* ${escapeRegExpForPattern(OPENCLAW_EXEC_PREFLIGHT_BYPASS_MARKER)} \\*/`),
+    '',
   );
-  if (restoredSource !== source) {
+  if (restoredSource !== source && !isOpenClawExecPreflightBypassPatched(restoredSource)) {
     fs.writeFileSync(target.targetPath, restoredSource);
   }
 }
@@ -3279,10 +3292,60 @@ function consumeBrowserWarmupRequest() {
   }
 }
 
+function resolveOpenClawPackageRootFromPath(inputPath: string | null | undefined): string | null {
+  const normalizedInput = normalizeCliText(inputPath);
+  if (!normalizedInput) return null;
+
+  let resolvedPath = normalizedInput;
+  try {
+    resolvedPath = fs.realpathSync(normalizedInput);
+  } catch {}
+
+  const marker = `${path.sep}node_modules${path.sep}openclaw${path.sep}`;
+  const markerIndex = resolvedPath.lastIndexOf(marker);
+  if (markerIndex !== -1) {
+    const rootPath = resolvedPath.slice(0, markerIndex + marker.length - 1);
+    return normalizeCliText(rootPath) || null;
+  }
+
+  let current = resolvedPath;
+  try {
+    if (!fs.statSync(current).isDirectory()) {
+      current = path.dirname(current);
+    }
+  } catch {
+    current = path.dirname(current);
+  }
+
+  while (current && current !== path.dirname(current)) {
+    if (path.basename(current) === 'openclaw' && path.basename(path.dirname(current)) === 'node_modules') {
+      return current;
+    }
+
+    const packageJsonPath = path.join(current, 'package.json');
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8')) as { name?: unknown };
+        if (normalizeCliText(packageJson?.name) === 'openclaw') {
+          return current;
+        }
+      } catch {}
+    }
+
+    current = path.dirname(current);
+  }
+
+  return null;
+}
+
 function collectOpenClawPackageRoots() {
+  const npmPrefix = normalizeCliText(process.env.npm_config_prefix);
   const moduleBaseDirs = [
     path.join(os.homedir(), '.npm-global', 'lib', 'node_modules'),
     path.join(os.homedir(), '.local', 'share', 'pnpm', 'global', '5', 'node_modules'),
+    '/usr/local/lib/node_modules',
+    '/usr/lib/node_modules',
+    npmPrefix ? path.join(npmPrefix, 'lib', 'node_modules') : '',
   ];
   const roots: string[] = [];
   const seen = new Set<string>();
@@ -3319,7 +3382,36 @@ function collectOpenClawPackageRoots() {
   try {
     const resolvedFromBin = fs.realpathSync(globalBinPath);
     pushRoot(path.dirname(resolvedFromBin));
+    const resolvedRoot = resolveOpenClawPackageRootFromPath(resolvedFromBin);
+    if (resolvedRoot) {
+      pushRoot(resolvedRoot);
+    }
   } catch {}
+
+  const executableName = process.platform === 'win32' ? 'openclaw.cmd' : 'openclaw';
+  const executableCandidates = [
+    normalizeCliText(process.env.OPENCLAW_BIN),
+    path.join(os.homedir(), '.npm-global', 'bin', executableName),
+    path.join(os.homedir(), '.local', 'bin', executableName),
+    '/usr/local/bin/openclaw',
+    '/usr/bin/openclaw',
+    ...normalizeCliText(process.env.PATH)
+      .split(path.delimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => path.join(entry, executableName)),
+  ];
+  const seenExecutableCandidates = new Set<string>();
+  for (const candidate of executableCandidates) {
+    const normalizedCandidate = normalizeCliText(candidate);
+    if (!normalizedCandidate || seenExecutableCandidates.has(normalizedCandidate)) continue;
+    seenExecutableCandidates.add(normalizedCandidate);
+
+    const resolvedRoot = resolveOpenClawPackageRootFromPath(normalizedCandidate);
+    if (resolvedRoot) {
+      pushRoot(resolvedRoot);
+    }
+  }
 
   return roots;
 }
