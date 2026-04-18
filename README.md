@@ -89,8 +89,8 @@ sudo apt update && sudo apt install libreoffice -y
 ### 💬 社群与支持
 - **Telegram 群**: [安格视界 (AngeWorld)](https://t.me/angeworld2024)
 - **资源站**: [安格超市 (Ange Market)](https://blog.angeworld.cc/market/)
-- **AI 接口**: [按需付费 AI 接口](https://ai.opendoor.cn)
-- **AI 接口**: [订阅付费 AI 接口](https://ai.superdoor.top)
+- **芝麻开门**: [按需付费 AI 接口，官方 1/10 价格](https://ai.opendoor.cn)
+- **超级门户**: [订阅付费 AI 接口，量大管饱的订阅制](https://ai.superdoor.top)
 
 ---
 
