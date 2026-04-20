@@ -85,6 +85,8 @@ interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  processContent?: string;
+  processStreaming?: boolean;
   timestamp: Date;
   model?: string;
   agentId?: string;
@@ -240,6 +242,41 @@ function hasOwnMessageField<T extends object>(value: T, key: keyof any): boolean
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function resolveProcessTagPair(
+  primaryStartTag?: string | null,
+  primaryEndTag?: string | null,
+  secondaryStartTag?: string | null,
+  secondaryEndTag?: string | null,
+): { startTag: string; endTag: string } {
+  const normalize = (value?: string | null) => (typeof value === 'string' ? value.trim() : '');
+
+  const primaryStart = normalize(primaryStartTag);
+  const primaryEnd = normalize(primaryEndTag);
+  if (primaryStart && primaryEnd) {
+    return { startTag: primaryStart, endTag: primaryEnd };
+  }
+
+  const secondaryStart = normalize(secondaryStartTag);
+  const secondaryEnd = normalize(secondaryEndTag);
+  if (secondaryStart && secondaryEnd) {
+    return { startTag: secondaryStart, endTag: secondaryEnd };
+  }
+
+  return {
+    startTag: DEFAULT_PROCESS_START_TAG,
+    endTag: DEFAULT_PROCESS_END_TAG,
+  };
+}
+
+function hasExplicitProcessState(incoming: Partial<ChatMessage>): boolean {
+  const hasProcessContent = hasOwnMessageField(incoming, 'processContent')
+    && typeof incoming.processContent === 'string'
+    && incoming.processContent.trim().length > 0;
+  const hasProcessStreaming = hasOwnMessageField(incoming, 'processStreaming')
+    && incoming.processStreaming === true;
+  return hasProcessContent || hasProcessStreaming;
+}
+
 function shouldPreferIncomingMessageContent(
   existing: Pick<ChatMessage, 'content' | 'role' | 'messageCode'> | undefined,
   incoming: Partial<ChatMessage>,
@@ -258,8 +295,12 @@ function shouldPreferIncomingMessageContent(
     : existing?.messageCode;
   const currentIsSystemLike = existing?.role === 'system' || !!existing?.messageCode;
   const nextIsSystemLike = nextRole === 'system' || !!nextMessageCode;
+  const explicitProcessState = hasExplicitProcessState(incoming);
 
   if (!normalizedNext) {
+    if (explicitProcessState) {
+      return true;
+    }
     return !normalizedCurrent;
   }
 
@@ -288,6 +329,46 @@ function shouldPreferIncomingMessageContent(
   }
 
   if (normalizedCurrent.startsWith(normalizedNext)) {
+    if (explicitProcessState) {
+      return true;
+    }
+    return false;
+  }
+
+  if (explicitProcessState) {
+    return true;
+  }
+
+  return normalizedNext.length > normalizedCurrent.length;
+}
+
+function shouldPreferIncomingSupplementalContent(currentValue: string | undefined, nextValue: string | undefined): boolean {
+  const currentContent = typeof currentValue === 'string' ? currentValue : '';
+  const nextContent = typeof nextValue === 'string' ? nextValue : '';
+  const normalizedCurrent = currentContent.trim();
+  const normalizedNext = nextContent.trim();
+
+  if (!normalizedNext) {
+    return !normalizedCurrent;
+  }
+
+  if (!normalizedCurrent) {
+    return true;
+  }
+
+  if (nextContent === currentContent) {
+    return true;
+  }
+
+  if (normalizedNext === normalizedCurrent) {
+    return nextContent.length >= currentContent.length;
+  }
+
+  if (normalizedNext.startsWith(normalizedCurrent)) {
+    return true;
+  }
+
+  if (normalizedCurrent.startsWith(normalizedNext)) {
     return false;
   }
 
@@ -298,6 +379,9 @@ function mergeMessagePreservingContent(existing: ChatMessage, incoming: Partial<
   const next = { ...existing, ...incoming };
   if (hasOwnMessageField(incoming, 'content') && !shouldPreferIncomingMessageContent(existing, incoming)) {
     next.content = existing.content;
+  }
+  if (hasOwnMessageField(incoming, 'processContent') && !shouldPreferIncomingSupplementalContent(existing.processContent, incoming.processContent)) {
+    next.processContent = existing.processContent;
   }
   return next;
 }
@@ -313,6 +397,12 @@ function mergeMessagePatchPreservingContent(
     messageCode: existingPatch.messageCode,
   }, incomingPatch)) {
     next.content = existingPatch.content;
+  }
+  if (hasOwnMessageField(incomingPatch, 'processContent') && !shouldPreferIncomingSupplementalContent(
+    typeof existingPatch.processContent === 'string' ? existingPatch.processContent : '',
+    incomingPatch.processContent,
+  )) {
+    next.processContent = existingPatch.processContent;
   }
   return next;
 }
@@ -355,8 +445,7 @@ function isLikelyInactiveGroupMessageStale(content: string, processStartTag?: st
   const normalized = content.trim();
   if (!normalized) return true;
 
-  const startTag = (processStartTag || DEFAULT_PROCESS_START_TAG).trim();
-  const endTag = (processEndTag || DEFAULT_PROCESS_END_TAG).trim();
+  const { startTag, endTag } = resolveProcessTagPair(processStartTag, processEndTag);
   if (!startTag || !endTag || !normalized.includes(startTag)) return false;
 
   if (normalized.lastIndexOf(endTag) < normalized.lastIndexOf(startTag)) {
@@ -418,6 +507,8 @@ function mapChatHistoryMessage(m: any): ChatMessage {
     id: String(m.id || Math.random()),
     role: m.role === 'system' ? 'system' : (m.role === 'assistant' ? 'assistant' as const : 'user' as const),
     content: String(m.content || ''),
+    processContent: typeof m.process_content === 'string' ? m.process_content : undefined,
+    processStreaming: !!m.process_streaming,
     timestamp: new Date(m.created_at || Date.now()),
     model: m.model_used || undefined,
     agentId: m.agent_id || undefined,
@@ -1735,8 +1826,12 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       return;
     }
 
-    const processStartTag = currentGroup?.process_start_tag || findSessionByAgentId(latestVisibleMessage.agentId)?.process_start_tag || DEFAULT_PROCESS_START_TAG;
-    const processEndTag = currentGroup?.process_end_tag || findSessionByAgentId(latestVisibleMessage.agentId)?.process_end_tag || DEFAULT_PROCESS_END_TAG;
+    const { startTag: processStartTag, endTag: processEndTag } = resolveProcessTagPair(
+      currentGroup?.process_start_tag,
+      currentGroup?.process_end_tag,
+      findSessionByAgentId(latestVisibleMessage.agentId)?.process_start_tag,
+      findSessionByAgentId(latestVisibleMessage.agentId)?.process_end_tag,
+    );
     const needsReconcile = isLikelyInactiveGroupMessageStale(latestVisibleMessage.content, processStartTag, processEndTag);
 
     if (!needsReconcile) {
@@ -2241,6 +2336,8 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
     return {
       id: String(m.id), role: m.sender_type === 'user' ? 'user' : (m.sender_id === 'system' ? 'system' : 'assistant'),
       content: m.content || '', timestamp: new Date(m.created_at || ''),
+      processContent: typeof m.process_content === 'string' ? m.process_content : undefined,
+      processStreaming: !!m.process_streaming,
       model: m.model_used, agentId: m.sender_id, agentName: m.sender_name,
       parentId: m.parent_id ? String(m.parent_id) : undefined,
       messageCode: typeof m.messageCode === 'string' ? m.messageCode : undefined,
@@ -2280,14 +2377,26 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
 
   const upsertGroupStreamMessage = useCallback((payload: any) => {
     if (!payload || payload.id === undefined || payload.id === null) return;
+    const existingMessage = messagesRef.current.find((message) => message.id === String(payload.id));
+    const inferredSenderType = typeof payload.sender_type === 'string'
+      ? payload.sender_type
+      : (existingMessage?.role === 'user' ? 'user' : 'agent');
+    const inferredSenderId = typeof payload.sender_id === 'string'
+      ? payload.sender_id
+      : (existingMessage?.role === 'system' ? 'system' : existingMessage?.agentId);
+    const inferredSenderName = typeof payload.sender_name === 'string'
+      ? payload.sender_name
+      : existingMessage?.agentName;
 
     const mapped = mapGroupMsg({
       id: payload.id,
       parent_id: payload.parent_id ?? null,
-      sender_type: payload.sender_type || 'agent',
-      sender_id: payload.sender_id,
-      sender_name: payload.sender_name,
+      sender_type: inferredSenderType,
+      sender_id: inferredSenderId,
+      sender_name: inferredSenderName,
       content: typeof payload.content === 'string' ? payload.content : '',
+      process_content: typeof payload.process_content === 'string' ? payload.process_content : undefined,
+      process_streaming: !!payload.process_streaming,
       created_at: payload.created_at || new Date().toISOString(),
       model_used: payload.model_used,
       messageCode: payload.messageCode,
@@ -2452,6 +2561,8 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
             const patch: Partial<ChatMessage> = {
               content: typeof parsed.content === 'string' ? parsed.content : '',
             };
+            if (typeof parsed.process_content === 'string') patch.processContent = parsed.process_content;
+            if (typeof parsed.process_streaming === 'boolean') patch.processStreaming = parsed.process_streaming;
             if (typeof parsed.messageCode === 'string') patch.messageCode = parsed.messageCode;
             if (parsed.messageParams && typeof parsed.messageParams === 'object') patch.messageParams = parsed.messageParams;
             if (typeof parsed.rawDetail === 'string') patch.rawDetail = parsed.rawDetail;
@@ -2459,6 +2570,7 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
             if (typeof parsed.sender_id === 'string') patch.agentId = parsed.sender_id;
             if (typeof parsed.sender_name === 'string') patch.agentName = parsed.sender_name;
             queueMessagePatch(String(parsed.id), patch);
+            flushQueuedMessagePatches();
           }
         } else if (parsed.type === 'edit') {
           dropQueuedMessagePatch(String(parsed.id));
@@ -2729,10 +2841,16 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       } catch {}
     } else if (isGroup && currentGroup) {
       try {
-        await fetch(`/api/groups/${currentGroup.id}/messages/${targetMessageId}`, {
+        const response = await fetch(`/api/groups/${currentGroup.id}/messages/${targetMessageId}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: nextContent })
         });
-      } catch {}
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(typeof data?.error === 'string' ? data.error : '');
+        }
+      } catch {
+        await recoverLatestGroupMessages(true);
+      }
     }
   };
 
@@ -3650,9 +3768,23 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                   );
                 }
 
+                const resolvedProcessTags = isGroup
+                  ? resolveProcessTagPair(
+                      currentGroup?.process_start_tag,
+                      currentGroup?.process_end_tag,
+                      findSessionByAgentId(msg.agentId)?.process_start_tag,
+                      findSessionByAgentId(msg.agentId)?.process_end_tag,
+                    )
+                  : resolveProcessTagPair(
+                      currentSession?.process_start_tag,
+                      currentSession?.process_end_tag,
+                    );
+
                 return (
                   <MessageBubble
                     key={msg.id} id={msg.id} role={msg.role} content={resolvedContent} timestamp={msg.timestamp}
+                    processContent={msg.processContent}
+                    processStreaming={msg.processStreaming}
                     rawDetail={msg.rawDetail}
                     isHighlighted={isHighlighted} showDateDivider={showDateDivider}
                     searchQuery={matchedMessageIdSet.has(msg.id) ? debouncedMessageSearchQuery : ''}
@@ -3674,8 +3806,8 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                     isCopied={copiedId === msg.id}
                     activeCopiedId={copiedId}
                     isLoading={isLoading}
-                    processStartTag={(isGroup ? (currentGroup?.process_start_tag || findSessionByAgentId(msg.agentId)?.process_start_tag) : currentSession?.process_start_tag) || '[执行工作_Start]'}
-                    processEndTag={(isGroup ? (currentGroup?.process_end_tag || findSessionByAgentId(msg.agentId)?.process_end_tag) : currentSession?.process_end_tag) || '[执行工作_End]'}
+                    processStartTag={resolvedProcessTags.startTag}
+                    processEndTag={resolvedProcessTags.endTag}
                     isLatest={msg.role === 'user' ? msg.id === lastUserMsgId : index === visibleMessages.length - 1}
                     preserveProcessExpansionWhenNotLatest={isGroup && msg.role === 'assistant'}
                   />

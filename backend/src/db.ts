@@ -32,6 +32,7 @@ export type GroupMessageRow = {
   sender_id?: string;
   sender_name?: string;
   content: string;
+  process_content?: string | null;
   mentions?: string;  // JSON array of mentioned agentIds
   model_used?: string;
   parent_id?: number;
@@ -213,6 +214,7 @@ export class DB {
         sender_id TEXT,
         sender_name TEXT,
         content TEXT NOT NULL,
+        process_content TEXT,
         mentions TEXT,
         model_used TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -227,6 +229,7 @@ export class DB {
     // Migration: add process tags for transparency feature
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN process_start_tag TEXT DEFAULT ''"); } catch (e) {}
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN process_end_tag TEXT DEFAULT ''"); } catch (e) {}
+    try { this.db.exec("ALTER TABLE group_messages ADD COLUMN process_content TEXT"); } catch (e) {}
     // Migration: add max_chain_depth
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN max_chain_depth INTEGER DEFAULT 6"); } catch (e) {}
     try { this.db.exec("ALTER TABLE group_chats ADD COLUMN runtime_session_epoch INTEGER DEFAULT 0"); } catch (e) {}
@@ -429,7 +432,16 @@ export class DB {
         ) AS anchorBeforeId
       FROM ${options.table} current_message
       WHERE current_message.${options.scopeColumn} = ?
-        AND instr(lower(current_message.content), lower(?)) > 0
+        AND instr(
+          lower(
+            ${
+              options.table === 'group_messages'
+                ? "coalesce(current_message.content, '') || '\n' || coalesce(current_message.process_content, '')"
+                : "coalesce(current_message.content, '')"
+            }
+          ),
+          lower(?)
+        ) > 0
       ORDER BY current_message.id ASC
     `;
 
@@ -598,16 +610,35 @@ export class DB {
   // --- Group Messages ---
   saveGroupMessage(msg: GroupMessageRow): number {
     const result = this.db
-      .prepare('INSERT INTO group_messages (group_id, parent_id, sender_type, sender_id, sender_name, content, mentions, model_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(msg.group_id, msg.parent_id || null, msg.sender_type, msg.sender_id || null, msg.sender_name || null, msg.content, msg.mentions || null, msg.model_used || null, msg.created_at || new Date().toISOString());
+      .prepare('INSERT INTO group_messages (group_id, parent_id, sender_type, sender_id, sender_name, content, process_content, mentions, model_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        msg.group_id,
+        msg.parent_id || null,
+        msg.sender_type,
+        msg.sender_id || null,
+        msg.sender_name || null,
+        msg.content,
+        msg.process_content || null,
+        msg.mentions || null,
+        msg.model_used || null,
+        msg.created_at || new Date().toISOString()
+      );
     return Number(result.lastInsertRowid);
   }
 
-  updateGroupMessage(id: number, content: string, modelUsed?: string, mentions?: string | null) {
-      if (mentions !== undefined) {
+  updateGroupMessage(id: number, content: string, modelUsed?: string, mentions?: string | null, processContent?: string | null) {
+      if (mentions !== undefined && processContent !== undefined) {
+        this.db
+          .prepare('UPDATE group_messages SET content = ?, model_used = ?, mentions = ?, process_content = ? WHERE id = ?')
+          .run(content, modelUsed || null, mentions, processContent || null, id);
+      } else if (mentions !== undefined) {
         this.db
           .prepare('UPDATE group_messages SET content = ?, model_used = ?, mentions = ? WHERE id = ?')
           .run(content, modelUsed || null, mentions, id);
+      } else if (processContent !== undefined) {
+        this.db
+          .prepare('UPDATE group_messages SET content = ?, model_used = ?, process_content = ? WHERE id = ?')
+          .run(content, modelUsed || null, processContent || null, id);
       } else {
         this.db
           .prepare('UPDATE group_messages SET content = ?, model_used = ? WHERE id = ?')
@@ -627,6 +658,35 @@ export class DB {
         SELECT id, parent_id
         FROM group_messages
         WHERE id = ?
+        UNION ALL
+        SELECT child.id, child.parent_id
+        FROM group_messages child
+        JOIN subtree ON child.parent_id = subtree.id
+      )
+      SELECT id, parent_id FROM subtree
+    `);
+
+    const deleteMany = this.db.transaction((messageId: number) => {
+      const rows = selectDescendantRows.all(messageId) as Array<{ id: number; parent_id: number | null }>;
+      if (rows.length === 0) {
+        return [];
+      }
+
+      const ids = rows.map((row) => row.id);
+      const placeholders = ids.map(() => '?').join(', ');
+      this.db.prepare(`DELETE FROM group_messages WHERE id IN (${placeholders})`).run(...ids);
+      return rows;
+    });
+
+    return deleteMany(id);
+  }
+
+  deleteGroupMessageDescendants(id: number) {
+    const selectDescendantRows = this.db.prepare(`
+      WITH RECURSIVE subtree(id, parent_id) AS (
+        SELECT id, parent_id
+        FROM group_messages
+        WHERE parent_id = ?
         UNION ALL
         SELECT child.id, child.parent_id
         FROM group_messages child
@@ -681,7 +741,7 @@ export class DB {
       table: 'group_messages',
       scopeColumn: 'group_id',
       scopeValue: groupId,
-      selectSql: "id, parent_id, group_id, sender_type, sender_id, sender_name, content, mentions, model_used, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at",
+      selectSql: "id, parent_id, group_id, sender_type, sender_id, sender_name, content, process_content, mentions, model_used, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at",
       beforeId: options.beforeId,
       limit: options.limit ?? 1000,
     });

@@ -30,8 +30,11 @@ const TEXT_SELECTION_STYLE = {
   WebkitTouchCallout: 'default' as const,
 };
 
+const HTML_PREVIEW_ROUTE_PADDING_SEGMENT = '__claw_preview_root__';
+const HTML_PREVIEW_ROUTE_PADDING_DEPTH = 24;
+const DOCUMENT_PREVIEW_WIDTH_CLASS = 'max-w-[1200px]';
 const DOCUMENT_PREVIEW_SCROLL_CLASS = 'w-full h-full overflow-y-auto';
-const DOCUMENT_PREVIEW_SURFACE_CLASS = 'w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200';
+const DOCUMENT_PREVIEW_SURFACE_CLASS = `w-full ${DOCUMENT_PREVIEW_WIDTH_CLASS} mx-auto bg-white sm:rounded-2xl sm:border border-gray-200`;
 const DOCUMENT_PREVIEW_BODY_CLASS = 'p-6 sm:p-10';
 
 function extractRenderableDocumentBody(content: string): string {
@@ -210,6 +213,52 @@ function buildPreviewDataUrl(url: string, mode: 'source' | 'converted' = 'source
 
   return null;
 }
+
+function encodeBase64ForPathSegment(base64: string): string {
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeBase64Utf8(base64: string): string | null {
+  try {
+    const normalized = base64.trim();
+    const binary = window.atob(normalized);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function buildHtmlPreviewRenderUrl(url: string): string | null {
+  const previewPadding = Array.from({ length: HTML_PREVIEW_ROUTE_PADDING_DEPTH }, () => HTML_PREVIEW_ROUTE_PADDING_SEGMENT).join('/');
+  const pathParam = extractPathParam(url);
+
+  if (pathParam && url.startsWith('/api/files/download')) {
+    const decodedPath = decodeBase64Utf8(decodeURIComponent(pathParam));
+    const entryFilename = decodedPath?.split('/').filter(Boolean).pop();
+    if (!entryFilename) {
+      return null;
+    }
+    return `/api/files/html-preview/path/${encodeBase64ForPathSegment(decodeURIComponent(pathParam))}/${previewPadding}/${encodeURIComponent(entryFilename)}`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    const filenameInUrl = url.split('/').pop();
+    if (filenameInUrl) {
+      const storedFilename = decodeURIComponent(filenameInUrl);
+      const encodedStoredFilename = encodeURIComponent(storedFilename);
+      return `/api/files/html-preview/upload/${encodedStoredFilename}/${previewPadding}/${encodedStoredFilename}`;
+    }
+  }
+
+  return null;
+}
+
 function decodeBase64ToBytes(base64: string): Uint8Array {
   const normalized = base64.trim();
   const binary = window.atob(normalized);
@@ -378,7 +427,7 @@ function PdfCanvasViewer({ pdfUrl, pdfData }: { pdfUrl?: string; pdfData?: Uint8
   }
 
   return (
-    <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[400px]">
+    <div className={`w-full ${DOCUMENT_PREVIEW_WIDTH_CLASS} mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[400px]`}>
       {loading && renderedPages === 0 && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
           <div className="flex flex-col items-center gap-3 text-gray-500">
@@ -506,7 +555,7 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
   }
 
   return (
-    <div className="w-full max-w-5xl mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[420px] h-full overflow-hidden">
+    <div className={`w-full ${DOCUMENT_PREVIEW_WIDTH_CLASS} mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[420px] h-full overflow-hidden`}>
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
           <div className="flex flex-col items-center gap-3 text-gray-500">
@@ -516,6 +565,38 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         </div>
       )}
       <div ref={containerRef} className="h-full w-full overflow-auto" />
+    </div>
+  );
+}
+
+function HtmlFrameViewer({ src }: { src: string }) {
+  const [loading, setLoading] = useState(true);
+  const { t } = useTranslation();
+
+  useEffect(() => {
+    setLoading(true);
+  }, [src]);
+
+  return (
+    <div className="w-full h-full overflow-hidden">
+      <div className={`w-full h-full ${DOCUMENT_PREVIEW_WIDTH_CLASS} mx-auto bg-white sm:rounded-2xl sm:border border-gray-200 relative min-h-[420px] overflow-hidden flex flex-col`}>
+        {loading && (
+          <div className="absolute inset-0 flex items-center justify-center bg-white/80 z-10">
+            <div className="flex flex-col items-center gap-3 text-gray-500">
+              <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+              <span className="text-sm font-medium">{t('filePreview.loadingPreview')}</span>
+            </div>
+          </div>
+        )}
+        <iframe
+          key={src}
+          src={src}
+          title="HTML preview"
+          sandbox="allow-downloads allow-forms allow-modals allow-popups allow-scripts"
+          className="w-full flex-1 min-h-0 border-0 bg-white"
+          onLoad={() => setLoading(false)}
+        />
+      </div>
     </div>
   );
 }
@@ -752,6 +833,7 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
   const isMarkdownFile = ['md', 'markdown'].includes(normalizedExt);
   const isHtmlFile = ['html', 'htm'].includes(normalizedExt);
   const isRenderedMode = supportsRenderToggle && viewMode === 'render';
+  const htmlRenderUrl = isHtmlFile ? buildHtmlPreviewRenderUrl(url) : null;
   const fileType = getFileType(filename);
   const renderedHtmlDocument = buildRenderedHtmlDocument(preview.status === 'ready' ? (preview.content || '') : '');
   const { Icon, typeText, bgColor } = getFileIconInfo(filename);
@@ -915,13 +997,17 @@ function EpubViewer({ epubData, filename }: { epubData?: ArrayBuffer; filename: 
         )}
 
         {preview.status === 'ready' && isHtmlFile && isRenderedMode && (
-          <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
-            <div
-              className={`${DOCUMENT_PREVIEW_SURFACE_CLASS} ${DOCUMENT_PREVIEW_BODY_CLASS} overflow-hidden cursor-text`}
-              style={TEXT_SELECTION_STYLE}
-              dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
-            />
-          </div>
+          htmlRenderUrl ? (
+            <HtmlFrameViewer src={htmlRenderUrl} />
+          ) : (
+            <div className={DOCUMENT_PREVIEW_SCROLL_CLASS}>
+              <div
+                className={`${DOCUMENT_PREVIEW_SURFACE_CLASS} ${DOCUMENT_PREVIEW_BODY_CLASS} overflow-hidden cursor-text`}
+                style={TEXT_SELECTION_STYLE}
+                dangerouslySetInnerHTML={{ __html: renderedHtmlDocument }}
+              />
+            </div>
+          )
         )}
 
         {preview.status === 'ready' && isMarkdownFile && isRenderedMode && (

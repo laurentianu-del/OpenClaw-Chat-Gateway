@@ -14,6 +14,16 @@ type Pending = {
   timer: NodeJS.Timeout;
 };
 
+type SessionToolEventPayload = {
+  sessionKey?: string;
+  parentSessionKey?: string;
+  runId?: string;
+  ts?: number;
+  stream?: string;
+  data?: any;
+  session?: any;
+};
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -228,6 +238,7 @@ export class OpenClawClient extends EventEmitter {
   private connected = false;
   private pending = new Map<string, Pending>();
   private connectPromise: Promise<void> | null = null;
+  private sessionEventSubscriptionRefs = 0;
 
   constructor(config: OpenClawConfig) {
     super();
@@ -273,7 +284,7 @@ export class OpenClawClient extends EventEmitter {
                   mode: 'webchat',
                   platform: process.platform,
                 },
-                caps: [],
+                caps: ['tool-events'],
                 auth: {
                   token: this.config.token,
                   password: this.config.password,
@@ -327,6 +338,38 @@ export class OpenClawClient extends EventEmitter {
             return;
           }
 
+          if (msg.type === 'event' && msg.event === 'session.tool') {
+            const payload = msg.payload || msg.data;
+            if (!payload) return;
+
+            const sessionPayload: SessionToolEventPayload = {
+              sessionKey: isNonEmptyString(payload.sessionKey) ? payload.sessionKey : undefined,
+              parentSessionKey: isNonEmptyString(payload.parentSessionKey) ? payload.parentSessionKey : undefined,
+              runId: isNonEmptyString(payload.runId) ? payload.runId : undefined,
+              ts: typeof payload.ts === 'number' ? payload.ts : undefined,
+              stream: isNonEmptyString(payload.stream) ? payload.stream : undefined,
+              data: payload.data,
+              session: payload.session,
+            };
+
+            this.emit('session.tool', sessionPayload);
+            return;
+          }
+
+          if (msg.type === 'event' && msg.event === 'session.message') {
+            const payload = msg.payload || msg.data;
+            if (!payload) return;
+
+            this.emit('session.message', {
+              sessionKey: isNonEmptyString(payload.sessionKey) ? payload.sessionKey : undefined,
+              message: payload.message,
+              messageId: isNonEmptyString(payload.messageId) ? payload.messageId : undefined,
+              messageSeq: typeof payload.messageSeq === 'number' ? payload.messageSeq : undefined,
+              session: payload.session,
+            });
+            return;
+          }
+
         } catch (err: any) {
           this.emit('error', new Error(err?.message || 'Failed to parse message'));
         }
@@ -335,6 +378,7 @@ export class OpenClawClient extends EventEmitter {
       this.ws.on('close', () => {
         this.connected = false;
         this.connectPromise = null;
+        this.sessionEventSubscriptionRefs = 0;
         this.rejectPendingRequests(new Error('Client disconnected'));
         this.emit('disconnected');
       });
@@ -379,6 +423,46 @@ export class OpenClawClient extends EventEmitter {
     }
 
     return this.request(method, params, timeoutMs);
+  }
+
+  async subscribeSessionEvents(): Promise<void> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    this.sessionEventSubscriptionRefs += 1;
+    if (this.sessionEventSubscriptionRefs > 1) {
+      return;
+    }
+
+    try {
+      await this.request('sessions.subscribe', {}, 15000);
+    } catch (error) {
+      this.sessionEventSubscriptionRefs = 0;
+      throw error;
+    }
+  }
+
+  async unsubscribeSessionEvents(): Promise<void> {
+    if (this.sessionEventSubscriptionRefs <= 0) {
+      return;
+    }
+
+    this.sessionEventSubscriptionRefs -= 1;
+    if (this.sessionEventSubscriptionRefs > 0) {
+      return;
+    }
+
+    if (!this.connected) {
+      return;
+    }
+
+    try {
+      await this.request('sessions.unsubscribe', {}, 15000);
+    } catch (error) {
+      this.sessionEventSubscriptionRefs = 1;
+      throw error;
+    }
   }
 
   async waitForRun(runId: string, timeoutMs = 90000): Promise<void> {
@@ -534,6 +618,7 @@ export class OpenClawClient extends EventEmitter {
     }
     this.connected = false;
     this.connectPromise = null;
+    this.sessionEventSubscriptionRefs = 0;
   }
 }
 

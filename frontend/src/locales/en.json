@@ -282,6 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "Processing",
+    "executingPlaceholder": "Working",
     "editMessagePlaceholder": "Edit message content..."
   },
   "settings": {

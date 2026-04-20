@@ -5296,17 +5296,38 @@ function getStructuredChatMessage(content?: string | null) {
   };
 }
 
-function withStructuredGroupMessage<T extends { content?: string | null; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; sender_id?: string | null; sender_name?: string | null }>(
+function withStructuredGroupMessage<T extends {
+  content?: string | null;
+  process_content?: string | null;
+  process_streaming?: boolean | null;
+  messageCode?: string;
+  messageParams?: StructuredMessageParams | null;
+  rawDetail?: string | null;
+  sender_id?: string | null;
+  sender_name?: string | null;
+}>(
   message: T,
   options?: { groupId?: string | null }
-): T & { messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; sender_id?: string | null; sender_name?: string | null } {
+): T & {
+  messageCode?: string;
+  messageParams?: StructuredMessageParams;
+  rawDetail?: string | null;
+  sender_id?: string | null;
+  sender_name?: string | null;
+  process_content?: string | null;
+  process_streaming?: boolean | null;
+} {
   const content = typeof message.content === 'string'
     ? rewriteOpenClawMediaPaths(message.content, options?.groupId ? getGroupWorkspacePath(options.groupId) : undefined)
     : message.content;
+  const processContent = typeof message.process_content === 'string'
+    ? rewriteOpenClawMediaPaths(message.process_content, options?.groupId ? getGroupWorkspacePath(options.groupId) : undefined)
+    : message.process_content;
   const structured = getStructuredGroupMessage(content);
   return {
     ...message,
     content,
+    process_content: processContent,
     messageCode: message.messageCode ?? structured.messageCode,
     messageParams: message.messageParams ?? structured.messageParams,
     rawDetail: message.rawDetail ?? structured.rawDetail,
@@ -9355,33 +9376,50 @@ app.get('/api/files/capabilities', (_req, res) => {
   res.json({ libreoffice: hasLibreOffice });
 });
 
+const HTML_PREVIEW_ROUTE_PADDING_SEGMENT = '__claw_preview_root__';
+
+function decodeAbsolutePathParam(b64Path: string): string {
+  const absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
+  if (!path.isAbsolute(absolutePath)) {
+    throw new Error('Only absolute paths are allowed');
+  }
+  return absolutePath;
+}
+
+function decodeBase64UrlUtf8(value: string): string {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4 || 4)) % 4);
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function resolveStoredPreviewAbsolutePath(filenameParam?: string): string {
+  if (!filenameParam) {
+    return '';
+  }
+
+  const decodedFilename = decodeURIComponent(filenameParam);
+  const fileInfo = db.getFileByStoredName(decodedFilename);
+  if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
+    return fileInfo.stored_path;
+  }
+
+  const globalPath = path.join(uploadDir, decodedFilename);
+  if (fs.existsSync(globalPath)) {
+    return globalPath;
+  }
+
+  return '';
+}
+
 function resolvePreviewAbsolutePath(req: express.Request): string {
-  let absolutePath = '';
   const b64Path = req.query.path as string | undefined;
   const filenameParam = req.query.filename as string | undefined;
 
   if (b64Path) {
-    absolutePath = Buffer.from(b64Path, 'base64').toString('utf8');
-    if (!path.isAbsolute(absolutePath)) {
-      throw new Error('Only absolute paths are allowed');
-    }
-    return absolutePath;
+    return decodeAbsolutePathParam(b64Path);
   }
 
-  if (filenameParam) {
-    const decodedFilename = decodeURIComponent(filenameParam);
-    const fileInfo = db.getFileByStoredName(decodedFilename);
-    if (fileInfo && fs.existsSync(fileInfo.stored_path)) {
-      return fileInfo.stored_path;
-    }
-
-    const globalPath = path.join(uploadDir, decodedFilename);
-    if (fs.existsSync(globalPath)) {
-      return globalPath;
-    }
-  }
-
-  return '';
+  return resolveStoredPreviewAbsolutePath(filenameParam);
 }
 
 async function ensureConvertedPreviewPdf(absolutePath: string): Promise<string> {
@@ -9456,6 +9494,65 @@ async function ensureConvertedPreviewPdf(absolutePath: string): Promise<string> 
   return conversionPromise;
 }
 
+function resolveHtmlPreviewEntryAbsolutePath(req: express.Request): string {
+  if (req.params.encodedPath) {
+    const absolutePath = decodeBase64UrlUtf8(req.params.encodedPath);
+    if (!path.isAbsolute(absolutePath)) {
+      throw new Error('Only absolute paths are allowed');
+    }
+    return absolutePath;
+  }
+
+  if (req.params.filename) {
+    return resolveStoredPreviewAbsolutePath(req.params.filename);
+  }
+
+  return '';
+}
+
+function resolveHtmlPreviewRequestedPath(entryAbsolutePath: string, relativePath: string | undefined): string {
+  const normalizedRelativePath = (relativePath || '')
+    .split('/')
+    .filter(Boolean)
+    .filter((segment) => segment !== HTML_PREVIEW_ROUTE_PADDING_SEGMENT)
+    .join('/');
+
+  if (!normalizedRelativePath || normalizedRelativePath === path.basename(entryAbsolutePath)) {
+    return entryAbsolutePath;
+  }
+
+  return path.resolve(path.dirname(entryAbsolutePath), normalizedRelativePath);
+}
+
+function serveHtmlPreviewRequest(req: express.Request, res: express.Response) {
+  try {
+    const entryAbsolutePath = resolveHtmlPreviewEntryAbsolutePath(req);
+    if (!entryAbsolutePath || !fs.existsSync(entryAbsolutePath)) {
+      return res.status(404).send('File not found');
+    }
+
+    const requestedPath = resolveHtmlPreviewRequestedPath(entryAbsolutePath, req.params[0]);
+    if (!fs.existsSync(requestedPath)) {
+      return res.status(404).send('File not found');
+    }
+
+    const stat = fs.statSync(requestedPath);
+    if (!stat.isFile()) {
+      return res.status(404).send('File not found');
+    }
+
+    const filename = path.basename(requestedPath);
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(filename)}`);
+    return res.sendFile(requestedPath);
+  } catch (error: any) {
+    console.error(`[HTML Preview Error] ${error.message}`);
+    if (error.message === 'Only absolute paths are allowed') {
+      return res.status(403).send(error.message);
+    }
+    return res.status(500).send('Failed to serve HTML preview');
+  }
+}
+
 app.get('/api/files/preview-data', async (req, res) => {
   try {
     const mode = req.query.mode === 'converted' ? 'converted' : 'source';
@@ -9488,6 +9585,14 @@ app.get('/api/files/preview-data', async (req, res) => {
     }
     res.status(500).json({ error: 'Preview data failed', message: error.message });
   }
+});
+
+app.get('/api/files/html-preview/path/:encodedPath/*', (req, res) => {
+  serveHtmlPreviewRequest(req, res);
+});
+
+app.get('/api/files/html-preview/upload/:filename/*', (req, res) => {
+  serveHtmlPreviewRequest(req, res);
 });
 
 app.get('/api/files/preview', async (req, res) => {
@@ -9563,6 +9668,9 @@ const groupChatEngine = new GroupChatEngine(db, getConnection, (agentId) => {
   const chars = db.getCharacters();
   const c = chars.find(x => x.agentId === agentId);
   return c?.model || '';
+}, () => {
+  const configuredLanguage = configManager.getConfig().language;
+  return configuredLanguage === 'zh-TW' || configuredLanguage === 'en' ? configuredLanguage : 'zh-CN';
 }, prepareGroupRuntimeAgent);
 
 // SSE clients per group
@@ -9995,14 +10103,59 @@ app.post('/api/groups/:id/stop', async (req, res) => {
 app.put('/api/groups/:id/messages/:msgId', (req, res) => {
   try {
     const { content } = req.body;
-    db.updateGroupMessage(Number(req.params.msgId), content);
-    res.json({ success: true });
-    
-    // Broadcast edit event
+    const messageId = Number(req.params.msgId);
+    const group = db.getGroupChat(req.params.id);
+    if (!group) {
+      return res.status(404).json(buildStructuredApiError(GROUP_NOT_FOUND_ERROR_CODE, null, { groupId: req.params.id }));
+    }
+    if (!content?.trim()) {
+      return res.status(400).json({ success: false, error: 'content is required' });
+    }
+
+    const existingMessage = db.getGroupMessageById(messageId, req.params.id);
+    if (!existingMessage) {
+      return res.status(404).json({ success: false, error: 'Message not found' });
+    }
+
+    const shouldRerun = existingMessage.sender_type === 'user';
+    if (shouldRerun && groupChatEngine.isGroupProcessing(req.params.id)) {
+      return res.status(409).json({
+        ...buildStructuredApiError(GROUP_RUN_IN_PROGRESS_ERROR_CODE),
+        runState: groupChatEngine.getGroupRunState(req.params.id),
+      });
+    }
+
+    db.updateGroupMessage(
+      messageId,
+      content,
+      existingMessage.model_used,
+      existingMessage.mentions ?? null,
+      existingMessage.process_content ?? null,
+    );
+
+    const updatedMessage = db.getGroupMessageById(messageId, req.params.id);
+    const deletedRows = shouldRerun
+      ? db.deleteGroupMessageDescendants(messageId) as Array<{ id: number; parent_id: number | null }>
+      : [];
+    const deletedIds = deletedRows.map((row) => row.id);
+
+    res.json({ success: true, rerunStarted: shouldRerun, deletedIds });
+
     const clients = groupSSEClients.get(req.params.id);
     if (clients) {
       clients.forEach(client => {
-        client.write(`data: ${JSON.stringify({ type: 'edit', id: Number(req.params.msgId), content })}\n\n`);
+        if (updatedMessage) {
+          client.write(`data: ${JSON.stringify({ type: 'edit', ...withStructuredGroupMessage(updatedMessage, { groupId: req.params.id }) })}\n\n`);
+        }
+        if (deletedIds.length > 0) {
+          client.write(`data: ${JSON.stringify({ type: 'delete', deletedIds, fallbackParentId: messageId })}\n\n`);
+        }
+      });
+    }
+
+    if (shouldRerun) {
+      void groupChatEngine.rerunUserMessage(req.params.id, messageId).catch((err: any) => {
+        console.error('[GroupChat] Error rerunning edited user message:', err);
       });
     }
   } catch (err: any) {

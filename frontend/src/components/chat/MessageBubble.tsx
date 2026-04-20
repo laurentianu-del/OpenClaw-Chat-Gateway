@@ -136,8 +136,11 @@ function highlightSearchNodes(node: React.ReactNode, query: string, keyPrefix = 
   );
 }
 
-function hasSearchMatchInProcessBlocks(content: string, query: string, processStartTag?: string, processEndTag?: string): boolean {
+function hasSearchMatchInProcessBlocks(content: string, query: string, processStartTag?: string, processEndTag?: string, explicitProcessContent?: string): boolean {
   const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery && explicitProcessContent && explicitProcessContent.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
   const startTag = processStartTag?.trim();
   const endTag = processEndTag?.trim();
   if (!content || !normalizedQuery || !startTag || !endTag) return false;
@@ -156,6 +159,99 @@ function hasSearchMatchInProcessBlocks(content: string, query: string, processSt
 
   return false;
 }
+
+function findTrailingIncompleteProcessTagFragment(content: string, tag?: string): string {
+  const normalizedTag = tag?.trim() || '';
+  if (!content || !normalizedTag || content.endsWith(normalizedTag)) {
+    return '';
+  }
+
+  const minFragmentLength = Math.min(3, Math.max(1, normalizedTag.length - 1));
+  const maxFragmentLength = Math.min(content.length, normalizedTag.length - 1);
+
+  for (let length = maxFragmentLength; length >= minFragmentLength; length -= 1) {
+    const fragment = normalizedTag.slice(0, length);
+    if (content.endsWith(fragment)) {
+      return fragment;
+    }
+  }
+
+  return '';
+}
+
+function sanitizeConfiguredProcessText(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+): { content: string; hasTrailingPlaceholder: boolean } {
+  if (!content) {
+    return { content, hasTrailingPlaceholder: false };
+  }
+
+  const tags = [processStartTag?.trim(), processEndTag?.trim()]
+    .filter((tag): tag is string => Boolean(tag));
+
+  if (tags.length === 0) {
+    return { content, hasTrailingPlaceholder: false };
+  }
+
+  let hasTrailingPlaceholder = false;
+  let cleanedContent = content.replace(/\r\n?/g, '\n');
+
+  for (const tag of tags) {
+    cleanedContent = cleanedContent.replace(new RegExp(escapeRegExpForPattern(tag), 'g'), '');
+  }
+
+  cleanedContent = cleanedContent
+    .split('\n')
+    .map((line) => {
+      let nextLine = line;
+
+      while (true) {
+        const startFragment = findTrailingIncompleteProcessTagFragment(nextLine, processStartTag);
+        const endFragment = findTrailingIncompleteProcessTagFragment(nextLine, processEndTag);
+        const fragment = startFragment.length >= endFragment.length ? startFragment : endFragment;
+
+        if (!fragment) {
+          return nextLine;
+        }
+
+        hasTrailingPlaceholder = true;
+        nextLine = nextLine
+          .slice(0, nextLine.length - fragment.length)
+          .replace(/[ \t]+$/g, '');
+      }
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd();
+
+  return {
+    content: cleanedContent,
+    hasTrailingPlaceholder,
+  };
+}
+
+const EXECUTING_PLACEHOLDER_DOT_COUNTS = [1, 2, 3, 4, 5, 6];
+
+const AnimatedExecutingPlaceholder: React.FC<{ label: string }> = ({ label }) => {
+  const [dotIndex, setDotIndex] = React.useState(0);
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => {
+      setDotIndex((current) => (current + 1) % EXECUTING_PLACEHOLDER_DOT_COUNTS.length);
+    }, 420);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <span>
+      {label}
+      {'.'.repeat(EXECUTING_PLACEHOLDER_DOT_COUNTS[dotIndex])}
+    </span>
+  );
+};
 
 export interface Attachment {
   name: string;
@@ -688,6 +784,8 @@ export const ProcessStepBlock = ({
   isExtractingProcess,
   isDense,
   onPreview,
+  processStartTag,
+  processEndTag,
 }: {
   content: string,
   initiallyExpanded: boolean,
@@ -696,11 +794,17 @@ export const ProcessStepBlock = ({
   isExtractingProcess?: boolean,
   isDense?: boolean,
   onPreview?: (url: string, filename: string) => void,
+  processStartTag?: string,
+  processEndTag?: string,
 }) => {
   const { t } = useTranslation();
   const normalizedSearchQuery = searchQuery?.trim() || '';
   const [isExpanded, setIsExpanded] = React.useState(initiallyExpanded || !!forceExpanded);
-  const normalizedContent = normalizeProcessPreviewablePathLines(content);
+  const sanitizedProcessContent = sanitizeConfiguredProcessText(content, processStartTag, processEndTag);
+  const normalizedContent = normalizeProcessPreviewablePathLines(sanitizedProcessContent.content);
+  const shouldRenderInlineExecutingPlaceholder = Boolean(
+    isExtractingProcess && sanitizedProcessContent.hasTrailingPlaceholder
+  );
 
   React.useEffect(() => {
     if (forceExpanded) {
@@ -999,6 +1103,11 @@ export const ProcessStepBlock = ({
              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={processMarkdownComponents}>
                {normalizedContent}
              </ReactMarkdown>
+             {shouldRenderInlineExecutingPlaceholder ? (
+               <div className="not-prose text-[13.5px] leading-[1.6] text-[#666]">
+                 <AnimatedExecutingPlaceholder label={t('messageBubble.executingPlaceholder')} />
+               </div>
+             ) : null}
           </div>
         </div>
       )}
@@ -1015,6 +1124,8 @@ export interface MessageProps {
   id: string | number;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  processContent?: string;
+  processStreaming?: boolean;
   rawDetail?: string;
   timestamp: Date;
   isHighlighted?: boolean;
@@ -1180,7 +1291,7 @@ export const normalizeProcessBlocks = (content: string, processStartTag?: string
 };
 
 const MessageBubbleInner: React.FC<MessageProps> = ({
-  id, role, content, rawDetail, timestamp, isHighlighted, searchQuery, showDateDivider,
+  id, role, content, processContent, processStreaming, rawDetail, timestamp, isHighlighted, searchQuery, showDateDivider,
   agentName, modelDisplayName, avatarUrl, avatarChar, avatarColorClass,
   isEditing, editContent, editIsDragging, editExistingAttachments, editPendingFiles,
   onSetEditIsDragging, onSetEditContent, onSetEditExistingAttachments, onDropNewFiles,
@@ -1206,9 +1317,22 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
   const shouldKeepProcessExpanded = preserveProcessExpansionWhenNotLatest
     ? hasBeenLatestForProcess
     : !!isLatest;
+  const explicitProcessContent = typeof processContent === 'string' ? processContent.trim() : '';
+  const sanitizedExplicitProcessContent = sanitizeConfiguredProcessText(
+    explicitProcessContent,
+    processStartTag,
+    processEndTag,
+  );
+  const shouldRenderExplicitProcessBlock = !!sanitizedExplicitProcessContent.content || !!processStreaming;
   const isProcessExpanded = isProcessManualToggle !== null ? isProcessManualToggle : shouldKeepProcessExpanded;
   const shouldAutoExpandProcessBlocks = Boolean(
-    isHighlighted && hasSearchMatchInProcessBlocks(content, normalizedSearchQuery, processStartTag, processEndTag)
+    isHighlighted && hasSearchMatchInProcessBlocks(
+      content,
+      normalizedSearchQuery,
+      processStartTag,
+      processEndTag,
+      sanitizedExplicitProcessContent.content,
+    )
   );
   const renderMessageSearchHighlighted = (children: React.ReactNode, scope: string) => (
     highlightSearchNodes(children, normalizedSearchQuery, `${scope}-${id}`)
@@ -1234,7 +1358,7 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
   }
 
   // Then handle process blocks that are OUTSIDE quotes (not inside chat_quote blocks)
-  if (processStartTag && processEndTag && displayContent) {
+  if (!shouldRenderExplicitProcessBlock && processStartTag && processEndTag && displayContent) {
     // Split content by chat_quote blocks to avoid extracting process blocks from inside quotes
     const quoteBlockRegex = /``````chat_quote[\s\S]*?``````/g;
     const quoteBlocks: string[] = [];
@@ -1259,6 +1383,15 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
   }
 
   displayContent = normalizeMalformedFencedBlocks(displayContent);
+  const trailingProcessPlaceholder = sanitizeConfiguredProcessText(
+    displayContent,
+    processStartTag,
+    processEndTag,
+  );
+  displayContent = trailingProcessPlaceholder.content;
+  const shouldRenderExecutingPlaceholder = role === 'assistant'
+    && trailingProcessPlaceholder.hasTrailingPlaceholder
+    && (!!isLatest || !!processStreaming);
 
   const renderFileAttachmentCards = (attachments: Attachment[], keyPrefix: string) => (
     <div className="flex flex-wrap gap-2 mb-3">
@@ -1508,6 +1641,18 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
               </div>
             ) : (
               <div className={`prose prose-sm max-w-none prose-slate text-[16px] pb-1 ${role === 'user' ? 'prose-pre:bg-gray-50' : (isHighlighted ? 'prose-pre:bg-[#f7fbff]' : 'prose-pre:bg-gray-50')}`}>
+                {shouldRenderExplicitProcessBlock ? (
+                  <ProcessStepBlock
+                    content={explicitProcessContent}
+                    initiallyExpanded={isProcessExpanded}
+                    forceExpanded={shouldAutoExpandProcessBlocks}
+                    searchQuery={normalizedSearchQuery}
+                    isExtractingProcess={!!processStreaming}
+                    onPreview={onPreview}
+                    processStartTag={processStartTag}
+                    processEndTag={processEndTag}
+                  />
+                ) : null}
                 {/* Always show images/files at the top if there are any trailing attachments */}
                 {(() => {
                   const { attachments } = parseAttachmentsFromContent(displayContent);
@@ -1667,6 +1812,8 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                                searchQuery={normalizedSearchQuery}
                                isExtractingProcess={codeLanguage === 'process_step_thought_streaming'}
                                onPreview={onPreview}
+                               processStartTag={processStartTag}
+                               processEndTag={processEndTag}
                              />
                            );
                         }
@@ -1736,6 +1883,8 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                                       isExtractingProcess={innerMatch[1] === 'process_step_thought_streaming'}
                                       isDense
                                       onPreview={onPreview}
+                                      processStartTag={processStartTag}
+                                      processEndTag={processEndTag}
                                     />
                                   );
                                }
@@ -1936,6 +2085,11 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                   </ReactMarkdown>
                   );
                 })()}
+                {shouldRenderExecutingPlaceholder ? (
+                  <div className="not-prose text-[16px] leading-[1.6] text-gray-500">
+                    <AnimatedExecutingPlaceholder label={t('messageBubble.executingPlaceholder')} />
+                  </div>
+                ) : null}
 
 
               </div>
@@ -1991,10 +2145,11 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
 // Only re-render when data props actually change
 const messageBubbleAreEqual = (prevProps: MessageProps, nextProps: MessageProps): boolean => {
   const dataKeys: (keyof MessageProps)[] = [
-    'id', 'role', 'content', 'isHighlighted', 'searchQuery', 'showDateDivider',
+    'id', 'role', 'content', 'processContent', 'processStreaming', 'rawDetail', 'isHighlighted', 'searchQuery', 'showDateDivider',
     'agentName', 'modelDisplayName', 'avatarUrl', 'avatarChar', 'avatarColorClass',
     'isEditing', 'editContent', 'editIsDragging',
     'isCopied', 'activeCopiedId', 'isLoading', 'isLatest',
+    'processStartTag', 'processEndTag',
     'preserveProcessExpansionWhenNotLatest'
   ];
   for (const key of dataKeys) {

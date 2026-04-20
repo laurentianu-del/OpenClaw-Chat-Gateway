@@ -282,6 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "處理過程",
+    "executingPlaceholder": "執行中",
     "editMessagePlaceholder": "編輯訊息內容..."
   },
   "settings": {

@@ -77,7 +77,10 @@ type ActiveGroupRun = {
   parentId?: number;
   modelUsed: string;
   createdAt: string;
+  rawText: string;
   text: string;
+  processContent: string;
+  processStreaming: boolean;
 };
 
 type PendingGroupRun = {
@@ -89,7 +92,113 @@ type PendingGroupRun = {
   parentId?: number;
   modelUsed?: string;
   createdAt?: string;
+  rawText: string;
   text: string;
+  processContent: string;
+  processStreaming: boolean;
+};
+
+type SplitGroupProcessOutputResult = {
+  finalContent: string;
+  processContent: string;
+  processStreaming: boolean;
+};
+
+type GroupToolProgressLocale = 'zh-CN' | 'zh-TW' | 'en';
+
+type GroupToolProgressKind =
+  | 'browse'
+  | 'command'
+  | 'generic'
+  | 'open_file'
+  | 'search'
+  | 'spawn_agent'
+  | 'update_file'
+  | 'update_plan'
+  | 'view_image'
+  | 'wait_agent';
+
+type GroupToolProgressState = {
+  toolName: string;
+  args?: Record<string, unknown>;
+};
+
+const GROUP_TOOL_PROGRESS_MAX_LINES = 80;
+const GROUP_TOOL_PROGRESS_MAX_DETAIL_CHARS = 120;
+
+const GROUP_TOOL_PROGRESS_TEXT: Record<GroupToolProgressLocale, Record<string, string>> = {
+  'zh-CN': {
+    agentFinished: '子任务已返回结果',
+    agentStarted: '子任务已启动',
+    browseCompleted: '页面操作已完成',
+    browsing: '正在打开页面',
+    commandCompleted: '命令已完成',
+    commandFailed: '命令执行失败',
+    executingTool: '正在执行工具',
+    fileOpened: '文件读取已完成',
+    fileUpdated: '文件修改已完成',
+    imageViewed: '图片查看已完成',
+    openingFile: '正在打开文件',
+    planUpdated: '计划已更新',
+    runningCommand: '正在运行命令',
+    searchCompleted: '搜索已完成',
+    searching: '正在搜索',
+    spawningAgent: '正在启动子任务',
+    toolCompleted: '工具已完成',
+    toolFailed: '工具执行失败',
+    updatingFile: '正在修改文件',
+    updatingPlan: '正在更新计划',
+    viewingImage: '正在查看图片',
+    waitingAgent: '正在等待子任务结果',
+  },
+  'zh-TW': {
+    agentFinished: '子任務已返回結果',
+    agentStarted: '子任務已啟動',
+    browseCompleted: '頁面操作已完成',
+    browsing: '正在開啟頁面',
+    commandCompleted: '命令已完成',
+    commandFailed: '命令執行失敗',
+    executingTool: '正在執行工具',
+    fileOpened: '檔案讀取已完成',
+    fileUpdated: '檔案修改已完成',
+    imageViewed: '圖片查看已完成',
+    openingFile: '正在開啟檔案',
+    planUpdated: '計畫已更新',
+    runningCommand: '正在執行命令',
+    searchCompleted: '搜尋已完成',
+    searching: '正在搜尋',
+    spawningAgent: '正在啟動子任務',
+    toolCompleted: '工具已完成',
+    toolFailed: '工具執行失敗',
+    updatingFile: '正在修改檔案',
+    updatingPlan: '正在更新計畫',
+    viewingImage: '正在查看圖片',
+    waitingAgent: '正在等待子任務結果',
+  },
+  en: {
+    agentFinished: 'Subtask returned',
+    agentStarted: 'Subtask started',
+    browseCompleted: 'Browser action completed',
+    browsing: 'Opening page',
+    commandCompleted: 'Command completed',
+    commandFailed: 'Command failed',
+    executingTool: 'Running tool',
+    fileOpened: 'File read completed',
+    fileUpdated: 'File update completed',
+    imageViewed: 'Image inspection completed',
+    openingFile: 'Opening file',
+    planUpdated: 'Plan updated',
+    runningCommand: 'Running command',
+    searchCompleted: 'Search completed',
+    searching: 'Searching',
+    spawningAgent: 'Starting subtask',
+    toolCompleted: 'Tool completed',
+    toolFailed: 'Tool failed',
+    updatingFile: 'Updating file',
+    updatingPlan: 'Updating plan',
+    viewingImage: 'Inspecting image',
+    waitingAgent: 'Waiting for subtask result',
+  },
 };
 
 class GroupResetInterruptedError extends Error {
@@ -115,6 +224,393 @@ function normalizeGroupPromptText(value: string): string {
     .replace(/\r\n?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+function normalizeGroupToolProgressLocale(value?: string | null): GroupToolProgressLocale {
+  return value === 'zh-TW' || value === 'en' ? value : 'zh-CN';
+}
+
+function stripAnsiCodes(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*[A-Za-z]/g, '');
+}
+
+function truncateGroupToolProgressText(value: string, maxChars = GROUP_TOOL_PROGRESS_MAX_DETAIL_CHARS): string {
+  const normalized = stripAnsiCodes(value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (!normalized) return '';
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
+}
+
+function normalizeToolArgsRecord(args: unknown): Record<string, unknown> | undefined {
+  return args && typeof args === 'object' && !Array.isArray(args)
+    ? args as Record<string, unknown>
+    : undefined;
+}
+
+function getNestedToolArgValue(args: Record<string, unknown> | undefined, pathExpression: string): unknown {
+  if (!args) return undefined;
+
+  let current: unknown = args;
+  for (const segment of pathExpression.split('.')) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[segment];
+  }
+
+  return current;
+}
+
+function getFirstToolDetailValue(args: Record<string, unknown> | undefined, paths: string[]): string {
+  for (const pathExpression of paths) {
+    const value = getNestedToolArgValue(args, pathExpression);
+    if (typeof value === 'string' && value.trim()) {
+      return truncateGroupToolProgressText(value);
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+  }
+
+  return '';
+}
+
+function resolveToolProgressKind(toolName: string, args?: Record<string, unknown>): GroupToolProgressKind {
+  const normalizedName = toolName.trim().toLowerCase();
+  const hasPath = !!getFirstToolDetailValue(args, ['path', 'filePath', 'file_path', 'filename']);
+  const hasUrl = !!getFirstToolDetailValue(args, ['url', 'urls.0']);
+
+  if (normalizedName === 'exec' || normalizedName === 'exec_command' || normalizedName.includes('shell')) {
+    return 'command';
+  }
+  if (normalizedName === 'apply_patch' || normalizedName === 'edit' || normalizedName === 'write') {
+    return 'update_file';
+  }
+  if (normalizedName === 'update_plan') {
+    return 'update_plan';
+  }
+  if (normalizedName === 'spawn_agent' || normalizedName === 'sessions_spawn' || normalizedName.includes('spawn')) {
+    return 'spawn_agent';
+  }
+  if (normalizedName === 'wait_agent') {
+    return 'wait_agent';
+  }
+  if (normalizedName === 'view_image' || normalizedName === 'image_query') {
+    return 'view_image';
+  }
+  if (normalizedName.includes('search') || normalizedName === 'find') {
+    return 'search';
+  }
+  if (normalizedName === 'read' || normalizedName === 'open' || normalizedName === 'cat') {
+    return hasUrl ? 'browse' : 'open_file';
+  }
+  if (normalizedName === 'click' || normalizedName === 'screenshot' || normalizedName.includes('browser') || normalizedName.includes('web') || hasUrl) {
+    return 'browse';
+  }
+  if (hasPath) {
+    return 'open_file';
+  }
+
+  return 'generic';
+}
+
+function resolveToolProgressDetail(toolName: string, args?: Record<string, unknown>): string {
+  const kind = resolveToolProgressKind(toolName, args);
+
+  if (kind === 'command') {
+    return getFirstToolDetailValue(args, ['cmd', 'command', 'cwd', 'workdir']);
+  }
+
+  if (kind === 'open_file' || kind === 'update_file' || kind === 'view_image') {
+    return getFirstToolDetailValue(args, ['path', 'filePath', 'file_path', 'filename', 'ref_id', 'paths.0']);
+  }
+
+  if (kind === 'search') {
+    return getFirstToolDetailValue(args, ['q', 'query', 'pattern', 'search_query.0.q', 'image_query.0.q', 'location']);
+  }
+
+  if (kind === 'browse') {
+    return getFirstToolDetailValue(args, ['url', 'ref_id', 'q', 'location']);
+  }
+
+  if (kind === 'spawn_agent') {
+    return getFirstToolDetailValue(args, ['message', 'task', 'name', 'agent_type', 'target']);
+  }
+
+  if (kind === 'wait_agent') {
+    return getFirstToolDetailValue(args, ['target', 'targets.0', 'sessionKey']);
+  }
+
+  if (kind === 'update_plan') {
+    return getFirstToolDetailValue(args, ['explanation', 'plan.0.step']);
+  }
+
+  return getFirstToolDetailValue(args, [
+    'path',
+    'url',
+    'q',
+    'query',
+    'pattern',
+    'command',
+    'cmd',
+    'message',
+    'task',
+    'name',
+    'target',
+  ]);
+}
+
+function buildToolProgressLine(locale: GroupToolProgressLocale, label: string, detail?: string): string {
+  const separator = locale === 'en' ? ': ' : '：';
+  const normalizedDetail = detail ? truncateGroupToolProgressText(detail) : '';
+  return normalizedDetail ? `- ${label}${separator}${normalizedDetail}` : `- ${label}`;
+}
+
+function formatToolStartProgress(locale: GroupToolProgressLocale, toolName: string, args?: Record<string, unknown>): string {
+  const text = GROUP_TOOL_PROGRESS_TEXT[locale];
+  const detail = resolveToolProgressDetail(toolName, args);
+
+  switch (resolveToolProgressKind(toolName, args)) {
+    case 'command':
+      return buildToolProgressLine(locale, text.runningCommand, detail);
+    case 'open_file':
+      return buildToolProgressLine(locale, text.openingFile, detail);
+    case 'update_file':
+      return buildToolProgressLine(locale, text.updatingFile, detail);
+    case 'search':
+      return buildToolProgressLine(locale, text.searching, detail);
+    case 'browse':
+      return buildToolProgressLine(locale, text.browsing, detail);
+    case 'view_image':
+      return buildToolProgressLine(locale, text.viewingImage, detail);
+    case 'update_plan':
+      return buildToolProgressLine(locale, text.updatingPlan, detail);
+    case 'spawn_agent':
+      return buildToolProgressLine(locale, text.spawningAgent, detail);
+    case 'wait_agent':
+      return buildToolProgressLine(locale, text.waitingAgent, detail);
+    default:
+      return buildToolProgressLine(locale, `${text.executingTool} ${toolName}`.trim(), detail);
+  }
+}
+
+function formatToolResultProgress(locale: GroupToolProgressLocale, toolName: string, args: Record<string, unknown> | undefined, isError: boolean): string {
+  const text = GROUP_TOOL_PROGRESS_TEXT[locale];
+  const detail = resolveToolProgressDetail(toolName, args);
+
+  if (isError) {
+    if (resolveToolProgressKind(toolName, args) === 'command') {
+      return buildToolProgressLine(locale, text.commandFailed, detail);
+    }
+    return buildToolProgressLine(locale, text.toolFailed, detail || toolName);
+  }
+
+  switch (resolveToolProgressKind(toolName, args)) {
+    case 'command':
+      return buildToolProgressLine(locale, text.commandCompleted, detail);
+    case 'open_file':
+      return buildToolProgressLine(locale, text.fileOpened, detail);
+    case 'update_file':
+      return buildToolProgressLine(locale, text.fileUpdated, detail);
+    case 'search':
+      return buildToolProgressLine(locale, text.searchCompleted, detail);
+    case 'browse':
+      return buildToolProgressLine(locale, text.browseCompleted, detail);
+    case 'view_image':
+      return buildToolProgressLine(locale, text.imageViewed, detail);
+    case 'update_plan':
+      return buildToolProgressLine(locale, text.planUpdated, detail);
+    case 'spawn_agent':
+      return buildToolProgressLine(locale, text.agentStarted, detail);
+    case 'wait_agent':
+      return buildToolProgressLine(locale, text.agentFinished, detail);
+    default:
+      return buildToolProgressLine(locale, text.toolCompleted, detail || toolName);
+  }
+}
+
+function appendToolProgressLine(lines: string[], line: string): boolean {
+  const normalizedLine = line.trim();
+  if (!normalizedLine) return false;
+  if (lines[lines.length - 1] === normalizedLine) {
+    return false;
+  }
+
+  lines.push(normalizedLine);
+  if (lines.length > GROUP_TOOL_PROGRESS_MAX_LINES) {
+    lines.splice(0, lines.length - GROUP_TOOL_PROGRESS_MAX_LINES);
+  }
+  return true;
+}
+
+function mergeGroupProcessContent(...sections: Array<string | null | undefined>): string {
+  return sections
+    .map((section) => normalizeGroupPromptText(section || ''))
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+}
+
+function resolveConfiguredProcessTagPair(
+  primaryStartTag?: string | null,
+  primaryEndTag?: string | null,
+  secondaryStartTag?: string | null,
+  secondaryEndTag?: string | null,
+): { startTag?: string; endTag?: string } {
+  const normalize = (value?: string | null) => (typeof value === 'string' ? value.trim() : '');
+  const primaryStart = normalize(primaryStartTag);
+  const primaryEnd = normalize(primaryEndTag);
+  if (primaryStart && primaryEnd) {
+    return { startTag: primaryStart, endTag: primaryEnd };
+  }
+
+  const secondaryStart = normalize(secondaryStartTag);
+  const secondaryEnd = normalize(secondaryEndTag);
+  if (secondaryStart && secondaryEnd) {
+    return { startTag: secondaryStart, endTag: secondaryEnd };
+  }
+
+  return {};
+}
+
+function findTrailingIncompleteConfiguredTagFragment(content: string, tag?: string): string {
+  const normalizedTag = tag?.trim() || '';
+  if (!content || !normalizedTag || content.endsWith(normalizedTag)) {
+    return '';
+  }
+
+  const minFragmentLength = Math.min(3, Math.max(1, normalizedTag.length - 1));
+  const maxFragmentLength = Math.min(content.length, normalizedTag.length - 1);
+
+  for (let length = maxFragmentLength; length >= minFragmentLength; length -= 1) {
+    const fragment = normalizedTag.slice(0, length);
+    if (content.endsWith(fragment)) {
+      return fragment;
+    }
+  }
+
+  return '';
+}
+
+function stripConfiguredProcessTagArtifacts(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+): string {
+  if (!content) return content;
+
+  const tags = [processStartTag?.trim(), processEndTag?.trim()]
+    .filter((tag): tag is string => Boolean(tag));
+  if (tags.length === 0) {
+    return content.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  let cleanedContent = content.replace(/\r\n?/g, '\n');
+
+  for (const tag of tags) {
+    cleanedContent = cleanedContent.replace(new RegExp(escapeRegExpForPrompt(tag), 'g'), '');
+  }
+
+  cleanedContent = cleanedContent
+    .split('\n')
+    .map((line) => {
+      let nextLine = line;
+
+      while (true) {
+        const startFragment = findTrailingIncompleteConfiguredTagFragment(nextLine, processStartTag);
+        const endFragment = findTrailingIncompleteConfiguredTagFragment(nextLine, processEndTag);
+        const fragment = startFragment.length >= endFragment.length ? startFragment : endFragment;
+
+        if (!fragment) {
+          return nextLine;
+        }
+
+        nextLine = nextLine
+          .slice(0, nextLine.length - fragment.length)
+          .replace(/[ \t]+$/g, '');
+      }
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return cleanedContent;
+}
+
+function splitGroupProcessOutput(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+): SplitGroupProcessOutputResult {
+  const normalizedContent = content.replace(/\r\n?/g, '\n');
+  const startTag = processStartTag?.trim();
+  const endTag = processEndTag?.trim();
+
+  const cleanup = (value: string) => (
+    value
+      .replace(/\r\n?/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  );
+
+  if (!normalizedContent || !startTag || !endTag) {
+    return {
+      finalContent: stripConfiguredProcessTagArtifacts(cleanup(normalizedContent), processStartTag, processEndTag),
+      processContent: '',
+      processStreaming: false,
+    };
+  }
+
+  const startPattern = escapeRegExpForPrompt(startTag);
+  const endPattern = escapeRegExpForPrompt(endTag);
+  const processRegex = new RegExp(`${startPattern}([\\s\\S]*?)(?:${endPattern}|$)`, 'g');
+  const processBlocks: string[] = [];
+  let processStreaming = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = processRegex.exec(normalizedContent)) !== null) {
+    processBlocks.push(match[1] || '');
+    if (!match[0].endsWith(endTag)) {
+      processStreaming = true;
+    }
+  }
+
+  if (processBlocks.length === 0) {
+    return {
+      finalContent: stripConfiguredProcessTagArtifacts(cleanup(normalizedContent), processStartTag, processEndTag),
+      processContent: '',
+      processStreaming: false,
+    };
+  }
+
+  const processContent = stripConfiguredProcessTagArtifacts(
+    cleanup(processBlocks.join('\n\n')),
+    processStartTag,
+    processEndTag,
+  );
+  const finalContent = stripConfiguredProcessTagArtifacts(
+    cleanup(
+      normalizedContent
+        .replace(processRegex, '\n\n')
+        .replace(new RegExp(`(?:${startPattern}|${endPattern})`, 'g'), '\n\n'),
+    ),
+    processStartTag,
+    processEndTag,
+  );
+
+  return {
+    finalContent,
+    processContent,
+    processStreaming,
+  };
 }
 
 function truncateGroupContextMessage(content: string): string {
@@ -144,8 +640,33 @@ function summarizeGroupProcessEvidence(content: string): string {
   return truncateGroupContextMessage(prioritizedLines.join('\n'));
 }
 
-function buildGroupContextMessageSummary(content: string, processStartTag?: string, processEndTag?: string): string {
+function buildGroupContextMessageSummary(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+  processContentText?: string | null,
+): string {
   const normalizedContent = normalizeGroupPromptText(content);
+  const normalizedProcessContent = normalizeGroupPromptText(processContentText || '');
+
+  if (normalizedProcessContent) {
+    const processEvidenceSummary = summarizeGroupProcessEvidence(normalizedProcessContent);
+
+    if (normalizedContent && processEvidenceSummary) {
+      return truncateGroupContextMessage(
+        `${normalizedContent}\n\n[过程证据摘要]\n${processEvidenceSummary}`,
+      );
+    }
+
+    if (normalizedContent) {
+      return truncateGroupContextMessage(normalizedContent);
+    }
+
+    if (processEvidenceSummary) {
+      return processEvidenceSummary;
+    }
+  }
+
   if (!normalizedContent) return '';
 
   const startTag = processStartTag?.trim();
@@ -159,11 +680,11 @@ function buildGroupContextMessageSummary(content: string, processStartTag?: stri
     'g',
   );
   const outsideProcessContent = normalizeGroupPromptText(normalizedContent.replace(processRegex, '\n\n'));
-  const processContent = Array.from(normalizedContent.matchAll(processRegex))
+  const extractedProcessContent = Array.from(normalizedContent.matchAll(processRegex))
     .map(match => normalizeGroupPromptText(match[1] || ''))
     .filter(Boolean)
     .join('\n\n');
-  const processEvidenceSummary = summarizeGroupProcessEvidence(processContent);
+  const processEvidenceSummary = summarizeGroupProcessEvidence(extractedProcessContent);
 
   if (outsideProcessContent && processEvidenceSummary) {
     return truncateGroupContextMessage(
@@ -272,6 +793,7 @@ export class GroupChatEngine extends EventEmitter {
   private db: DB;
   private getClient: (sessionId: string) => Promise<OpenClawClient>;
   private getAgentModel: (agentId: string) => string;
+  private getPreferredLanguage: () => GroupToolProgressLocale;
   private processingGroups = new Set<string>();
   private resetEpochs = new Map<string, number>();
   private prepareGroupRuntime: (groupId: string, agentId: string) => Promise<{
@@ -287,6 +809,7 @@ export class GroupChatEngine extends EventEmitter {
     db: DB,
     getClient: (sessionId: string) => Promise<OpenClawClient>,
     getAgentModel: (agentId: string) => string,
+    getPreferredLanguage: () => GroupToolProgressLocale,
     prepareGroupRuntime: (groupId: string, agentId: string) => Promise<{
       runtimeAgentId: string;
       workspacePath: string;
@@ -298,6 +821,7 @@ export class GroupChatEngine extends EventEmitter {
     this.db = db;
     this.getClient = getClient;
     this.getAgentModel = getAgentModel;
+    this.getPreferredLanguage = getPreferredLanguage;
     this.prepareGroupRuntime = prepareGroupRuntime;
   }
 
@@ -333,10 +857,13 @@ export class GroupChatEngine extends EventEmitter {
     this.emitRunState(activeRun.groupId);
   }
 
-  private updateActiveRunText(groupId: string, runId: string, text: string) {
+  private updateActiveRunOutput(groupId: string, runId: string, output: SplitGroupProcessOutputResult & { rawText: string }) {
     const activeRun = this.activeRuns.get(groupId);
     if (!activeRun || activeRun.runId !== runId) return;
-    activeRun.text = selectPreferredTextSnapshot(activeRun.text, text);
+    activeRun.rawText = selectPreferredTextSnapshot(activeRun.rawText, output.rawText);
+    activeRun.text = selectPreferredTextSnapshot(activeRun.text, output.finalContent);
+    activeRun.processContent = selectPreferredTextSnapshot(activeRun.processContent, output.processContent);
+    activeRun.processStreaming = output.processStreaming;
   }
 
   private clearActiveRun(groupId: string, runId?: string) {
@@ -416,6 +943,8 @@ export class GroupChatEngine extends EventEmitter {
       sender_id: currentRun.agentId,
       sender_name: currentRun.agentName,
       content: currentRun.text,
+      process_content: currentRun.processContent,
+      process_streaming: currentRun.processStreaming,
       model_used: currentRun.modelUsed,
       created_at: currentRun.createdAt || new Date(currentRun.startedAt).toISOString(),
     };
@@ -484,6 +1013,47 @@ export class GroupChatEngine extends EventEmitter {
     return [...new Set(mentioned)];
   }
 
+  private resolveTargetAgentIds(groupId: string, content: string, members: GroupMemberRow[]): string[] {
+    let targetAgentIds = this.parseMentions(content, members);
+
+    if (content.trim() === '/new') {
+      return members.map((member) => member.agent_id);
+    }
+
+    if (targetAgentIds.length === 0) {
+      const recent = this.db.getRecentGroupMessages(groupId, 5);
+      const lastAgent = [...recent].reverse().find((message) => (
+        message.sender_type === 'agent'
+        && message.sender_id !== 'system'
+      ));
+      if (lastAgent?.sender_id) {
+        targetAgentIds = [lastAgent.sender_id];
+      } else {
+        targetAgentIds = [members[0].agent_id];
+      }
+    }
+
+    return targetAgentIds;
+  }
+
+  private async dispatchExistingUserMessage(
+    groupId: string,
+    groupName: string,
+    content: string,
+    members: GroupMemberRow[],
+    userMsgId: number,
+    resetEpoch: number,
+  ): Promise<void> {
+    const targetAgentIds = this.resolveTargetAgentIds(groupId, content, members);
+    let currentParentId: number | undefined = userMsgId;
+
+    for (const agentId of targetAgentIds) {
+      this.throwIfGroupReset(groupId, resetEpoch);
+      const res = await this.sendToAgent(groupId, groupName, agentId, content, '用户', 0, currentParentId, resetEpoch);
+      if (res !== undefined) currentParentId = res;
+    }
+  }
+
   /**
    * Build a structured prompt for an agent (inspired by OpenCrew's Subagent Packet).
    * Includes: role identity, group context, recent messages, task, and boundaries.
@@ -509,7 +1079,10 @@ export class GroupChatEngine extends EventEmitter {
       const normalizedContent = uploadsPath
         ? rewriteMessageWithWorkspaceUploads(m.content, uploadsPath, { extractImageAttachments: false }).text
         : m.content;
-      const summary = buildGroupContextMessageSummary(normalizedContent, processStartTag, processEndTag);
+      const normalizedProcessContent = uploadsPath
+        ? rewriteMessageWithWorkspaceUploads(m.process_content || '', uploadsPath, { extractImageAttachments: false }).text
+        : (m.process_content || '');
+      const summary = buildGroupContextMessageSummary(normalizedContent, processStartTag, processEndTag, normalizedProcessContent);
       return `[${name}]: ${summary}`;
     }).join('\n');
 
@@ -524,6 +1097,7 @@ export class GroupChatEngine extends EventEmitter {
 
     if (hasProcessTags) {
       formatHeader += `规则${ruleIdx++}: 【工作记录汇报】在回复中，用以下标签包裹你的实际执行步骤、操作记录和中间结果（就像团队成员汇报工作进度一样）：\n${processStartTag}\n（在这里写你做了什么、执行了哪些操作、看到了什么结果）\n${processEndTag}\n标签外面写最终结论或给人的回复。这是团队协作的标准汇报格式，必须遵守！\n`;
+      formatHeader += `规则${ruleIdx++}: 【实时更新处理过程】一开始动手就立刻输出 ${processStartTag}，并随着你的实际工作持续追加简短进度，比如“正在打开 xxx 文件”“正在修改 xxx 文件”“已完成搜索”。每次只写一句高信号进展，不要逐字粘贴大段命令输出、网页原文或重复日志；除非出错，只保留关键动作、关键结果、关键结论。不要等全部做完后再一次性回顾总结。完成工作记录后，再输出 ${processEndTag}，最后在标签外给出结论。\n`;
     }
 
     formatHeader += `规则${ruleIdx++}: 【以上下文为准】如果你之前的记忆、你自己更早的回复、或 OpenClaw 历史记忆，与下面提供的“团队对话历史 / 最新任务”冲突，必须以下面提供的内容为准，并明确纠正旧结论，不能抱着旧判断不放。\n`;
@@ -576,7 +1150,7 @@ export class GroupChatEngine extends EventEmitter {
 
     // 5. End reminder
     if (hasProcessTags) {
-      parts.push(`[汇报格式提醒] 请用 ${processStartTag}...${processEndTag} 记录你的操作步骤和执行结果，再在标签外写对话结论。就像施工日志一样，记录你实际做了什么。`);
+      parts.push(`[汇报格式提醒] 请用 ${processStartTag}...${processEndTag} 记录你的操作步骤和执行结果，再在标签外写对话结论。过程只保留高信号短句，不要贴大段原始输出。`);
     }
 
     const finalPrompt = parts.join('\n\n');
@@ -620,36 +1194,55 @@ export class GroupChatEngine extends EventEmitter {
       });
 
       this.emit('message', { groupId, id: userMsgId, parent_id: computedParentId, sender_type: 'user', sender_name: '用户', content, created_at: new Date().toISOString() });
+      await this.dispatchExistingUserMessage(groupId, group.name, content, members, userMsgId, resetEpoch);
+    } catch (error) {
+      if (!(error instanceof GroupResetInterruptedError)) {
+        throw error;
+      }
+    } finally {
+      this.processingGroups.delete(groupId);
+      this.emitRunState(groupId);
+    }
+  }
 
-      // Parse mentions
-      let targetAgentIds = this.parseMentions(content, members);
-      
-      // Special handling for /new command
-      if (content.trim() === '/new') {
-        // Send the clear command to ALL agents in the group
-        targetAgentIds = members.map(m => m.agent_id);
-        
-        // We don't want them pinging each other back in response to a reset
-        // We can just rely on normal dispatching
-      }
-      // No mention → send to first member (group lead) or last replying agent (exclude system)
-      else if (targetAgentIds.length === 0) {
-        const recent = this.db.getRecentGroupMessages(groupId, 5);
-        const lastAgent = [...recent].reverse().find(m => m.sender_type === 'agent' && m.sender_id !== 'system');
-        if (lastAgent?.sender_id) {
-          targetAgentIds = [lastAgent.sender_id];
-        } else {
-          targetAgentIds = [members[0].agent_id];
-        }
+  async rerunUserMessage(groupId: string, userMessageId: number): Promise<void> {
+    if (this.processingGroups.has(groupId)) {
+      const error = new Error('Group run already in progress.');
+      (error as Error & { code?: string }).code = 'GROUP_RUN_IN_PROGRESS';
+      throw error;
+    }
+
+    const resetEpoch = this.getResetEpoch(groupId);
+    this.processingGroups.add(groupId);
+    this.emitRunState(groupId);
+
+    try {
+      this.throwIfGroupReset(groupId, resetEpoch);
+      const group = this.db.getGroupChat(groupId);
+      if (!group) throw new Error('团队不存在');
+
+      this.throwIfGroupReset(groupId, resetEpoch);
+      const members = this.resolveMembers(this.db.getGroupMembers(groupId));
+      if (members.length === 0) throw new Error('团队没有成员');
+
+      const userMessage = this.db.getGroupMessageById(userMessageId, groupId);
+      if (!userMessage || userMessage.sender_type !== 'user') {
+        throw new Error('Only user messages can be rerun.');
       }
 
-      // Send to each targeted agent sequentially so group history stays linear.
-      let currentParentId: number | undefined = userMsgId;
-      for (const agentId of targetAgentIds) {
-        this.throwIfGroupReset(groupId, resetEpoch);
-        const res = await this.sendToAgent(groupId, group.name, agentId, content, '用户', 0, currentParentId, resetEpoch);
-        if (res !== undefined) currentParentId = res;
+      const latestMessageId = this.db.getLatestGroupMessageId(groupId);
+      if (latestMessageId !== userMessageId) {
+        throw new Error('Only the latest user message can be rerun.');
       }
+
+      await this.dispatchExistingUserMessage(
+        groupId,
+        group.name,
+        userMessage.content,
+        members,
+        userMessageId,
+        resetEpoch,
+      );
     } catch (error) {
       if (!(error instanceof GroupResetInterruptedError)) {
         throw error;
@@ -727,6 +1320,11 @@ export class GroupChatEngine extends EventEmitter {
     let typingFinished = false;
     const placeholderCreatedAt = new Date().toISOString();
     const modelUsed = this.getAgentModel(agentId);
+    let latestProcessOutput = '';
+    let runtimeWorkspacePath = '';
+    const progressLocale = normalizeGroupToolProgressLocale(this.getPreferredLanguage());
+    let sessionEventsClient: OpenClawClient | null = null;
+    let sessionEventsSubscribed = false;
 
     const finishTyping = () => {
       if (typingFinished) return;
@@ -742,6 +1340,7 @@ export class GroupChatEngine extends EventEmitter {
         sender_id: agentId,
         sender_name: member.display_name,
         content: '',
+        process_content: '',
         model_used: modelUsed,
         created_at: placeholderCreatedAt,
       });
@@ -754,6 +1353,8 @@ export class GroupChatEngine extends EventEmitter {
         sender_id: agentId,
         sender_name: member.display_name,
         content: '',
+        process_content: '',
+        process_streaming: false,
         model_used: modelUsed,
         created_at: placeholderCreatedAt
       });
@@ -766,12 +1367,16 @@ export class GroupChatEngine extends EventEmitter {
         parentId,
         modelUsed,
         createdAt: placeholderCreatedAt,
+        rawText: '',
         text: '',
+        processContent: '',
+        processStreaming: false,
       });
 
       const group = this.db.getGroupChat(groupId);
       const groupSysPrompt = group?.system_prompt || group?.description || '';
       const runtimeContext = await this.prepareGroupRuntime(groupId, agentId);
+      runtimeWorkspacePath = runtimeContext.workspacePath;
       this.throwIfGroupReset(groupId, effectiveResetEpoch);
       
       // Always replay a recent summarized history window into the prompt.
@@ -786,8 +1391,12 @@ export class GroupChatEngine extends EventEmitter {
       const isResetCommand = triggerMsg.trim() === '/new';
       const remainingDepth = maxDepth === 0 ? 0 : Math.max(0, maxDepth - depth);
       const memberSessionConfig = this.db.getSessionByAgentId(agentId);
-      const processStartTag = group?.process_start_tag || memberSessionConfig?.process_start_tag;
-      const processEndTag = group?.process_end_tag || memberSessionConfig?.process_end_tag;
+      const { startTag: processStartTag, endTag: processEndTag } = resolveConfiguredProcessTagPair(
+        group?.process_start_tag,
+        group?.process_end_tag,
+        memberSessionConfig?.process_start_tag,
+        memberSessionConfig?.process_end_tag,
+      );
       const rewrittenTrigger = isResetCommand
         ? { text: triggerMsg, attachments: [] as MessageAttachment[], linkedUploads: [] as WorkspaceUploadLink[] }
         : rewriteMessageWithWorkspaceUploads(triggerMsg, runtimeContext.uploadsPath, { extractImageAttachments: true });
@@ -835,7 +1444,14 @@ export class GroupChatEngine extends EventEmitter {
       // Tools (browser, code execution, etc.) are granted via agentId, not sessionKey.
       const sessionKey = getGroupRuntimeSessionKey(groupId, group?.runtime_session_epoch);
       const client = await this.getClient(runtimeContext.runtimeAgentId);
+      sessionEventsClient = client;
       this.throwIfGroupReset(groupId, effectiveResetEpoch);
+      try {
+        await client.subscribeSessionEvents();
+        sessionEventsSubscribed = true;
+      } catch (error) {
+        console.warn(`[GroupChatEngine] Failed to subscribe session events for group ${groupId}, agent ${agentId}:`, error);
+      }
       const expectedSessionKey = sessionKey.startsWith('agent:')
         ? sessionKey
         : `agent:${runtimeContext.runtimeAgentId}:chat:${sessionKey}`;
@@ -871,12 +1487,18 @@ export class GroupChatEngine extends EventEmitter {
         parentId: parentId,
         modelUsed,
         createdAt: placeholderCreatedAt,
+        rawText: '',
         text: '',
+        processContent: '',
+        processStreaming: false,
       });
 
       // Listen for stream events
       let visibleFinalOutput = '';
+      let visibleProcessOutput = '';
+      let rawOutput = '';
       let finalOutput = '';
+      let processOutput = '';
       let finalEventText = '';
       const response = await new Promise<string>((resolve, reject) => {
         let idleTimeout: NodeJS.Timeout | null = null;
@@ -892,6 +1514,98 @@ export class GroupChatEngine extends EventEmitter {
         let lastObservedHistoryLength = preRunHistorySnapshot.length;
         let lastObservedHistorySignature = preRunHistorySnapshot.latestSignature;
         let lastObservedHistoryActivityAt: number | null = null;
+        let visibleProcessStreaming = false;
+        let modelProcessStreaming = false;
+        let toolProcessOutput = '';
+        const toolProcessLines: string[] = [];
+        const activeToolCallIds = new Set<string>();
+        const toolProgressById = new Map<string, GroupToolProgressState>();
+
+        const isRelevantToolEvent = (payload: {
+          sessionKey?: string;
+          parentSessionKey?: string;
+          runId?: string;
+        }) => {
+          if (payload.runId === runId) {
+            return true;
+          }
+          if (payload.sessionKey === finalSessionKey) {
+            return true;
+          }
+          if (payload.parentSessionKey === finalSessionKey) {
+            return true;
+          }
+          return false;
+        };
+
+        const syncCombinedProcessState = () => {
+          const combinedProcessOutput = mergeGroupProcessContent(toolProcessOutput, processOutput);
+          const combinedProcessStreaming = modelProcessStreaming || activeToolCallIds.size > 0;
+          latestProcessOutput = combinedProcessOutput;
+          this.updateActiveRunOutput(groupId, runId, {
+            rawText: rawOutput,
+            finalContent: finalOutput,
+            processContent: combinedProcessOutput,
+            processStreaming: combinedProcessStreaming,
+          });
+          return { combinedProcessOutput, combinedProcessStreaming };
+        };
+
+        const emitVisiblePatchIfChanged = (
+          eventName: 'delta' | 'edit',
+          options?: { trimVisibleContent?: boolean; trimVisibleProcess?: boolean; force?: boolean },
+        ) => {
+          const { combinedProcessOutput, combinedProcessStreaming } = syncCombinedProcessState();
+          const nextVisibleFinalOutputRaw = rewriteVisibleFileLinks(finalOutput, { workspacePath: runtimeContext.workspacePath });
+          const nextVisibleProcessOutputRaw = rewriteVisibleFileLinks(combinedProcessOutput, { workspacePath: runtimeContext.workspacePath });
+          const nextVisibleFinalOutput = options?.trimVisibleContent ? nextVisibleFinalOutputRaw.trim() : nextVisibleFinalOutputRaw;
+          const nextVisibleProcessOutput = options?.trimVisibleProcess === false
+            ? nextVisibleProcessOutputRaw
+            : nextVisibleProcessOutputRaw.trim();
+          const didVisibleChange = nextVisibleFinalOutput !== visibleFinalOutput
+            || nextVisibleProcessOutput !== visibleProcessOutput
+            || combinedProcessStreaming !== visibleProcessStreaming;
+
+          if (!options?.force && !didVisibleChange) {
+            return {
+              combinedProcessOutput,
+              combinedProcessStreaming,
+              nextVisibleFinalOutput,
+              nextVisibleProcessOutput,
+              didVisibleChange: false,
+            };
+          }
+
+          if (msgId !== undefined) {
+            this.db.updateGroupMessage(msgId, finalOutput, modelUsed, undefined, combinedProcessOutput);
+          }
+
+          visibleFinalOutput = nextVisibleFinalOutput;
+          visibleProcessOutput = nextVisibleProcessOutput;
+          visibleProcessStreaming = combinedProcessStreaming;
+
+          this.emit(eventName, {
+            groupId,
+            id: msgId,
+            parent_id: parentId,
+            sender_type: 'agent',
+            sender_id: agentId,
+            sender_name: member.display_name,
+            model_used: modelUsed,
+            created_at: placeholderCreatedAt,
+            content: nextVisibleFinalOutput,
+            process_content: nextVisibleProcessOutput,
+            process_streaming: combinedProcessStreaming,
+          });
+
+          return {
+            combinedProcessOutput,
+            combinedProcessStreaming,
+            nextVisibleFinalOutput,
+            nextVisibleProcessOutput,
+            didVisibleChange: true,
+          };
+        };
 
         const clearIdleTimeout = () => {
           if (idleTimeout) {
@@ -914,7 +1628,14 @@ export class GroupChatEngine extends EventEmitter {
           client.off('chat.final', onFinal);
           client.off('chat.error', onError);
           client.off('chat.aborted', onAborted);
+          client.off('session.tool', onSessionTool);
           client.off('disconnected', onDisconnect);
+          if (sessionEventsSubscribed) {
+            sessionEventsSubscribed = false;
+            void client.unsubscribeSessionEvents().catch((error) => {
+              console.warn(`[GroupChatEngine] Failed to unsubscribe session events for group ${groupId}, agent ${agentId}:`, error);
+            });
+          }
         };
 
         const resolveOnce = (value: string) => {
@@ -934,7 +1655,7 @@ export class GroupChatEngine extends EventEmitter {
         const resetIdleTimeout = () => {
           clearIdleTimeout();
           idleTimeout = setTimeout(() => {
-            rejectOnce(new Error(finalOutput.trim() ? 'Stream interrupted (idle timeout).' : 'Stream timed out (no response).'));
+            rejectOnce(new Error((finalOutput.trim() || latestProcessOutput.trim()) ? 'Stream interrupted (idle timeout).' : 'Stream timed out (no response).'));
           }, GROUP_STREAM_IDLE_TIMEOUT_MS);
         };
 
@@ -1126,30 +1847,20 @@ export class GroupChatEngine extends EventEmitter {
 
         const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
           if (data.sessionKey === finalSessionKey && data.runId === runId) {
-            const nextFinalOutput = selectPreferredTextSnapshot(finalOutput, data.text);
-            const didOutputChange = nextFinalOutput !== finalOutput;
-            finalOutput = nextFinalOutput;
-            this.updateActiveRunText(groupId, runId, finalOutput);
+            const nextRawOutput = selectPreferredTextSnapshot(rawOutput, data.text);
+            const didOutputChange = nextRawOutput !== rawOutput;
+            rawOutput = nextRawOutput;
+            const splitOutput = splitGroupProcessOutput(rawOutput, processStartTag, processEndTag);
+            finalOutput = splitOutput.finalContent;
+            processOutput = splitOutput.processContent;
+            modelProcessStreaming = splitOutput.processStreaming;
             if (!didOutputChange) {
+              syncCombinedProcessState();
               resetIdleTimeout();
               scheduleCompletionProbe();
               return;
             }
-            const visibleDeltaText = rewriteVisibleFileLinks(finalOutput, { workspacePath: runtimeContext.workspacePath });
-            if (msgId !== undefined) {
-              this.db.updateGroupMessage(msgId, finalOutput, modelUsed);
-            }
-            this.emit('delta', {
-              groupId,
-              id: msgId,
-              parent_id: parentId,
-              sender_type: 'agent',
-              sender_id: agentId,
-              sender_name: member.display_name,
-              model_used: modelUsed,
-              created_at: placeholderCreatedAt,
-              content: visibleDeltaText,
-            });
+            emitVisiblePatchIfChanged('delta', { trimVisibleContent: false, trimVisibleProcess: false });
             resetIdleTimeout();
             scheduleCompletionProbe();
           }
@@ -1160,37 +1871,27 @@ export class GroupChatEngine extends EventEmitter {
             const finalEventObservedAt = Date.now();
             const terminalFinalText = resolveChatFinalTextSnapshot(data.text, data.message);
             if (terminalFinalText) {
-              finalEventText = selectPreferredTextSnapshot(finalEventText, terminalFinalText);
-              finalOutput = selectPreferredTextSnapshot(finalOutput, terminalFinalText);
-              this.updateActiveRunText(groupId, runId, finalOutput);
+              const splitFinalEvent = splitGroupProcessOutput(terminalFinalText, processStartTag, processEndTag);
+              finalEventText = selectPreferredTextSnapshot(finalEventText, splitFinalEvent.finalContent);
+              rawOutput = selectPreferredTextSnapshot(rawOutput, terminalFinalText);
+              finalOutput = selectPreferredTextSnapshot(finalOutput, splitFinalEvent.finalContent);
+              processOutput = selectPreferredTextSnapshot(processOutput, splitFinalEvent.processContent);
+              modelProcessStreaming = splitFinalEvent.processStreaming;
               latestFinalEventAt = finalEventObservedAt;
               finalEventGeneration += 1;
             } else if (data.text) {
-              finalOutput = selectPreferredTextSnapshot(finalOutput, data.text);
-              this.updateActiveRunText(groupId, runId, finalOutput);
+              rawOutput = selectPreferredTextSnapshot(rawOutput, data.text);
+              const splitOutput = splitGroupProcessOutput(rawOutput, processStartTag, processEndTag);
+              finalOutput = selectPreferredTextSnapshot(finalOutput, splitOutput.finalContent);
+              processOutput = selectPreferredTextSnapshot(processOutput, splitOutput.processContent);
+              modelProcessStreaming = splitOutput.processStreaming;
             }
 
+            syncCombinedProcessState();
+
             if (terminalFinalText) {
-              const immediateFinalText = selectPreferredTextSnapshot(finalOutput, finalEventText);
-              const visibleImmediateFinalText = rewriteVisibleFileLinks(immediateFinalText, {
-                workspacePath: runtimeContext.workspacePath,
-              }).trim();
-              const nextVisibleFinalOutput = selectPreferredTextSnapshot(visibleFinalOutput, visibleImmediateFinalText);
-              if (msgId !== undefined && nextVisibleFinalOutput && visibleFinalOutput !== nextVisibleFinalOutput) {
-                visibleFinalOutput = nextVisibleFinalOutput;
-                this.db.updateGroupMessage(msgId, immediateFinalText, modelUsed);
-                this.emit('edit', {
-                  groupId,
-                  id: msgId,
-                  parent_id: parentId,
-                  sender_type: 'agent',
-                  sender_id: agentId,
-                  sender_name: member.display_name,
-                  content: nextVisibleFinalOutput,
-                  model_used: modelUsed,
-                  created_at: placeholderCreatedAt,
-                });
-              }
+              finalOutput = selectPreferredTextSnapshot(finalOutput, finalEventText);
+              emitVisiblePatchIfChanged('edit', { trimVisibleContent: true, trimVisibleProcess: true });
             }
             resetIdleTimeout();
             scheduleCompletionProbe(0);
@@ -1208,11 +1909,70 @@ export class GroupChatEngine extends EventEmitter {
         const onAborted = (data: { sessionKey: string; runId: string; text: string; message: any }) => {
           if (data.sessionKey === finalSessionKey && data.runId === runId) {
             if (data.text) {
-              finalOutput = selectPreferredTextSnapshot(finalOutput, data.text);
-              this.updateActiveRunText(groupId, runId, finalOutput);
+              rawOutput = selectPreferredTextSnapshot(rawOutput, data.text);
+              const splitOutput = splitGroupProcessOutput(rawOutput, processStartTag, processEndTag);
+              finalOutput = selectPreferredTextSnapshot(finalOutput, splitOutput.finalContent);
+              processOutput = selectPreferredTextSnapshot(processOutput, splitOutput.processContent);
+              modelProcessStreaming = splitOutput.processStreaming;
+              emitVisiblePatchIfChanged('delta', { trimVisibleContent: false, trimVisibleProcess: false });
             }
             scheduleCompletionProbe(0);
           }
+        };
+
+        const onSessionTool = (payload: {
+          sessionKey?: string;
+          parentSessionKey?: string;
+          runId?: string;
+          data?: any;
+        }) => {
+          if (!isRelevantToolEvent(payload)) {
+            return;
+          }
+
+          const eventData = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+            ? payload.data as Record<string, unknown>
+            : {};
+          const toolName = typeof eventData.name === 'string' && eventData.name.trim()
+            ? eventData.name.trim()
+            : 'tool';
+          const toolCallId = typeof eventData.toolCallId === 'string' && eventData.toolCallId.trim()
+            ? eventData.toolCallId.trim()
+            : `${payload.runId || runId}:${toolName}`;
+          const phase = typeof eventData.phase === 'string' ? eventData.phase.trim() : '';
+          const existingState = toolProgressById.get(toolCallId);
+          const nextArgs = normalizeToolArgsRecord(eventData.args) ?? existingState?.args;
+          const nextState: GroupToolProgressState = existingState ?? {
+            toolName,
+            args: nextArgs,
+          };
+          nextState.toolName = toolName;
+          nextState.args = nextArgs;
+
+          if (phase === 'start') {
+            activeToolCallIds.add(toolCallId);
+            appendToolProgressLine(toolProcessLines, formatToolStartProgress(progressLocale, toolName, nextArgs));
+          } else if (phase === 'update') {
+            activeToolCallIds.add(toolCallId);
+          } else if (phase === 'result') {
+            activeToolCallIds.delete(toolCallId);
+            appendToolProgressLine(toolProcessLines, formatToolResultProgress(
+              progressLocale,
+              toolName,
+              nextArgs,
+              eventData.isError === true,
+            ));
+          }
+
+          toolProcessOutput = toolProcessLines.join('\n');
+          if (phase === 'result') {
+            toolProgressById.delete(toolCallId);
+          } else {
+            toolProgressById.set(toolCallId, nextState);
+          }
+
+          emitVisiblePatchIfChanged('delta', { trimVisibleContent: false, trimVisibleProcess: true });
+          resetIdleTimeout();
         };
 
         const onDisconnect = () => {
@@ -1223,6 +1983,7 @@ export class GroupChatEngine extends EventEmitter {
         client.on('chat.final', onFinal);
         client.on('chat.error', onError);
         client.on('chat.aborted', onAborted);
+        client.on('session.tool', onSessionTool);
         client.on('disconnected', onDisconnect);
         resetIdleTimeout();
         scheduleCompletionProbe();
@@ -1234,10 +1995,13 @@ export class GroupChatEngine extends EventEmitter {
         selectPreferredTextSnapshot(finalOutput, response),
         finalEventText,
       );
-      const canonicalResponse = canonicalizeAssistantWorkspaceArtifacts(protectedResponse, {
+      const splitProtectedResponse = splitGroupProcessOutput(protectedResponse, processStartTag, processEndTag);
+      const canonicalResponse = canonicalizeAssistantWorkspaceArtifacts(splitProtectedResponse.finalContent, {
         workspacePath: runtimeContext.workspacePath,
         startedAtMs: runStartedAt,
       });
+      const canonicalProcessContent = selectPreferredTextSnapshot(latestProcessOutput, splitProtectedResponse.processContent);
+      latestProcessOutput = canonicalProcessContent;
       const mentionedIds = this.parseMentions(canonicalResponse, members);
       if (!canonicalResponse.trim() && msgId !== undefined) {
         if (isResetCommand) {
@@ -1256,7 +2020,7 @@ export class GroupChatEngine extends EventEmitter {
           member.display_name,
           'No text output returned from the run.'
         );
-        this.db.updateGroupMessage(msgId, errMsg, this.getAgentModel(agentId), null);
+        this.db.updateGroupMessage(msgId, errMsg, this.getAgentModel(agentId), null, canonicalProcessContent);
         this.db.updateGroupMessageSender(msgId, 'system', '系统');
         this.emit('message', {
           groupId,
@@ -1266,6 +2030,8 @@ export class GroupChatEngine extends EventEmitter {
           sender_id: 'system',
           sender_name: '系统',
           content: errMsg,
+          process_content: rewriteVisibleFileLinks(canonicalProcessContent, { workspacePath: runtimeContext.workspacePath }),
+          process_streaming: false,
           messageCode,
           messageParams,
           rawDetail,
@@ -1286,13 +2052,20 @@ export class GroupChatEngine extends EventEmitter {
         msgId, 
         canonicalResponse, 
         this.getAgentModel(agentId), 
-        mentionedIds.length > 0 ? JSON.stringify(mentionedIds) : null
+        mentionedIds.length > 0 ? JSON.stringify(mentionedIds) : null,
+        canonicalProcessContent,
       );
       const visibleResponse = selectPreferredTextSnapshot(
         visibleFinalOutput,
         rewriteVisibleFileLinks(canonicalResponse, { workspacePath: runtimeContext.workspacePath }).trim(),
       );
-      if (visibleResponse !== visibleFinalOutput) {
+      const visibleProcessResponse = selectPreferredTextSnapshot(
+        visibleProcessOutput,
+        rewriteVisibleFileLinks(canonicalProcessContent, { workspacePath: runtimeContext.workspacePath }).trim(),
+      );
+      if (visibleResponse !== visibleFinalOutput || visibleProcessResponse !== visibleProcessOutput) {
+        visibleFinalOutput = visibleResponse;
+        visibleProcessOutput = visibleProcessResponse;
         this.emit('edit', {
           groupId,
           id: msgId,
@@ -1301,6 +2074,8 @@ export class GroupChatEngine extends EventEmitter {
           sender_id: agentId,
           sender_name: member.display_name,
           content: visibleResponse,
+          process_content: visibleProcessResponse,
+          process_streaming: false,
           model_used: modelUsed,
           created_at: placeholderCreatedAt,
         });
@@ -1341,7 +2116,7 @@ export class GroupChatEngine extends EventEmitter {
         : createAgentResponseFailedMessage(member.display_name, rawDetail).content;
       
       if (msgId !== undefined) {
-        this.db.updateGroupMessage(msgId, errMsg, this.getAgentModel(agentId), null);
+        this.db.updateGroupMessage(msgId, errMsg, this.getAgentModel(agentId), null, latestProcessOutput);
         this.db.updateGroupMessageSender(msgId, 'system', '系统');
         this.emit('message', {
           groupId,
@@ -1351,6 +2126,8 @@ export class GroupChatEngine extends EventEmitter {
           sender_id: 'system',
           sender_name: '系统',
           content: errMsg,
+          process_content: rewriteVisibleFileLinks(latestProcessOutput, { workspacePath: runtimeWorkspacePath }),
+          process_streaming: false,
           messageCode: messageCode || AGENT_RESPONSE_FAILED_MESSAGE_CODE,
           messageParams,
           rawDetail,
@@ -1359,6 +2136,14 @@ export class GroupChatEngine extends EventEmitter {
       }
       return msgId || parentId;
     } finally {
+      if (sessionEventsSubscribed && sessionEventsClient) {
+        sessionEventsSubscribed = false;
+        try {
+          await sessionEventsClient.unsubscribeSessionEvents();
+        } catch (error) {
+          console.warn(`[GroupChatEngine] Failed to unsubscribe session events for group ${groupId}, agent ${agentId}:`, error);
+        }
+      }
       if (activeRunId) {
         this.clearActiveRun(groupId, activeRunId);
       }

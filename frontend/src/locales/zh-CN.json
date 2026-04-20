@@ -282,6 +282,7 @@
   },
   "messageBubble": {
     "processTitle": "处理过程",
+    "executingPlaceholder": "执行中",
     "editMessagePlaceholder": "编辑消息内容..."
   },
   "settings": {
