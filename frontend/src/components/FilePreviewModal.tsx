@@ -845,25 +845,25 @@ function HtmlFrameViewer({ src }: { src: string }) {
     >
       {/* Top toolbar - Light Theme */}
       <div 
-        className="flex items-center justify-between px-4 sm:px-6 py-2.5 bg-white/95 border-b border-gray-200 flex-shrink-0"
+        className="flex items-center justify-between gap-3 px-3 sm:px-6 py-2.5 bg-white/95 border-b border-gray-200 flex-shrink-0"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex flex-1 min-w-0 items-center gap-2 sm:gap-3">
           <div className={`hidden sm:flex w-8 h-8 rounded-lg ${bgColor} items-center justify-center flex-shrink-0 text-white border border-black/5`}>
             <Icon className="w-4 h-4" />
           </div>
-          <div className="min-w-0">
-            <h3 className="text-gray-900 font-semibold text-sm truncate max-w-[50vw]">{filename}</h3>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-gray-900 font-semibold text-sm truncate">{filename}</h3>
             <p className="text-gray-500 text-[10px] font-medium tracking-wider uppercase">{ext} • {typeText}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-shrink-0 items-center gap-1.5 sm:gap-2">
           {supportsRenderToggle && (
-            <div className="flex items-center h-9 rounded-xl border border-gray-200 bg-gray-200/80 p-1">
+            <div className="flex flex-shrink-0 items-center h-9 rounded-xl border border-gray-200 bg-gray-200/80 p-1">
               <button
                 type="button"
                 onClick={() => setViewMode('source')}
-                className={`h-full rounded-lg px-3 text-xs transition-colors ${
+                className={`flex h-full flex-shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-2.5 sm:px-3 text-xs leading-none transition-colors ${
                   !isRenderedMode
                     ? 'bg-white text-gray-900 font-semibold border border-gray-200'
                     : 'font-normal text-gray-500 hover:text-gray-700 hover:font-semibold'
@@ -874,7 +874,7 @@ function HtmlFrameViewer({ src }: { src: string }) {
               <button
                 type="button"
                 onClick={() => setViewMode('render')}
-                className={`h-full rounded-lg px-3 text-xs transition-colors ${
+                className={`flex h-full flex-shrink-0 items-center justify-center whitespace-nowrap rounded-lg px-2.5 sm:px-3 text-xs leading-none transition-colors ${
                   isRenderedMode
                     ? 'bg-white text-gray-900 font-semibold border border-gray-200'
                     : 'font-normal text-gray-500 hover:text-gray-700 hover:font-semibold'
@@ -886,9 +886,9 @@ function HtmlFrameViewer({ src }: { src: string }) {
           )}
 
 
-           <button 
+          <button 
             onClick={handleDownload}
-            className="w-9 h-9 sm:w-auto flex items-center justify-center sm:gap-1.5 sm:px-4 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold transition-all border border-gray-200"
+            className="w-9 h-9 sm:w-auto flex-shrink-0 flex items-center justify-center sm:gap-1.5 sm:px-4 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs font-semibold transition-all border border-gray-200"
           >
             <Download className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">{t('common.download')}</span>
@@ -896,7 +896,7 @@ function HtmlFrameViewer({ src }: { src: string }) {
 
           <button 
             onClick={handleClose}
-            className="w-9 h-9 flex items-center justify-center rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition-all border border-gray-200"
+            className="w-9 h-9 flex-shrink-0 flex items-center justify-center rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition-all border border-gray-200"
           >
             <X className="w-5 h-5" />
           </button>
