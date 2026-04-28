@@ -776,9 +776,9 @@ let updateRestartResumeTask: Promise<void> | null = null;
 let activeGatewayRestartTask: Promise<void> | null = null;
 let cachedGatewayProbeKey: string | null = null;
 let cachedGatewayProbeResult:
-  | { checkedAt: number; result: { connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' } }
+  | { checkedAt: number; result: GatewayConnectionProbeResult }
   | null = null;
-const gatewayProbeInflight = new Map<string, Promise<{ connected: boolean; message?: string; source: 'local-runtime' | 'auth-probe' }>>();
+const gatewayProbeInflight = new Map<string, Promise<GatewayConnectionProbeResult>>();
 let gatewayRestartReconcileStableSinceMs: number | null = null;
 
 function appendUpdateLog(message: string) {
@@ -3690,7 +3690,7 @@ function buildGatewayProbeCacheKey(params: {
 type GatewayConnectionProbeResult = {
   connected: boolean;
   message?: string;
-  source: 'local-runtime' | 'auth-probe';
+  source: 'local-runtime' | 'auth-probe' | 'active-session';
 };
 
 async function probeGatewayConnectionStatus(params: {
@@ -5507,6 +5507,22 @@ if (mainRegistered) {
 
 const connections = new Map<string, OpenClawClient>();
 
+function getActiveGatewayConnectionStatus(): GatewayConnectionProbeResult | null {
+  const activeConnectionCount = Array.from(connections.values())
+    .filter((client) => client.isConnected())
+    .length;
+
+  if (activeConnectionCount === 0) {
+    return null;
+  }
+
+  return {
+    connected: true,
+    message: `OpenClaw gateway has ${activeConnectionCount} active session connection${activeConnectionCount === 1 ? '' : 's'}`,
+    source: 'active-session',
+  };
+}
+
 for (const group of db.getGroupChats()) {
   try {
     cleanupLegacyGroupRuntimeArtifacts(group.id);
@@ -6685,6 +6701,15 @@ app.post('/api/auth/login', (req, res) => {
 
 app.get('/api/gateway/status', async (_req, res) => {
   try {
+    const activeConnectionStatus = getActiveGatewayConnectionStatus();
+    if (activeConnectionStatus) {
+      return res.json({
+        connected: activeConnectionStatus.connected,
+        message: activeConnectionStatus.message,
+        source: activeConnectionStatus.source,
+      });
+    }
+
     const result = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
     res.json({
       connected: result.connected,

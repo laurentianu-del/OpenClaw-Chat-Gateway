@@ -245,6 +245,10 @@ export class OpenClawClient extends EventEmitter {
     this.config = config;
   }
 
+  isConnected(): boolean {
+    return this.connected;
+  }
+
   async connect(): Promise<void> {
     if (this.connected) return;
     if (this.connectPromise) return this.connectPromise;
