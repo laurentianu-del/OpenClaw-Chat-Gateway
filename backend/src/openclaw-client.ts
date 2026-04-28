@@ -588,6 +588,7 @@ export class OpenClawClient extends EventEmitter {
   async abortChat(params: {
     sessionKey: string;
     runId?: string;
+    timeoutMs?: number;
   }): Promise<{ aborted: boolean; runIds?: string[] }> {
     if (!this.connected) {
       await this.connect();
@@ -596,7 +597,7 @@ export class OpenClawClient extends EventEmitter {
     const response = await this.request('chat.abort', {
       sessionKey: params.sessionKey,
       ...(params.runId ? { runId: params.runId } : {}),
-    }, 10000);
+    }, params.timeoutMs ?? 10000);
 
     return {
       aborted: response?.aborted !== false,

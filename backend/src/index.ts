@@ -257,6 +257,7 @@ const CHAT_HISTORY_COMPLETION_SETTLE_POLL_MS = 500;
 const CHAT_FINAL_EVENT_SETTLE_GRACE_MS = 1500;
 const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const CHAT_HISTORY_ACTIVITY_GRACE_MS = 2 * 60 * 1000;
+const CHAT_ORPHAN_ABORT_TIMEOUT_MS = 5000;
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
 const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
@@ -5775,6 +5776,10 @@ function getSessionWorkspacePath(sessionId: string): string {
   return agentProvisioner.getWorkspacePath(agentId);
 }
 
+function buildOpenClawChatSessionKey(sessionId: string, agentId: string): string {
+  return sessionId.startsWith('agent:') ? sessionId : `agent:${agentId}:chat:${sessionId}`;
+}
+
 function rewriteOpenClawMediaPaths(text: string, workspacePath?: string): string {
   return rewriteVisibleFileLinks(text, { workspacePath });
 }
@@ -8527,6 +8532,26 @@ async function interruptSessionStreamingStateForNewRun(sessionId: string): Promi
   return nextEpoch;
 }
 
+async function abortOpenClawSessionRuns(client: OpenClawClient, sessionKey: string, context: string): Promise<{ aborted: boolean; runIds: string[] }> {
+  try {
+    const result = await client.abortChat({
+      sessionKey,
+      timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+    });
+    const runIds = Array.isArray(result.runIds) ? result.runIds : [];
+    return {
+      aborted: result.aborted,
+      runIds,
+    };
+  } catch (error) {
+    console.warn(`[chat] Failed to abort orphan OpenClaw runs for ${context} (${sessionKey}):`, error);
+    return {
+      aborted: false,
+      runIds: [],
+    };
+  }
+}
+
 async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<void> {
   if (activeRunManager.getRun(sessionId) || pendingChatPreparationManager.get(sessionId)) {
     return;
@@ -8865,12 +8890,12 @@ app.post('/api/chat', async (req, res) => {
 
     const client = await getConnection(normalizedSessionId);
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+    const expectedSessionKey = buildOpenClawChatSessionKey(normalizedSessionId, agentId);
+    await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${normalizedSessionId} before send`);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
-    const expectedSessionKey = normalizedSessionId.startsWith('agent:')
-      ? normalizedSessionId
-      : `agent:${agentId}:chat:${normalizedSessionId}`;
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
@@ -9100,11 +9125,11 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     const client = await getConnection(sessionId);
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    const expectedSessionKey = buildOpenClawChatSessionKey(sessionId, agentId);
+    await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${sessionId} before regenerate`);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
-    const expectedSessionKey = sessionId.startsWith('agent:')
-      ? sessionId
-      : `agent:${agentId}:chat:${sessionId}`;
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => ({ length: 0, latestSignature: '' }));
@@ -9263,8 +9288,25 @@ app.post('/api/chat/stop', async (req, res) => {
     bumpSessionInterruptionEpoch(normalizedSessionId);
     pendingChatPreparationManager.cancel(normalizedSessionId, interruptedEpoch);
     const result = await activeRunManager.abortRun(normalizedSessionId);
+    let orphanAbortResult: { aborted: boolean; runIds: string[] } = { aborted: false, runIds: [] };
+    try {
+      const sessionInfo = sessionManager.getSession(normalizedSessionId);
+      const agentId = sessionInfo?.agentId || 'main';
+      const client = await getConnection(normalizedSessionId);
+      orphanAbortResult = await abortOpenClawSessionRuns(
+        client,
+        buildOpenClawChatSessionKey(normalizedSessionId, agentId),
+        `session ${normalizedSessionId} stop`,
+      );
+    } catch (error) {
+      console.warn(`[chat] Failed to abort orphan OpenClaw runs while stopping session ${normalizedSessionId}:`, error);
+    }
     await reconcileInactiveChatLatestMessage(normalizedSessionId);
-    res.json({ success: true, ...result });
+    res.json({
+      success: true,
+      aborted: result.aborted || orphanAbortResult.aborted,
+      runIds: orphanAbortResult.runIds,
+    });
   } catch (error: any) {
     res.status(500).json(buildStructuredChatHttpError(error?.message || 'Failed to stop chat run.'));
   }
