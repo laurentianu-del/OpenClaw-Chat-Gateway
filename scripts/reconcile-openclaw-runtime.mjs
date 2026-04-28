@@ -314,6 +314,67 @@ function parseJsonPayload(text) {
   return JSON.parse(payload);
 }
 
+function parseBrowserStatusBoolean(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (normalized.startsWith('true')) return true;
+  if (normalized.startsWith('false')) return false;
+  return null;
+}
+
+function parseBrowserStatusText(text) {
+  const trimmed = normalizeText(text);
+  if (!trimmed) return null;
+
+  const parsed = {};
+  for (const line of trimmed.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z][A-Za-z0-9._-]*)\s*:\s*(.*?)\s*$/);
+    if (!match) continue;
+
+    const key = match[1].toLowerCase();
+    const value = match[2];
+    if (key === 'enabled' || key === 'running' || key === 'headless') {
+      const parsedBoolean = parseBrowserStatusBoolean(value);
+      if (parsedBoolean !== null) {
+        parsed[key] = parsedBoolean;
+      }
+      continue;
+    }
+
+    if (key === 'profile') {
+      parsed.profile = normalizeText(value);
+    } else if (key === 'transport') {
+      parsed.transport = normalizeText(value);
+    } else if (key === 'browser' || key === 'chosenbrowser') {
+      parsed.chosenBrowser = normalizeText(value);
+    } else if (key === 'detectedbrowser') {
+      parsed.detectedBrowser = normalizeText(value);
+    } else if (key === 'detecterror') {
+      const detail = normalizeText(value);
+      parsed.detectError = /^(none|null|n\/a)$/i.test(detail) ? '' : detail;
+    }
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : null;
+}
+
+function parseBrowserStatusOutput(...outputs) {
+  for (const output of outputs) {
+    const trimmed = normalizeText(output);
+    if (!trimmed) continue;
+
+    try {
+      return parseJsonPayload(trimmed);
+    } catch {}
+
+    const parsedText = parseBrowserStatusText(trimmed);
+    if (parsedText) {
+      return parsedText;
+    }
+  }
+
+  throw new Error('OpenClaw browser status did not return parseable output.');
+}
+
 function scopeList(value) {
   if (!Array.isArray(value)) return [];
   return value
@@ -512,7 +573,7 @@ async function readBrowserStatus(executablePath) {
     ['browser', '--json', '--browser-profile', BROWSER_PROFILE, '--timeout', '15000', 'status'],
     { timeout: 20000 }
   );
-  return parseJsonPayload(result.stdout);
+  return parseBrowserStatusOutput(result.stdout, result.stderr);
 }
 
 async function waitForBrowserRunning(executablePath) {

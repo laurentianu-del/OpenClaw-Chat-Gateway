@@ -3904,7 +3904,11 @@ function readBrowserConfigState(): BrowserConfigState {
 
   return {
     enabled: typeof config?.browser?.enabled === 'boolean' ? config.browser.enabled : null,
-    headless: typeof config?.browser?.headless === 'boolean' ? config.browser.headless : null,
+    headless: typeof profileConfig?.headless === 'boolean'
+      ? profileConfig.headless
+      : typeof config?.browser?.headless === 'boolean'
+        ? config.browser.headless
+        : null,
     profile,
     executablePath: normalizeCliText(config?.browser?.executablePath) || null,
     noSandbox: typeof config?.browser?.noSandbox === 'boolean' ? config.browser.noSandbox : null,
@@ -4069,6 +4073,69 @@ function buildBrowserHealthDiagnosticsFromCli(
     config: browserConfig,
     runtime,
   };
+}
+
+function parseBrowserStatusCliBoolean(value: string): boolean | null {
+  const normalized = normalizeCliText(value).toLowerCase();
+  if (normalized.startsWith('true')) return true;
+  if (normalized.startsWith('false')) return false;
+  return null;
+}
+
+function parseBrowserStatusCliText(output: string): Record<string, unknown> | null {
+  const normalizedOutput = normalizeCliText(output);
+  if (!normalizedOutput) return null;
+
+  const parsed: Record<string, unknown> = {};
+  for (const line of normalizedOutput.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z][A-Za-z0-9._-]*)\s*:\s*(.*?)\s*$/);
+    if (!match) continue;
+
+    const key = match[1];
+    const value = match[2];
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey === 'enabled' || normalizedKey === 'running' || normalizedKey === 'headless') {
+      const parsedBoolean = parseBrowserStatusCliBoolean(value);
+      if (parsedBoolean !== null) {
+        parsed[normalizedKey] = parsedBoolean;
+      }
+      continue;
+    }
+
+    if (normalizedKey === 'profile') {
+      parsed.profile = normalizeCliText(value);
+    } else if (normalizedKey === 'transport') {
+      parsed.transport = normalizeCliText(value);
+    } else if (normalizedKey === 'browser' || normalizedKey === 'chosenbrowser') {
+      parsed.chosenBrowser = normalizeCliText(value);
+    } else if (normalizedKey === 'detectedbrowser') {
+      parsed.detectedBrowser = normalizeCliText(value);
+    } else if (normalizedKey === 'detecterror') {
+      const detail = normalizeCliText(value);
+      parsed.detectError = /^(none|null|n\/a)$/i.test(detail) ? '' : detail;
+    }
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : null;
+}
+
+function parseBrowserStatusCliOutput(output: string): Record<string, unknown> | null {
+  const normalizedOutput = normalizeCliText(output);
+  if (!normalizedOutput) return null;
+
+  try {
+    return JSON.parse(normalizedOutput);
+  } catch {}
+
+  const jsonStart = normalizedOutput.indexOf('{');
+  const jsonEnd = normalizedOutput.lastIndexOf('}');
+  if (jsonStart >= 0 && jsonEnd > jsonStart) {
+    try {
+      return JSON.parse(normalizedOutput.slice(jsonStart, jsonEnd + 1));
+    } catch {}
+  }
+
+  return parseBrowserStatusCliText(normalizedOutput);
 }
 
 function patchExecApprovals(enabled: boolean) {
@@ -4452,18 +4519,22 @@ async function readBrowserHealthDiagnostics(
   rawDetail?: string | null
 ): Promise<BrowserHealthDiagnostics> {
   try {
-    const { stdout } = await runOpenClawBrowserCommand(
+    const { stdout, stderr } = await runOpenClawBrowserCommand(
       buildBrowserProfileArgs(browserConfig, ['--json', '--timeout', String(BROWSER_HEALTH_CLI_TIMEOUT_MS), 'status']),
       BROWSER_HEALTH_EXEC_TIMEOUT_MS
     );
-    const parsed = JSON.parse(normalizeCliText(stdout) || '{}');
-    return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt, browserConfig, rawDetail);
+    const parsed = parseBrowserStatusCliOutput(stdout) || parseBrowserStatusCliOutput(stderr);
+    if (parsed) {
+      return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt, browserConfig, rawDetail);
+    }
+    return buildFallbackBrowserHealthDiagnostics(checkedAt, rawDetail || 'Unable to parse OpenClaw browser status output');
   } catch (error: any) {
-    const stdout = normalizeCliText(error?.stdout);
-    if (stdout) {
-      try {
-        return buildBrowserHealthDiagnosticsFromCli(JSON.parse(stdout), checkedAt, browserConfig, rawDetail || readCliErrorDetail(error));
-      } catch {}
+    const output = normalizeCliText(error?.stdout) || normalizeCliText(error?.stderr);
+    if (output) {
+      const parsed = parseBrowserStatusCliOutput(output);
+      if (parsed) {
+        return buildBrowserHealthDiagnosticsFromCli(parsed, checkedAt, browserConfig, rawDetail || readCliErrorDetail(error));
+      }
     }
 
     return buildFallbackBrowserHealthDiagnostics(checkedAt, rawDetail || readCliErrorDetail(error));
