@@ -2,12 +2,11 @@ import React from 'react';
 import { Check, Copy, Trash2, RefreshCw, Quote, X, Download, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkBreaks from 'remark-breaks';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { normalizeLanguage } from '../../i18n';
 import { getFileIconInfo } from '../../utils/fileUtils';
+import { markdownRehypePlugins, markdownRemarkPlugins, normalizeMathMarkdown } from '../../utils/markdownMath';
 
 const SEARCH_HIGHLIGHT_CLASS_NAME = 'rounded-[4px] bg-[#fff3b0] px-0.5 text-inherit';
 const EXTERNAL_LINK_CLASS_NAME = 'text-[#1a73e8] no-underline hover:underline decoration-1 underline-offset-2 break-all transition-colors hover:text-[#1557b0]';
@@ -1166,8 +1165,12 @@ export const ProcessStepBlock = ({
             {renderProcessAttachmentCards(embeddedFileLinks.attachments, `process-code-mixed-${createStableContentKey(codeText)}`)}
             {embeddedFileLinks.text.trim() ? (
               <div className="prose prose-sm max-w-none prose-slate text-[13.5px] text-[#444]">
-                <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={processMarkdownComponents}>
-                  {embeddedFileLinks.text}
+                <ReactMarkdown
+                  remarkPlugins={markdownRemarkPlugins}
+                  rehypePlugins={markdownRehypePlugins}
+                  components={processMarkdownComponents}
+                >
+                  {normalizeMathMarkdown(embeddedFileLinks.text)}
                 </ReactMarkdown>
               </div>
             ) : null}
@@ -1283,8 +1286,12 @@ export const ProcessStepBlock = ({
       {isExpanded && (
         <div className="px-3 py-2.5 bg-white">
           <div className="text-[13.5px] font-sans text-[#444] break-all prose prose-sm max-w-none" style={{ lineHeight: '1.6' }}>
-             <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={processMarkdownComponents}>
-               {normalizedContent}
+             <ReactMarkdown
+               remarkPlugins={markdownRemarkPlugins}
+               rehypePlugins={markdownRehypePlugins}
+               components={processMarkdownComponents}
+             >
+               {normalizeMathMarkdown(normalizedContent)}
              </ReactMarkdown>
              {shouldRenderInlineExecutingPlaceholder ? (
                <div className="not-prose text-[13.5px] leading-[1.6] text-[#666]">
@@ -1422,11 +1429,12 @@ const QuoteBlock: React.FC<{ author: string; time: string; content: string; comp
       </button>
       <div className="px-3.5 py-2 relative" style={{ padding: '0.5rem 0.875rem' }}>
         <div className={`text-[13px] text-gray-700 font-sans break-words custom-markdown quote-content-inner ${!expanded && isLong ? 'max-h-[120px] overflow-hidden' : ''}`} style={{ lineHeight: '1.5', wordBreak: 'break-word' }}>
-          <ReactMarkdown 
-            remarkPlugins={[remarkGfm, remarkBreaks]} 
+          <ReactMarkdown
+            remarkPlugins={markdownRemarkPlugins}
+            rehypePlugins={markdownRehypePlugins}
             components={components}
           >
-            {content}
+            {normalizeMathMarkdown(content)}
           </ReactMarkdown>
         </div>
         {!expanded && isLong && (
@@ -1984,10 +1992,11 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                               {embeddedFileLinks.text.trim() ? (
                                 <div className="prose prose-sm max-w-none prose-slate text-[16px] pb-1">
                                   <ReactMarkdown
-                                    remarkPlugins={[remarkGfm, remarkBreaks]}
+                                    remarkPlugins={markdownRemarkPlugins}
+                                    rehypePlugins={markdownRehypePlugins}
                                     components={markdownComponents}
                                   >
-                                    {embeddedFileLinks.text}
+                                    {normalizeMathMarkdown(embeddedFileLinks.text)}
                                   </ReactMarkdown>
                                 </div>
                               ) : null}
@@ -2267,11 +2276,12 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                     };
 
                     return (
-                  <ReactMarkdown 
-                    remarkPlugins={[remarkGfm, remarkBreaks]}
+                  <ReactMarkdown
+                    remarkPlugins={markdownRemarkPlugins}
+                    rehypePlugins={markdownRehypePlugins}
                     components={markdownComponents}
                   >
-                    {text}
+                    {normalizeMathMarkdown(text)}
                   </ReactMarkdown>
                   );
                 })()}

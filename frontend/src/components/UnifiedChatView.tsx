@@ -3,8 +3,6 @@ import { Menu, Plus, X, Search, ChevronUp, ChevronDown, Trash2, Users, Check } f
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import remarkBreaks from 'remark-breaks';
 import { normalizeLanguage } from '../i18n';
 import { getFileIconInfo } from '../utils/fileUtils';
 import FilePreviewModal from './FilePreviewModal';
@@ -19,6 +17,7 @@ import {
 } from '../utils/historyPagination';
 import { ACTIVE_CONTEXT_REFRESH_EVENT, type ActiveContextRefreshDetail } from '../utils/contextRefresh';
 import { getGroupIdValidationKey } from '../utils/groupId';
+import { markdownRehypePlugins, markdownRemarkPlugins, normalizeMathMarkdown } from '../utils/markdownMath';
 
 // ============ TYPES ============
 
@@ -3973,8 +3972,12 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                           }
                         };
                         return (
-                          <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={previewComponents}>
-                            {processed}
+                          <ReactMarkdown
+                            remarkPlugins={markdownRemarkPlugins}
+                            rehypePlugins={markdownRehypePlugins}
+                            components={previewComponents}
+                          >
+                            {normalizeMathMarkdown(processed)}
                           </ReactMarkdown>
                         );
                       })()}
@@ -4029,7 +4032,15 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                           return <code className={className} {...props}>{children}</code>;
                         }
                       };
-                      return <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={previewComponents}>{processed}</ReactMarkdown>;
+                      return (
+                        <ReactMarkdown
+                          remarkPlugins={markdownRemarkPlugins}
+                          rehypePlugins={markdownRehypePlugins}
+                          components={previewComponents}
+                        >
+                          {normalizeMathMarkdown(processed)}
+                        </ReactMarkdown>
+                      );
                     })() : (
                       <span className="text-gray-400">{t('unifiedChat.inputPlaceholder')}</span>
                     )}
