@@ -46,6 +46,7 @@ export type ChatRow = {
   role: 'user' | 'assistant' | 'system';
   content: string;
   process_content?: string | null;
+  process_streaming?: boolean | number | null;
   model_used?: string;
   agent_id?: string;
   agent_name?: string;
@@ -153,6 +154,7 @@ export class DB {
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         process_content TEXT,
+        process_streaming INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -313,6 +315,7 @@ export class DB {
     try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN agent_name TEXT"); } catch (e: any) {}
     try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN parent_id INTEGER REFERENCES chat_messages(id)"); } catch (e: any) {}
     try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN process_content TEXT"); } catch (e: any) {}
+    try { this.db.exec("ALTER TABLE chat_messages ADD COLUMN process_streaming INTEGER DEFAULT 0"); } catch (e: any) {}
 
     // Group message upgrades
     try { this.db.exec("ALTER TABLE group_messages ADD COLUMN model_used TEXT"); } catch (e: any) {}
@@ -401,16 +404,40 @@ export class DB {
 
   saveMessage(row: ChatRow): number | bigint {
     const result = this.db
-      .prepare('INSERT INTO chat_messages (session_key, parent_id, role, content, process_content, model_used, agent_id, agent_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(row.session_key, row.parent_id || null, row.role, row.content, row.process_content || null, row.model_used || null, row.agent_id || null, row.agent_name || null);
+      .prepare('INSERT INTO chat_messages (session_key, parent_id, role, content, process_content, process_streaming, model_used, agent_id, agent_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        row.session_key,
+        row.parent_id || null,
+        row.role,
+        row.content,
+        row.process_content || null,
+        row.process_streaming ? 1 : 0,
+        row.model_used || null,
+        row.agent_id || null,
+        row.agent_name || null,
+      );
     return result.lastInsertRowid;
   }
 
-  updateMessage(id: number, content: string, modelUsed?: string, processContent?: string | null) {
+  updateMessage(id: number, content: string, modelUsed?: string, processContent?: string | null, processStreaming?: boolean | null) {
+    if (processContent !== undefined && processStreaming !== undefined) {
+      this.db
+        .prepare('UPDATE chat_messages SET content = ?, process_content = ?, process_streaming = ?, model_used = ? WHERE id = ?')
+        .run(content, processContent || null, processStreaming ? 1 : 0, modelUsed || null, id);
+      return;
+    }
+
     if (processContent !== undefined) {
       this.db
         .prepare('UPDATE chat_messages SET content = ?, process_content = ?, model_used = ? WHERE id = ?')
         .run(content, processContent || null, modelUsed || null, id);
+      return;
+    }
+
+    if (processStreaming !== undefined) {
+      this.db
+        .prepare('UPDATE chat_messages SET content = ?, process_streaming = ?, model_used = ? WHERE id = ?')
+        .run(content, processStreaming ? 1 : 0, modelUsed || null, id);
       return;
     }
 
@@ -550,7 +577,7 @@ export class DB {
       table: 'chat_messages',
       scopeColumn: 'session_key',
       scopeValue: sessionKey,
-      selectSql: "id, parent_id, session_key, role, content, process_content, model_used, agent_id, agent_name, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at",
+      selectSql: "id, parent_id, session_key, role, content, process_content, process_streaming, model_used, agent_id, agent_name, strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at",
       beforeId: options.beforeId,
       limit: options.limit ?? 1000,
     });

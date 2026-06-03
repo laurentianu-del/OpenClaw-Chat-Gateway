@@ -282,6 +282,8 @@ const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const CHAT_HISTORY_ACTIVITY_GRACE_MS = 2 * 60 * 1000;
 const CHAT_ORPHAN_ABORT_TIMEOUT_MS = 5000;
 const CHAT_ABORT_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000];
+const CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS = 1000;
+const CHAT_GATEWAY_RECONNECT_PROBE_RETRY_DELAY_MS = 3000;
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
 const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
@@ -6371,21 +6373,23 @@ function withStructuredGroupMessage<T extends {
   };
 }
 
-function withStructuredChatMessage<T extends { content?: string | null; process_content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null }>(
+function withStructuredChatMessage<T extends { content?: string | null; process_content?: string | null; process_streaming?: boolean | number | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null }>(
   message: T,
   options?: { sessionId?: string | null }
-): T & { process_content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null } {
+): T & { process_content?: string | null; process_streaming?: boolean | number | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null } {
   const content = typeof message.content === 'string'
     ? rewriteOpenClawMediaPaths(message.content, options?.sessionId ? getSessionWorkspacePath(options.sessionId) : undefined)
     : message.content;
   const processContent = typeof message.process_content === 'string'
     ? rewriteOpenClawMediaPaths(message.process_content, options?.sessionId ? getSessionWorkspacePath(options.sessionId) : undefined)
     : message.process_content;
+  const processStreaming = Boolean(message.process_streaming);
   const structured = getStructuredChatMessage(content);
   return {
     ...message,
     content,
     process_content: processContent,
+    process_streaming: structured.messageCode ? false : processStreaming,
     role: structured.role ?? message.role,
     messageCode: message.messageCode ?? structured.messageCode,
     messageParams: message.messageParams ?? structured.messageParams,
@@ -6766,15 +6770,19 @@ async function runDirectChatCompletion(params: {
     lastVisibleText = visibleText;
     lastVisibleProcessContent = visibleProcessContent;
     lastVisibleProcessStreaming = visibleProcessStreaming;
-    db.updateMessage(params.assistantMessageId, visibleText, params.modelUsed, visibleProcessContent);
-    params.response.write(`data: ${JSON.stringify({
-      type,
-      text: visibleText,
-      process_content: visibleProcessContent,
-      process_streaming: visibleProcessStreaming,
-      modelUsed: params.modelUsed,
-      model_used: params.modelUsed,
-    })}\n\n`);
+    db.updateMessage(params.assistantMessageId, visibleText, params.modelUsed, visibleProcessContent, visibleProcessStreaming);
+    if (isStreamingClientOpen(params.response)) {
+      try {
+        params.response.write(`data: ${JSON.stringify({
+          type,
+          text: visibleText,
+          process_content: visibleProcessContent,
+          process_streaming: visibleProcessStreaming,
+          modelUsed: params.modelUsed,
+          model_used: params.modelUsed,
+        })}\n\n`);
+      } catch {}
+    }
   };
 
   try {
@@ -9431,6 +9439,9 @@ interface ActiveRun {
   sessionEventsSubscribed?: boolean;
   clientRef?: OpenClawClient;
   cleanedUp?: boolean;
+  gatewayReconnectTimer?: NodeJS.Timeout;
+  gatewayReconnectInFlight?: boolean;
+  gatewayDisconnectedAt?: number;
 }
 
 type SplitChatProcessOutputResult = {
@@ -9468,6 +9479,12 @@ function warmManagedHostToolingInBackground() {
 
 function isStreamingClientOpen(res: express.Response): boolean {
   return !res.writableEnded && !res.destroyed;
+}
+
+function isRecoverableGatewayDisconnectDetail(detail?: string | null): boolean {
+  const normalized = normalizeCliText(detail);
+  if (!normalized) return false;
+  return /Client disconnected|connection is not open|ECONNREFUSED|ECONNRESET|EPIPE|gateway connect timeout|Gateway connect failed|WebSocket/i.test(normalized);
 }
 
 class PendingChatPreparationManager {
@@ -9576,6 +9593,93 @@ class ActiveRunManager {
     return this.runs.get(sessionId);
   }
 
+  private writeRunEvent(run: ActiveRun, payload: Record<string, unknown>, options?: { end?: boolean }) {
+    const frame = `data: ${JSON.stringify(payload)}\n\n`;
+    run.clients = run.clients.filter((res) => {
+      if (!isStreamingClientOpen(res)) {
+        return false;
+      }
+
+      try {
+        res.write(frame);
+        if (options?.end) {
+          res.end();
+          return false;
+        }
+        return isStreamingClientOpen(res);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private writeSingleRunEvent(res: express.Response, payload: Record<string, unknown>, options?: { end?: boolean }): boolean {
+    if (!isStreamingClientOpen(res)) return false;
+    try {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      if (options?.end) {
+        res.end();
+        return false;
+      }
+      return isStreamingClientOpen(res);
+    } catch {
+      return false;
+    }
+  }
+
+  private persistVisibleSnapshot(run: ActiveRun, visible: { text: string; process_content: string; process_streaming: boolean }) {
+    this.db.updateMessage(
+      run.messageId,
+      visible.text,
+      run.modelUsed,
+      visible.process_content,
+      visible.process_streaming,
+    );
+  }
+
+  private scheduleGatewayReconnectProbe(run: ActiveRun, delay = CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS) {
+    if (!this.isCurrentRun(run) || !run.clientRef) return;
+    run.gatewayDisconnectedAt = run.gatewayDisconnectedAt ?? Date.now();
+    if (run.gatewayReconnectTimer) {
+      clearTimeout(run.gatewayReconnectTimer);
+    }
+    run.gatewayReconnectTimer = setTimeout(() => {
+      run.gatewayReconnectTimer = undefined;
+      if (!this.isCurrentRun(run) || run.gatewayReconnectInFlight || !run.clientRef) {
+        return;
+      }
+
+      run.gatewayReconnectInFlight = true;
+      void run.clientRef.connect()
+        .then(async () => {
+          if (!this.isCurrentRun(run) || !run.clientRef) return;
+          connections.set(run.sessionId, run.clientRef);
+          run.gatewayDisconnectedAt = undefined;
+          if (isRecoverableGatewayDisconnectDetail(run.pendingErrorDetail)) {
+            run.pendingErrorDetail = undefined;
+          }
+          if (run.sessionEventsSubscribed) {
+            try {
+              await run.clientRef.subscribeSessionEvents();
+            } catch (error) {
+              console.warn(`[chat] Failed to resubscribe session events after gateway reconnect for session ${run.sessionId}:`, error);
+            }
+          }
+          this.scheduleCompletionProbe(run, 0);
+        })
+        .catch((error) => {
+          if (!this.isCurrentRun(run)) return;
+          const detail = error instanceof Error ? error.message : String(error);
+          console.warn(`[chat] Waiting for gateway reconnect for session ${run.sessionId}, run ${run.runId}: ${detail}`);
+          this.scheduleGatewayReconnectProbe(run, CHAT_GATEWAY_RECONNECT_PROBE_RETRY_DELAY_MS);
+        })
+        .finally(() => {
+          run.gatewayReconnectInFlight = false;
+        });
+    }, delay);
+    run.gatewayReconnectTimer.unref?.();
+  }
+
   private isCurrentRun(run: ActiveRun | undefined): run is ActiveRun {
     if (!run) return false;
     const current = this.runs.get(run.sessionId);
@@ -9620,17 +9724,14 @@ class ActiveRunManager {
     });
     const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
     const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent || '', run.workspacePath);
-    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent, false);
 
-    run.clients.forEach((res) => {
-      res.write(`data: ${JSON.stringify({
-        type: 'final',
-        text: rewritten,
-        process_content: rewrittenProcessContent,
-        process_streaming: false,
-      })}\n\n`);
-      res.end();
-    });
+    this.writeRunEvent(run, {
+      type: 'final',
+      text: rewritten,
+      process_content: rewrittenProcessContent,
+      process_streaming: false,
+    }, { end: true });
 
     this.cleanupRun(run);
     return { aborted };
@@ -9679,9 +9780,8 @@ class ActiveRunManager {
     run.visibleFinalText = visible.text;
     run.visibleProcessContent = visible.process_content;
     run.visibleProcessStreaming = visible.process_streaming;
-    run.clients.forEach(res => {
-      res.write(`data: ${JSON.stringify({ type: 'delta', ...visible })}\n\n`);
-    });
+    this.persistVisibleSnapshot(run, visible);
+    this.writeRunEvent(run, { type: 'delta', ...visible });
   }
 
   private emitVisibleFinal(run: ActiveRun, finalText: string, options?: { end?: boolean; allowShorterReplacement?: boolean }) {
@@ -9701,9 +9801,17 @@ class ActiveRunManager {
     const nextVisibleProcessContent = selectPreferredTextSnapshot(run.visibleProcessContent, visible.process_content);
     if (!nextVisibleFinalText.trim() && !nextVisibleProcessContent.trim()) {
       if (options?.end) {
-        run.clients.forEach((res) => {
-          res.end();
+        this.persistVisibleSnapshot(run, {
+          text: nextVisibleFinalText,
+          process_content: nextVisibleProcessContent,
+          process_streaming: false,
         });
+        this.writeRunEvent(run, {
+          type: 'final',
+          text: nextVisibleFinalText,
+          process_content: nextVisibleProcessContent,
+          process_streaming: false,
+        }, { end: true });
       }
       return '';
     }
@@ -9716,24 +9824,29 @@ class ActiveRunManager {
       run.visibleFinalText = nextVisibleFinalText;
       run.visibleProcessContent = nextVisibleProcessContent;
       run.visibleProcessStreaming = visible.process_streaming;
-      run.clients.forEach((res) => {
-        res.write(`data: ${JSON.stringify({
-          type: 'final',
-          text: nextVisibleFinalText,
-          process_content: nextVisibleProcessContent,
-          process_streaming: visible.process_streaming,
-        })}\n\n`);
-        if (options?.end) {
-          res.end();
-        }
-      });
+      const eventPayload = {
+        type: 'final',
+        text: nextVisibleFinalText,
+        process_content: nextVisibleProcessContent,
+        process_streaming: visible.process_streaming,
+      };
+      this.persistVisibleSnapshot(run, eventPayload);
+      this.writeRunEvent(run, eventPayload, { end: options?.end });
       return nextVisibleFinalText;
     }
 
     if (options?.end) {
-      run.clients.forEach((res) => {
-        res.end();
+      this.persistVisibleSnapshot(run, {
+        text: nextVisibleFinalText,
+        process_content: nextVisibleProcessContent,
+        process_streaming: false,
       });
+      this.writeRunEvent(run, {
+        type: 'final',
+        text: nextVisibleFinalText,
+        process_content: nextVisibleProcessContent,
+        process_streaming: false,
+      }, { end: true });
     }
 
     return nextVisibleFinalText;
@@ -9841,8 +9954,14 @@ class ActiveRunManager {
 
     const onError = (data: { sessionKey: string; runId: string; error: string }) => {
       if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
-        run.pendingErrorDetail = normalizeCliText(data.error) || 'Unknown stream error';
+        const detail = normalizeCliText(data.error) || 'Unknown stream error';
         this.resetIdleTimeout(run);
+        if (isRecoverableGatewayDisconnectDetail(detail)) {
+          this.scheduleGatewayReconnectProbe(run);
+          this.scheduleCompletionProbe(run, CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS);
+          return;
+        }
+        run.pendingErrorDetail = detail;
         this.scheduleCompletionProbe(run, 0);
       }
     };
@@ -9909,7 +10028,8 @@ class ActiveRunManager {
     };
 
     const onDisconnect = () => {
-      onError({ sessionKey: sessionId, runId, error: CHAT_GATEWAY_DISCONNECTED_DETAIL });
+      this.scheduleGatewayReconnectProbe(run);
+      this.scheduleCompletionProbe(run, CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS);
     };
 
     clientRef.on('chat.delta', onDelta);
@@ -9941,24 +10061,24 @@ class ActiveRunManager {
     if (run) {
       run.clients.push(res);
       if (options?.announceAttach) {
-        res.write(`data: ${JSON.stringify({
+        this.writeSingleRunEvent(res, {
           type: 'attached',
           messageId: run.messageId,
           agentId: run.agentId,
           agentName: run.agentName,
           modelUsed: run.modelUsed,
-        })}\n\n`);
+        });
       }
       if (run.visibleFinalText || run.visibleProcessContent) {
-        res.write(`data: ${JSON.stringify({
+        this.writeSingleRunEvent(res, {
           type: 'final',
           text: run.visibleFinalText || '',
           process_content: run.visibleProcessContent || '',
           process_streaming: !!run.visibleProcessStreaming,
-        })}\n\n`);
+        });
       } else if (run.text || run.processContent || run.processStreaming) {
         const visible = this.buildVisibleChatPatch(run, run.text);
-        res.write(`data: ${JSON.stringify({ type: 'delta', ...visible })}\n\n`);
+        this.writeSingleRunEvent(res, { type: 'delta', ...visible });
       }
       res.on('close', () => {
         run.clients = run.clients.filter(c => c !== res);
@@ -9985,7 +10105,7 @@ class ActiveRunManager {
       const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
       const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
       
-      this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
+      this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent, false);
       this.emitVisibleFinal(run, finalText, { end: true });
       this.abortUnderlyingRunBestEffort(run, 'idle timeout');
       this.cleanupRun(run);
@@ -10111,8 +10231,14 @@ class ActiveRunManager {
 
         if (shouldPreferSettledAssistantText(completedOutput, bestSettledAssistantText)) {
           completedOutput = selectPreferredTextSnapshot(completedOutput, bestSettledAssistantText);
+      }
+    } catch (historyError) {
+        const historyErrorDetail = historyError instanceof Error ? historyError.message : String(historyError);
+        if (isRecoverableGatewayDisconnectDetail(historyErrorDetail)) {
+          this.scheduleGatewayReconnectProbe(run);
+          this.scheduleCompletionProbe(run, CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS);
+          return;
         }
-      } catch (historyError) {
         console.warn(`[ActiveRunManager] Failed to read final history for session ${run.sessionId}, run ${run.runId}:`, historyError);
         shouldRetryForEmptyCompletion = true;
       }
@@ -10202,6 +10328,11 @@ class ActiveRunManager {
         this.scheduleCompletionProbe(run);
         return;
       }
+      if (isRecoverableGatewayDisconnectDetail(detail)) {
+        this.scheduleGatewayReconnectProbe(run);
+        this.scheduleCompletionProbe(run, CHAT_GATEWAY_RECONNECT_PROBE_INITIAL_DELAY_MS);
+        return;
+      }
       this.failRun(run, pendingErrorDetail || detail || 'Failed waiting for run completion.');
     } finally {
       run.completionProbeInFlight = false;
@@ -10243,19 +10374,16 @@ class ActiveRunManager {
         run.processStreaming = false;
         const rewrittenFallbackProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
 
-        this.db.updateMessage(run.messageId, rewrittenFallbackText, run.modelUsed, rewrittenFallbackProcessContent);
+        this.db.updateMessage(run.messageId, rewrittenFallbackText, run.modelUsed, rewrittenFallbackProcessContent, false);
         run.visibleFinalText = rewrittenFallbackText;
         run.visibleProcessContent = rewrittenFallbackProcessContent;
         run.visibleProcessStreaming = false;
-        run.clients.forEach((res) => {
-          res.write(`data: ${JSON.stringify({
-            type: 'final',
-            text: rewrittenFallbackText,
-            process_content: rewrittenFallbackProcessContent,
-            process_streaming: false,
-          })}\n\n`);
-          res.end();
-        });
+        this.writeRunEvent(run, {
+          type: 'final',
+          text: rewrittenFallbackText,
+          process_content: rewrittenFallbackProcessContent,
+          process_streaming: false,
+        }, { end: true });
         this.cleanupRun(run);
         return;
       }
@@ -10263,7 +10391,7 @@ class ActiveRunManager {
       return;
     }
 
-    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent, false);
     this.emitVisibleFinal(run, protectedRawText, {
       end: true,
       allowShorterReplacement: hasFinalEventText,
@@ -10279,22 +10407,20 @@ class ActiveRunManager {
     const structuredError = createStructuredChatError(detail, options?.messageCode);
 
     run.processStreaming = false;
-    this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed, run.processContent);
+    const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
+    this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed, rewrittenProcessContent, false);
     this.db.updateMessageEnvelope(run.messageId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
 
-    run.clients.forEach(res => {
-      res.write(`data: ${JSON.stringify({
-        type: 'error',
-        text: structuredError.content,
-        process_content: rewriteOpenClawMediaPaths(run.processContent, run.workspacePath),
-        process_streaming: false,
-        messageCode: structuredError.messageCode,
-        messageParams: structuredError.messageParams,
-        rawDetail: structuredError.rawDetail,
-        role: structuredError.role,
-      })}\n\n`);
-      res.end();
-    });
+    this.writeRunEvent(run, {
+      type: 'error',
+      text: structuredError.content,
+      process_content: rewrittenProcessContent,
+      process_streaming: false,
+      messageCode: structuredError.messageCode,
+      messageParams: structuredError.messageParams,
+      rawDetail: structuredError.rawDetail,
+      role: structuredError.role,
+    }, { end: true });
     this.abortUnderlyingRunBestEffort(run, detail);
     this.cleanupRun(run);
   }
@@ -10341,6 +10467,7 @@ class ActiveRunManager {
     run.cleanedUp = true;
     if (run.idleTimeout) clearTimeout(run.idleTimeout);
     if (run.completionProbeTimer) clearTimeout(run.completionProbeTimer);
+    if (run.gatewayReconnectTimer) clearTimeout(run.gatewayReconnectTimer);
     if (run.clientRef) {
       if ((run as any)._onDelta) run.clientRef.off('chat.delta', (run as any)._onDelta);
       if ((run as any)._onFinal) run.clientRef.off('chat.final', (run as any)._onFinal);
@@ -10491,7 +10618,19 @@ async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<vo
   const currentContent = typeof latestAssistantLikeMessage.content === 'string'
     ? latestAssistantLikeMessage.content
     : '';
+  const currentProcessContent = typeof latestAssistantLikeMessage.process_content === 'string'
+    ? latestAssistantLikeMessage.process_content
+    : '';
   if (currentContent.trim()) {
+    if (latestAssistantLikeMessage.process_streaming) {
+      db.updateMessage(
+        latestAssistantLikeMessageId,
+        currentContent,
+        latestAssistantLikeMessage.model_used || undefined,
+        currentProcessContent,
+        false,
+      );
+    }
     return;
   }
 
@@ -10526,7 +10665,7 @@ async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<vo
       });
       const rewritten = rewriteOpenClawMediaPaths(canonicalText, workspacePath);
       if (rewritten.trim()) {
-        db.updateMessage(latestAssistantLikeMessageId, rewritten, latestAssistantLikeMessage.model_used || undefined);
+        db.updateMessage(latestAssistantLikeMessageId, rewritten, latestAssistantLikeMessage.model_used || undefined, '', false);
         db.updateMessageEnvelope(
           latestAssistantLikeMessageId,
           'assistant',
@@ -10543,7 +10682,7 @@ async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<vo
 
     if (historyIsNewerThanCurrentMessage && latestOutcomeRecord.kind === 'error') {
       const structuredError = createStructuredChatError(latestOutcomeRecord.error);
-      db.updateMessage(latestAssistantLikeMessageId, structuredError.content, latestAssistantLikeMessage.model_used || undefined);
+      db.updateMessage(latestAssistantLikeMessageId, structuredError.content, latestAssistantLikeMessage.model_used || undefined, currentProcessContent, false);
       db.updateMessageEnvelope(
         latestAssistantLikeMessageId,
         structuredError.role,
@@ -10554,6 +10693,17 @@ async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<vo
     }
   } catch (error) {
     console.warn(`[chat] Failed to reconcile inactive latest message for session ${sessionId}:`, error);
+  }
+
+  if (currentProcessContent.trim()) {
+    db.updateMessage(
+      latestAssistantLikeMessageId,
+      currentContent,
+      latestAssistantLikeMessage.model_used || undefined,
+      currentProcessContent,
+      false,
+    );
+    return;
   }
 
   db.deleteMessage(latestAssistantLikeMessageId);
@@ -10786,15 +10936,19 @@ app.post('/api/chat', async (req, res) => {
 
     if (directImageModel) {
       const startProcessContent = buildImageGenerationStartProcessContent(directImageModel);
-      db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent);
-      res.write(`data: ${JSON.stringify({
-        type: 'delta',
-        text: '',
-        process_content: startProcessContent,
-        process_streaming: true,
-        modelUsed: directImageModel,
-        model_used: directImageModel,
-      })}\n\n`);
+      db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent, true);
+      if (isStreamingClientOpen(res)) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'delta',
+            text: '',
+            process_content: startProcessContent,
+            process_streaming: true,
+            modelUsed: directImageModel,
+            model_used: directImageModel,
+          })}\n\n`);
+        } catch {}
+      }
     }
 
     const directImageResult = await tryGenerateImageForPrompt({
@@ -10805,16 +10959,20 @@ app.post('/api/chat', async (req, res) => {
     });
     if (directImageResult) {
       assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
-      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent);
-      res.write(`data: ${JSON.stringify({
-        type: 'final',
-        text: directImageResult.content,
-        process_content: directImageResult.processContent,
-        process_streaming: false,
-        modelUsed: directImageResult.modelUsed,
-        model_used: directImageResult.modelUsed,
-      })}\n\n`);
-      res.end();
+      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
+      if (isStreamingClientOpen(res)) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'final',
+            text: directImageResult.content,
+            process_content: directImageResult.processContent,
+            process_streaming: false,
+            modelUsed: directImageResult.modelUsed,
+            model_used: directImageResult.modelUsed,
+          })}\n\n`);
+          res.end();
+        } catch {}
+      }
       return;
     }
 
@@ -10955,7 +11113,7 @@ app.post('/api/chat', async (req, res) => {
 
     if (typeof assistantMsgId === 'number') {
       try {
-        db.updateMessage(assistantMsgId, structuredError.content, modelUsed);
+        db.updateMessage(assistantMsgId, structuredError.content, modelUsed, null, false);
         db.updateMessageEnvelope(assistantMsgId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
       } catch {}
     } else if (typeof userMsgId === 'number') {
@@ -11103,15 +11261,19 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     if (directImageModel) {
       const startProcessContent = buildImageGenerationStartProcessContent(directImageModel);
-      db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent);
-      res.write(`data: ${JSON.stringify({
-        type: 'delta',
-        text: '',
-        process_content: startProcessContent,
-        process_streaming: true,
-        modelUsed: directImageModel,
-        model_used: directImageModel,
-      })}\n\n`);
+      db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent, true);
+      if (isStreamingClientOpen(res)) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'delta',
+            text: '',
+            process_content: startProcessContent,
+            process_streaming: true,
+            modelUsed: directImageModel,
+            model_used: directImageModel,
+          })}\n\n`);
+        } catch {}
+      }
     }
 
     const directImageResult = await tryGenerateImageForPrompt({
@@ -11122,16 +11284,20 @@ app.post('/api/chat/regenerate', async (req, res) => {
     });
     if (directImageResult) {
       assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
-      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent);
-      res.write(`data: ${JSON.stringify({
-        type: 'final',
-        text: directImageResult.content,
-        process_content: directImageResult.processContent,
-        process_streaming: false,
-        modelUsed: directImageResult.modelUsed,
-        model_used: directImageResult.modelUsed,
-      })}\n\n`);
-      res.end();
+      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
+      if (isStreamingClientOpen(res)) {
+        try {
+          res.write(`data: ${JSON.stringify({
+            type: 'final',
+            text: directImageResult.content,
+            process_content: directImageResult.processContent,
+            process_streaming: false,
+            modelUsed: directImageResult.modelUsed,
+            model_used: directImageResult.modelUsed,
+          })}\n\n`);
+          res.end();
+        } catch {}
+      }
       return;
     }
 
@@ -11272,7 +11438,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
     if (typeof assistantMsgId === 'number') {
       try {
-        db.updateMessage(assistantMsgId, structuredError.content, modelUsed);
+        db.updateMessage(assistantMsgId, structuredError.content, modelUsed, null, false);
         db.updateMessageEnvelope(assistantMsgId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
       } catch {}
     } else {
