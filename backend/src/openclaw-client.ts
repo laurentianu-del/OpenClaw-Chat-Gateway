@@ -316,7 +316,7 @@ export class OpenClawClient extends EventEmitter {
             try {
               await this.request('connect', {
                 minProtocol: 3,
-                maxProtocol: 3,
+                maxProtocol: 4,
                 client: {
                   id: 'openclaw-control-ui',
                   version: 'clawui-backend',

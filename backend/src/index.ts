@@ -2682,12 +2682,18 @@ const OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT
 const OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT_MARKER}:fields-alias`;
 const OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER = `${OPENCLAW_BROWSER_FILL_COMPAT_MARKER}:cli-text-alias`;
 const OPENCLAW_BROWSER_FILL_COMPAT_PATCH_BACKUP_SUFFIX = '.clawui-browser-fill-compat.bak';
-const OPENCLAW_BROWSER_FILL_CLIENT_ENTRY_PATTERN = /^client-fetch-.*\.js$/i;
-const OPENCLAW_BROWSER_FILL_PLUGIN_ENTRY_PATTERN = /^plugin-service-.*\.js$/i;
+const OPENCLAW_BROWSER_FILL_CANDIDATE_ENTRY_PATTERNS = [
+  /^browser-cli-actions-input-.*\.js$/i,
+  /^client-fetch-.*\.js$/i,
+  /^plugin-service-.*\.js$/i,
+  /^pw-role-snapshot-.*\.js$/i,
+  /^routes-.*\.js$/i,
+  /^snapshot-urls-.*\.js$/i,
+] as const;
 const OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE = 'const value = normalizeBrowserFormFieldValue(record.value);';
 const OPENCLAW_BROWSER_FILL_CLIENT_FIELD_PATCHED_SIGNATURE = `const value = normalizeBrowserFormFieldValue(record.value !== void 0 ? record.value : record.text); /* ${OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER} */`;
-const OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE = 'const fields = (Array.isArray(body.fields) ? body.fields : []).map((field) => {';
-const OPENCLAW_BROWSER_FILL_CLIENT_ACTION_PATCHED_SIGNATURE = [
+const OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_SIGNATURE = 'const fields = (Array.isArray(body.fields) ? body.fields : []).map((field) => {';
+const OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_PATCHED_SIGNATURE = [
   'const fallbackRef = normalizeBrowserFormFieldRef(body.ref);',
   '\t\t\t\t\t\tconst rawFields = Array.isArray(body.fields) ? body.fields : fallbackRef ? [{',
   '\t\t\t\t\t\t\tref: fallbackRef,',
@@ -2695,6 +2701,16 @@ const OPENCLAW_BROWSER_FILL_CLIENT_ACTION_PATCHED_SIGNATURE = [
   '\t\t\t\t\t\t\tvalue: body.value !== void 0 ? body.value : body.text',
   `\t\t\t\t\t\t}] : []; /* ${OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER} */`,
   '\t\t\t\t\t\tconst fields = rawFields.map((field) => {',
+].join('\n');
+const OPENCLAW_BROWSER_FILL_ROUTE_ACTION_SIGNATURE = 'const fields = normalizeFields(body.fields);';
+const OPENCLAW_BROWSER_FILL_ROUTE_ACTION_PATCHED_SIGNATURE = [
+  `const fallbackRef = toStringOrEmpty(body.ref) || void 0; /* ${OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER} */`,
+  '\t\t\tconst rawFields = Array.isArray(body.fields) ? body.fields : fallbackRef ? [{',
+  '\t\t\t\tref: fallbackRef,',
+  '\t\t\t\ttype: body.type,',
+  '\t\t\t\tvalue: body.value !== void 0 ? body.value : body.text',
+  '\t\t\t}] : [];',
+  '\t\t\tconst fields = normalizeFields(rawFields);',
 ].join('\n');
 const OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE = 'if (rec.value === void 0 || rec.value === null || normalizeBrowserFormFieldValue(rec.value) !== void 0) return parsedField;';
 const OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_PATCHED_SIGNATURE = [
@@ -2731,7 +2747,7 @@ type OpenClawExecPreflightBypassStatus = {
   targets: OpenClawExecPreflightPatchTarget[];
 };
 
-type OpenClawBrowserFillCompatPatchTargetKind = 'client-fetch' | 'plugin-service';
+type OpenClawBrowserFillCompatPatchTargetKind = 'browser-fill-source';
 
 type OpenClawBrowserFillCompatPatchTarget = {
   packageRoot: string;
@@ -3114,13 +3130,36 @@ function readOpenClawBrowserFillCompatSource(targetPath: string) {
   return fs.readFileSync(targetPath, 'utf-8');
 }
 
-function isOpenClawBrowserFillCompatPatched(target: OpenClawBrowserFillCompatPatchTarget, source: string) {
-  if (target.kind === 'client-fetch') {
-    return source.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)
-      && source.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER);
+function isOpenClawBrowserFillCompatCandidateEntryName(entryName: string) {
+  return OPENCLAW_BROWSER_FILL_CANDIDATE_ENTRY_PATTERNS.some((pattern) => pattern.test(entryName));
+}
+
+function sourceHasOpenClawBrowserFillCompatSignatureOrMarker(source: string) {
+  return source.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_ROUTE_ACTION_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)
+    || source.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER)
+    || source.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER);
+}
+
+function isOpenClawBrowserFillCompatPatched(_target: OpenClawBrowserFillCompatPatchTarget, source: string) {
+  const needsValueAlias = source.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER);
+  const needsFieldsAlias = source.includes(OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_ROUTE_ACTION_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER);
+  const needsCliAlias = source.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)
+    || source.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER);
+
+  if (!needsValueAlias && !needsFieldsAlias && !needsCliAlias) {
+    return false;
   }
 
-  return source.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER);
+  return (!needsValueAlias || source.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER))
+    && (!needsFieldsAlias || source.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER))
+    && (!needsCliAlias || source.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER));
 }
 
 function collectOpenClawBrowserFillCompatPatchTargets(): OpenClawBrowserFillCompatPatchTarget[] {
@@ -3141,12 +3180,7 @@ function collectOpenClawBrowserFillCompatPatchTargets(): OpenClawBrowserFillComp
     }
 
     for (const entryName of entryNames) {
-      const kind: OpenClawBrowserFillCompatPatchTargetKind | null = OPENCLAW_BROWSER_FILL_CLIENT_ENTRY_PATTERN.test(entryName)
-        ? 'client-fetch'
-        : OPENCLAW_BROWSER_FILL_PLUGIN_ENTRY_PATTERN.test(entryName)
-          ? 'plugin-service'
-          : null;
-      if (!kind) continue;
+      if (!isOpenClawBrowserFillCompatCandidateEntryName(entryName)) continue;
 
       const targetPath = path.join(distDir, entryName);
       if (seen.has(targetPath)) continue;
@@ -3156,19 +3190,14 @@ function collectOpenClawBrowserFillCompatPatchTargets(): OpenClawBrowserFillComp
         packageRoot,
         targetPath,
         backupPath,
-        kind,
+        kind: 'browser-fill-source',
       };
 
       let shouldInclude = fs.existsSync(backupPath);
       if (!shouldInclude) {
         try {
           const source = readOpenClawBrowserFillCompatSource(targetPath);
-          shouldInclude = kind === 'client-fetch'
-            ? (source.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)
-                && source.includes(OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE))
-              || isOpenClawBrowserFillCompatPatched(target, source)
-            : source.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)
-              || isOpenClawBrowserFillCompatPatched(target, source);
+          shouldInclude = sourceHasOpenClawBrowserFillCompatSignatureOrMarker(source);
         } catch {
           shouldInclude = false;
         }
@@ -3192,41 +3221,42 @@ function patchOpenClawBrowserFillCompatTarget(target: OpenClawBrowserFillCompatP
 
   let patchedSource = source;
 
-  if (target.kind === 'client-fetch') {
-    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)) {
-      if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)) {
-        throw new Error(`OpenClaw browser fill value signature not found in ${target.targetPath}.`);
-      }
-
-      const nextSource = patchedSource.replace(
-        OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE,
-        OPENCLAW_BROWSER_FILL_CLIENT_FIELD_PATCHED_SIGNATURE,
-      );
-      if (nextSource === patchedSource) {
-        throw new Error(`Failed to patch the OpenClaw browser fill value alias in ${target.targetPath}.`);
-      }
-      patchedSource = nextSource;
+  if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_VALUE_ALIAS_MARKER)
+    && patchedSource.includes(OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE)) {
+    const nextSource = patchedSource.replace(
+      OPENCLAW_BROWSER_FILL_CLIENT_FIELD_SIGNATURE,
+      OPENCLAW_BROWSER_FILL_CLIENT_FIELD_PATCHED_SIGNATURE,
+    );
+    if (nextSource === patchedSource) {
+      throw new Error(`Failed to patch the OpenClaw browser fill value alias in ${target.targetPath}.`);
     }
+    patchedSource = nextSource;
+  }
 
-    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER)) {
-      if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE)) {
-        throw new Error(`OpenClaw browser fill fields signature not found in ${target.targetPath}.`);
-      }
-
+  if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_FIELDS_ALIAS_MARKER)) {
+    if (patchedSource.includes(OPENCLAW_BROWSER_FILL_ROUTE_ACTION_SIGNATURE)) {
       const nextSource = patchedSource.replace(
-        OPENCLAW_BROWSER_FILL_CLIENT_ACTION_SIGNATURE,
-        OPENCLAW_BROWSER_FILL_CLIENT_ACTION_PATCHED_SIGNATURE,
+        OPENCLAW_BROWSER_FILL_ROUTE_ACTION_SIGNATURE,
+        OPENCLAW_BROWSER_FILL_ROUTE_ACTION_PATCHED_SIGNATURE,
       );
       if (nextSource === patchedSource) {
         throw new Error(`Failed to patch the OpenClaw browser fill fields alias in ${target.targetPath}.`);
       }
       patchedSource = nextSource;
+    } else if (patchedSource.includes(OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_SIGNATURE)) {
+      const nextSource = patchedSource.replace(
+        OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_SIGNATURE,
+        OPENCLAW_BROWSER_FILL_LEGACY_CLIENT_ACTION_PATCHED_SIGNATURE,
+      );
+      if (nextSource === patchedSource) {
+        throw new Error(`Failed to patch the OpenClaw browser fill legacy fields alias in ${target.targetPath}.`);
+      }
+      patchedSource = nextSource;
     }
-  } else {
-    if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)) {
-      throw new Error(`OpenClaw browser fill CLI signature not found in ${target.targetPath}.`);
-    }
+  }
 
+  if (!patchedSource.includes(OPENCLAW_BROWSER_FILL_CLI_ALIAS_MARKER)
+    && patchedSource.includes(OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE)) {
     const nextSource = patchedSource.replace(
       OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_SIGNATURE,
       OPENCLAW_BROWSER_FILL_PLUGIN_READ_FIELDS_PATCHED_SIGNATURE,
@@ -3238,6 +3268,9 @@ function patchOpenClawBrowserFillCompatTarget(target: OpenClawBrowserFillCompatP
   }
 
   if (patchedSource === source) {
+    if (!isOpenClawBrowserFillCompatPatched(target, source)) {
+      throw new Error(`OpenClaw browser fill compatibility signature not found in ${target.targetPath}.`);
+    }
     return;
   }
 

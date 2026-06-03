@@ -5627,17 +5627,17 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
                 {/* API Button Row */}
                 <div className="w-full flex flex-col items-center gap-3 px-2">
-                  <a 
-                    href="https://ai.opendoor.cn" 
-                    target="_blank" 
+                  <a
+                    href="https://ai.opendoor.sbs"
+                    target="_blank"
                     rel="noreferrer"
                     className="flex items-center justify-center px-6 py-2.5 rounded-xl sm:rounded-full bg-[#fefce8] border border-blue-300 text-[#3b82f6] hover:bg-yellow-100 hover:border-blue-400 transition-all font-bold text-[11px] min-[380px]:text-[12px] sm:text-[14px] max-w-full text-center"
                   >
                     {t('settings.about.openDoorApiLabel')}
                   </a>
-                  <a 
-                    href="https://ai.superdoor.top/register?promo=ANGEWORLD" 
-                    target="_blank" 
+                  <a
+                    href="https://ai.superdoor.top"
+                    target="_blank"
                     rel="noreferrer"
                     className="flex items-center justify-center px-6 py-2.5 rounded-xl sm:rounded-full bg-[#fefce8] border border-blue-300 text-[#3b82f6] hover:bg-yellow-100 hover:border-blue-400 transition-all font-bold text-[11px] min-[380px]:text-[12px] sm:text-[14px] max-w-full text-center"
                   >
