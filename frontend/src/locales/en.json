@@ -298,7 +298,9 @@
     "historyPageNoticeNewer": "Returned to newer {{count}} rounds"
   },
   "messageBubble": {
-    "processTitle": "Processing",
+    "processTitle": "Execution",
+    "toolStepsLabel": "Tool steps",
+    "modelProcessLabel": "Model process",
     "executingPlaceholder": "Working",
     "editMessagePlaceholder": "Edit message content..."
   },

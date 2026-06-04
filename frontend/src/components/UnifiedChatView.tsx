@@ -36,6 +36,7 @@ const GROUP_ACTIVE_RUN_RECOVERY_POLL_MS = 500;
 const GROUP_SSE_RECOVERY_THROTTLE_MS = 2000;
 const GROUP_POST_RUN_SETTLE_POLL_MS = 2000;
 const GROUP_POST_RUN_SETTLE_TIMEOUT_MS = 120000;
+const CHAT_ACTIVE_RUN_RECOVERY_POLL_MS = 1500;
 const DEFAULT_PROCESS_START_TAG = '[执行工作_Start]';
 const DEFAULT_PROCESS_END_TAG = '[执行工作_End]';
 const MODAL_FORM_FONT_STYLE = {
@@ -606,7 +607,7 @@ function resolveSubmitError(
 interface UnifiedChatViewProps {
   mode: 'chat' | 'group';
   onMenuClick: () => void;
-  sessions: { id: string; name: string; agentId?: string; characterId?: string; model?: string; process_start_tag?: string; process_end_tag?: string }[];
+  sessions: { id: string; name: string; agentId?: string; characterId?: string; model?: string; runtimeMode?: string; runtime_mode?: string; process_start_tag?: string; process_end_tag?: string }[];
   // Chat mode
   isConnected?: boolean;
   activeSessionId?: string;
@@ -1596,6 +1597,57 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
       return false;
     }
   }, [activeKey, fetchHistoryPage, historyFetchBatchLimit, isChat, mergeChatMessagesIntoState]);
+
+  const recoverChatActiveRun = useCallback(async (signal?: AbortSignal) => {
+    if (!isChat || !activeKey) return { ok: false as const, active: false as const };
+
+    try {
+      const response = await fetch(`/api/chat/${activeKey}/active-run`, { signal });
+      const data = await response.json();
+      if (!data?.success) {
+        return { ok: false as const, active: false as const };
+      }
+      return { ok: true as const, active: !!data.active };
+    } catch (error: any) {
+      if (error?.name === 'AbortError') {
+        return { ok: false as const, active: false as const };
+      }
+      return { ok: false as const, active: false as const };
+    }
+  }, [activeKey, isChat]);
+
+  useEffect(() => {
+    if (!isChat || !activeKey || !isLoading || isInitialLoading) return;
+
+    let cancelled = false;
+    const controller = new AbortController();
+    let timer: number | null = null;
+
+    const poll = async () => {
+      const recovery = await recoverChatActiveRun(controller.signal);
+      if (cancelled || controller.signal.aborted) return;
+
+      if (recovery.ok && !recovery.active) {
+        await recoverLatestChatMessages(true);
+        if (!cancelled && !controller.signal.aborted) {
+          setIsLoading(false);
+        }
+        return;
+      }
+
+      timer = window.setTimeout(poll, CHAT_ACTIVE_RUN_RECOVERY_POLL_MS);
+    };
+
+    timer = window.setTimeout(poll, CHAT_ACTIVE_RUN_RECOVERY_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [activeKey, isChat, isInitialLoading, isLoading, recoverChatActiveRun, recoverLatestChatMessages]);
 
   const loadHistoryWindow = useCallback(async (
     { beforeId = null }: { beforeId?: number | null } = {}
@@ -3000,7 +3052,7 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
           }
         }
         flushQueuedMessagePatches();
-        if (!receivedError) {
+        if (!receivedError && receivedFinal) {
           queueAssistantPatch({ processStreaming: false }, true);
         }
         if (!receivedFinal && !receivedError && shouldAttemptMissingTerminalRecovery(lastStreamText)) {

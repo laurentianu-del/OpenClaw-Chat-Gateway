@@ -623,6 +623,13 @@ function splitGroupProcessOutput(
   };
 }
 
+function combineGroupProcessContent(toolContent: string, modelContent: string): string {
+  return [toolContent, modelContent]
+    .map((value) => normalizeGroupPromptText(value || ''))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 function truncateGroupContextMessage(content: string): string {
   const normalizedContent = normalizeGroupPromptText(content);
   if (normalizedContent.length <= GROUP_CONTEXT_MESSAGE_MAX_CHARS) {
@@ -1577,6 +1584,7 @@ export class GroupChatEngine extends EventEmitter {
       let rawOutput = '';
       let finalOutput = '';
       let processOutput = '';
+      let toolProcessOutput = '';
       let finalEventText = '';
       const response = await new Promise<string>((resolve, reject) => {
         let idleTimeout: NodeJS.Timeout | null = null;
@@ -1594,7 +1602,6 @@ export class GroupChatEngine extends EventEmitter {
         let lastObservedHistoryActivityAt: number | null = null;
         let visibleProcessStreaming = false;
         let modelProcessStreaming = false;
-        let toolProcessOutput = '';
         const toolProcessLines: string[] = [];
         const activeToolCallIds = new Set<string>();
         const toolProgressById = new Map<string, GroupToolProgressState>();
@@ -1617,7 +1624,7 @@ export class GroupChatEngine extends EventEmitter {
         };
 
         const syncCombinedProcessState = () => {
-          const combinedProcessOutput = toolProcessOutput;
+          const combinedProcessOutput = combineGroupProcessContent(toolProcessOutput, processOutput);
           const combinedProcessStreaming = modelProcessStreaming || activeToolCallIds.size > 0;
           latestProcessOutput = combinedProcessOutput;
           this.updateActiveRunOutput(groupId, runId, {
@@ -2078,7 +2085,10 @@ export class GroupChatEngine extends EventEmitter {
         workspacePath: runtimeContext.workspacePath,
         startedAtMs: runStartedAt,
       });
-      let canonicalProcessContent = latestProcessOutput;
+      let canonicalProcessContent = combineGroupProcessContent(
+        toolProcessOutput,
+        selectPreferredTextSnapshot(processOutput, splitProtectedResponse.processContent),
+      );
       if (!canonicalResponse.trim()) {
         const canonicalFallbackResponse = canonicalizeAssistantWorkspaceArtifacts(splitProtectedResponse.processContent, {
           workspacePath: runtimeContext.workspacePath,

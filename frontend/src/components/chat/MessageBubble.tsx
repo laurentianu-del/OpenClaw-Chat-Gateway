@@ -959,6 +959,131 @@ function normalizeProcessPreviewablePathLines(content: string): string {
   return normalizedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+type ProcessToolStep = {
+  label: string;
+  detail: string;
+  status: 'running' | 'done' | 'error';
+};
+
+const KNOWN_TOOL_PROGRESS_LABELS = new Set([
+  '子任务已返回结果',
+  '子任务已启动',
+  '页面操作已完成',
+  '正在打开页面',
+  '命令已完成',
+  '命令执行失败',
+  '正在执行工具',
+  '文件读取已完成',
+  '文件修改已完成',
+  '图片查看已完成',
+  '正在打开文件',
+  '计划已更新',
+  '正在运行命令',
+  '搜索已完成',
+  '正在搜索',
+  '正在启动子任务',
+  '工具已完成',
+  '工具执行失败',
+  '正在修改文件',
+  '正在更新计划',
+  '正在查看图片',
+  '正在等待子任务结果',
+  '子任務已返回結果',
+  '子任務已啟動',
+  '頁面操作已完成',
+  '正在開啟頁面',
+  '命令已完成',
+  '命令執行失敗',
+  '正在執行工具',
+  '檔案讀取已完成',
+  '檔案修改已完成',
+  '圖片查看已完成',
+  '正在開啟檔案',
+  '計畫已更新',
+  '正在執行命令',
+  '搜尋已完成',
+  '正在搜尋',
+  '正在啟動子任務',
+  '工具已完成',
+  '工具執行失敗',
+  '正在修改檔案',
+  '正在更新計畫',
+  '正在查看圖片',
+  '正在等待子任務結果',
+  'Subtask returned',
+  'Subtask started',
+  'Browser action completed',
+  'Opening page',
+  'Command completed',
+  'Command failed',
+  'Running tool',
+  'File read completed',
+  'File update completed',
+  'Image inspection completed',
+  'Opening file',
+  'Plan updated',
+  'Running command',
+  'Search completed',
+  'Searching',
+  'Starting subtask',
+  'Tool completed',
+  'Tool failed',
+  'Updating file',
+  'Updating plan',
+  'Inspecting image',
+  'Waiting for subtask result',
+]);
+
+function isKnownToolProgressLabel(label: string): boolean {
+  const normalized = label.trim();
+  if (KNOWN_TOOL_PROGRESS_LABELS.has(normalized)) return true;
+  return /^(正在执行工具|正在執行工具|Running tool)\s+\S+/.test(normalized);
+}
+
+function resolveProcessToolStepStatus(label: string): ProcessToolStep['status'] {
+  if (/(失败|失敗|failed)/i.test(label)) return 'error';
+  if (/^正在/.test(label) || /^(Running|Opening|Searching|Updating|Starting|Waiting|Inspecting)\b/i.test(label)) {
+    return 'running';
+  }
+  return 'done';
+}
+
+function parseProcessToolStepLine(line: string): ProcessToolStep | null {
+  const bulletMatch = line.match(/^\s*[-*]\s+(.+?)\s*$/);
+  if (!bulletMatch) return null;
+
+  const text = bulletMatch[1].trim();
+  const splitMatch = text.match(/^(.+?)(?:：|:\s+)([\s\S]*)$/);
+  const label = (splitMatch?.[1] || text).trim();
+  const detail = (splitMatch?.[2] || '').trim();
+  if (!isKnownToolProgressLabel(label)) return null;
+
+  return {
+    label,
+    detail,
+    status: resolveProcessToolStepStatus(label),
+  };
+}
+
+function splitProcessContent(content: string): { toolSteps: ProcessToolStep[]; modelContent: string } {
+  const toolSteps: ProcessToolStep[] = [];
+  const modelLines: string[] = [];
+
+  for (const line of content.replace(/\r\n?/g, '\n').split('\n')) {
+    const toolStep = parseProcessToolStepLine(line);
+    if (toolStep) {
+      toolSteps.push(toolStep);
+    } else {
+      modelLines.push(line);
+    }
+  }
+
+  return {
+    toolSteps,
+    modelContent: modelLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+  };
+}
+
 export const ProcessStepBlock = ({
   content,
   initiallyExpanded,
@@ -985,15 +1110,27 @@ export const ProcessStepBlock = ({
   const [isExpanded, setIsExpanded] = React.useState(initiallyExpanded || !!forceExpanded);
   const sanitizedProcessContent = sanitizeConfiguredProcessText(content, processStartTag, processEndTag);
   const normalizedContent = normalizeProcessPreviewablePathLines(sanitizedProcessContent.content);
+  const { toolSteps, modelContent } = React.useMemo(
+    () => splitProcessContent(normalizedContent),
+    [normalizedContent]
+  );
+  const hasModelContent = modelContent.trim().length > 0;
+  const hasToolSteps = toolSteps.length > 0;
   const shouldRenderInlineExecutingPlaceholder = Boolean(
     isExtractingProcess && (!normalizedContent.trim() || sanitizedProcessContent.hasTrailingPlaceholder)
   );
+  const isProcessActive = Boolean(isExtractingProcess || shouldRenderInlineExecutingPlaceholder);
+  const hasRenderableProcessContent = hasToolSteps || hasModelContent || shouldRenderInlineExecutingPlaceholder;
 
   React.useEffect(() => {
     if (forceExpanded) {
       setIsExpanded(true);
     }
   }, [forceExpanded]);
+
+  if (!hasRenderableProcessContent) {
+    return null;
+  }
 
   const renderSearchHighlighted = (children: React.ReactNode, scope: string) => (
     highlightSearchNodes(children, normalizedSearchQuery, `process-${isDense ? 'dense' : 'default'}-${scope}`)
@@ -1264,41 +1401,78 @@ export const ProcessStepBlock = ({
   };
 
   return (
-    <div className={`process-step-container flex flex-col ${isDense ? 'my-1.5' : 'mt-1 mb-4'} w-fit max-w-full min-w-[200px] border border-gray-300 rounded-xl overflow-hidden bg-white transition-colors leading-normal`}>
+    <div className={`process-step-container flex flex-col ${isDense ? 'my-1.5' : 'mt-1 mb-4'} w-fit max-w-full min-w-[240px] border border-gray-300 rounded-xl overflow-hidden bg-white transition-colors leading-normal`}>
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className={`flex items-center justify-between px-3 py-2 w-full bg-[#f2fbf4] hover:bg-[#e6f7ea] transition-colors cursor-pointer outline-none ${isExpanded ? 'border-b border-gray-300' : ''}`}
+        className={`flex items-center justify-between gap-4 px-3 py-2 w-full bg-[#f2fbf4] hover:bg-[#e6f7ea] transition-colors cursor-pointer outline-none ${isExpanded ? 'border-b border-gray-300' : ''}`}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <div className="flex-shrink-0 flex items-center justify-center pl-0.5 pr-1">
-             {isExtractingProcess ? (
+             {isProcessActive ? (
                 <RefreshCw className="w-[16px] h-[16px] text-[#5ca36f] animate-spin" strokeWidth={2.5} />
              ) : (
                 <Check className="w-[16px] h-[16px] text-[#5ca36f]" strokeWidth={2.5} />
              )}
           </div>
-          <span className="text-[13.5px] font-medium text-gray-700">{t('messageBubble.processTitle')}</span>
+          <div className="flex min-w-0 flex-col items-start">
+            <span className="text-[13.5px] font-medium text-gray-700 leading-tight">{t('messageBubble.processTitle')}</span>
+          </div>
         </div>
-        <div className="text-gray-400 pl-8">
+        <div className="text-gray-400 flex-shrink-0">
           {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
         </div>
       </button>
       {isExpanded && (
-        <div className="px-3 py-2.5 bg-white">
-          <div className="text-[13.5px] font-sans text-[#444] break-all prose prose-sm max-w-none" style={{ lineHeight: '1.6' }}>
-             <ReactMarkdown
-               remarkPlugins={markdownRemarkPlugins}
-               rehypePlugins={markdownRehypePlugins}
-               components={processMarkdownComponents}
-             >
-               {normalizeMathMarkdown(normalizedContent)}
-             </ReactMarkdown>
-             {shouldRenderInlineExecutingPlaceholder ? (
-               <div className="not-prose text-[13.5px] leading-[1.6] text-[#666]">
-                 <AnimatedExecutingPlaceholder label={t('messageBubble.executingPlaceholder')} />
-               </div>
-             ) : null}
-          </div>
+        <div className="px-3 py-2.5 bg-white space-y-3">
+          {hasToolSteps ? (
+            <div className="not-prose">
+              <div className="mb-1.5 text-[11.5px] font-semibold text-gray-500">{t('messageBubble.toolStepsLabel')}</div>
+              <ol className="space-y-1.5">
+                {toolSteps.map((step, index) => (
+                  <li key={`${step.label}-${step.detail}-${index}`} className="grid grid-cols-[18px_minmax(0,1fr)] gap-2 text-[13px] leading-[1.45] text-gray-700">
+                    <span className="mt-[2px] flex h-[18px] w-[18px] items-center justify-center rounded-full border border-gray-300 bg-white">
+                      {step.status === 'running' && isProcessActive ? (
+                        <RefreshCw className="h-3 w-3 animate-spin text-[#5ca36f]" strokeWidth={2.4} />
+                      ) : step.status === 'error' ? (
+                        <X className="h-3 w-3 text-[#d93025]" strokeWidth={2.4} />
+                      ) : (
+                        <Check className="h-3 w-3 text-[#5ca36f]" strokeWidth={2.4} />
+                      )}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="font-medium text-gray-700">{renderSearchHighlighted(step.label, `tool-label-${index}`)}</span>
+                      {step.detail ? (
+                        <span className="text-gray-500">：{renderSearchHighlighted(step.detail, `tool-detail-${index}`)}</span>
+                      ) : null}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
+          {hasModelContent ? (
+            <div>
+              {hasToolSteps ? (
+                <div className="not-prose mb-1.5 border-t border-gray-200 pt-2 text-[11.5px] font-semibold text-gray-500">
+                  {t('messageBubble.modelProcessLabel')}
+                </div>
+              ) : null}
+              <div className="text-[13.5px] font-sans text-[#444] break-all prose prose-sm max-w-none" style={{ lineHeight: '1.6' }}>
+                <ReactMarkdown
+                  remarkPlugins={markdownRemarkPlugins}
+                  rehypePlugins={markdownRehypePlugins}
+                  components={processMarkdownComponents}
+                >
+                  {normalizeMathMarkdown(modelContent)}
+                </ReactMarkdown>
+              </div>
+            </div>
+          ) : null}
+          {shouldRenderInlineExecutingPlaceholder ? (
+            <div className="not-prose text-[13.5px] leading-[1.6] text-[#666]">
+              <AnimatedExecutingPlaceholder label={t('messageBubble.executingPlaceholder')} />
+            </div>
+          ) : null}
         </div>
       )}
     </div>

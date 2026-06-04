@@ -2461,7 +2461,12 @@ function findGeneratedImageUrl(payload: any): string | null {
     || null;
 }
 
-async function writeGeneratedImageUrlToFile(endpoint: ImageGenerationEndpointModelSnapshot, imageUrl: string, outputPath: string): Promise<void> {
+async function writeGeneratedImageUrlToFile(
+  endpoint: ImageGenerationEndpointModelSnapshot,
+  imageUrl: string,
+  outputPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
   if (/^data:[^;]+;base64,/i.test(imageUrl)) {
     const buffer = parseBase64ImageData(imageUrl);
     if (!buffer) throw new Error('Image generation returned an unreadable data URL.');
@@ -2473,6 +2478,7 @@ async function writeGeneratedImageUrlToFile(endpoint: ImageGenerationEndpointMod
   const response = await axios.get<ArrayBuffer>(resolvedUrl, {
     responseType: 'arraybuffer',
     timeout: IMAGE_GENERATION_TIMEOUT_MS,
+    signal,
     validateStatus: () => true,
   });
 
@@ -2487,6 +2493,7 @@ async function writeOpenAICompatibleImageResponseToFile(
   endpoint: ImageGenerationEndpointModelSnapshot,
   payload: unknown,
   outputPath: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const base64Image = findGeneratedImageBase64(payload as any);
   if (base64Image) {
@@ -2498,7 +2505,7 @@ async function writeOpenAICompatibleImageResponseToFile(
 
   const imageUrl = findGeneratedImageUrl(payload as any);
   if (imageUrl) {
-    await writeGeneratedImageUrlToFile(endpoint, imageUrl, outputPath);
+    await writeGeneratedImageUrlToFile(endpoint, imageUrl, outputPath, signal);
     return;
   }
 
@@ -2525,6 +2532,7 @@ async function generateImageThroughEndpoint(
   endpoint: ImageGenerationEndpointModelSnapshot,
   prompt: string,
   outputPath: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const url = buildImageGenerationRequestUrl(endpoint);
   const headers = buildImageGenerationRequestHeaders(endpoint);
@@ -2535,6 +2543,7 @@ async function generateImageThroughEndpoint(
       const response = await axios.post(url, body, {
         headers,
         timeout: IMAGE_GENERATION_TIMEOUT_MS,
+        signal,
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
         validateStatus: () => true,
@@ -2546,7 +2555,7 @@ async function generateImageThroughEndpoint(
         throw error;
       }
 
-      await writeOpenAICompatibleImageResponseToFile(endpoint, response.data, outputPath);
+      await writeOpenAICompatibleImageResponseToFile(endpoint, response.data, outputPath, signal);
       if (!fs.existsSync(outputPath)) {
         throw new Error('Image generation completed without a readable output file.');
       }
@@ -2567,6 +2576,7 @@ async function tryGenerateImageForPrompt(params: {
   intentText?: string;
   intentContext?: Array<string | null | undefined> | string | null;
   outputDir: string;
+  signal?: AbortSignal;
 }): Promise<DirectImageGenerationResult | null> {
   const candidates = getConfiguredDirectImageGenerationCandidates();
   if (candidates.length === 0) {
@@ -2595,7 +2605,7 @@ async function tryGenerateImageForPrompt(params: {
 
     try {
       if (fs.existsSync(outputPath)) fs.rmSync(outputPath, { force: true });
-      const imagePath = await generateImageThroughEndpoint(endpoint, prompt, outputPath);
+      const imagePath = await generateImageThroughEndpoint(endpoint, prompt, outputPath, params.signal);
       const filename = path.basename(imagePath);
       return {
         content: `![${filename}](${buildInlineLocalFileUrl(imagePath)})`,
@@ -6315,6 +6325,17 @@ function buildStructuredChatHttpError(rawDetail?: string | null, forcedCode?: st
   };
 }
 
+function buildStructuredChatErrorStreamEvent(structuredError: ReturnType<typeof createStructuredChatError>) {
+  return {
+    type: 'error',
+    text: structuredError.content,
+    messageCode: structuredError.messageCode,
+    messageParams: structuredError.messageParams,
+    rawDetail: structuredError.rawDetail,
+    role: structuredError.role,
+  };
+}
+
 function getStructuredChatMessage(content?: string | null) {
   if (!content || !content.startsWith(CHAT_RUN_ERROR_PREFIX)) return {};
 
@@ -6723,6 +6744,8 @@ async function runDirectChatCompletion(params: {
   message: string;
   modelUsed: string;
   response: ExpressResponse;
+  signal?: AbortSignal;
+  onEvent?: (event: Record<string, unknown>) => void;
   processStartTag?: string;
   processEndTag?: string;
   sessionInterruptionEpoch: number;
@@ -6750,7 +6773,6 @@ async function runDirectChatCompletion(params: {
     throw new Error('Direct runtime has no message content to send.');
   }
 
-  const controller = new AbortController();
   let rawText = '';
   let lastVisibleText = '';
   let lastVisibleProcessContent = '';
@@ -6771,18 +6793,20 @@ async function runDirectChatCompletion(params: {
     lastVisibleProcessContent = visibleProcessContent;
     lastVisibleProcessStreaming = visibleProcessStreaming;
     db.updateMessage(params.assistantMessageId, visibleText, params.modelUsed, visibleProcessContent, visibleProcessStreaming);
+    const event = {
+      type,
+      text: visibleText,
+      process_content: visibleProcessContent,
+      process_streaming: visibleProcessStreaming,
+      modelUsed: params.modelUsed,
+      model_used: params.modelUsed,
+    };
     if (isStreamingClientOpen(params.response)) {
       try {
-        params.response.write(`data: ${JSON.stringify({
-          type,
-          text: visibleText,
-          process_content: visibleProcessContent,
-          process_streaming: visibleProcessStreaming,
-          modelUsed: params.modelUsed,
-          model_used: params.modelUsed,
-        })}\n\n`);
+        params.response.write(`data: ${JSON.stringify(event)}\n\n`);
       } catch {}
     }
+    params.onEvent?.(event);
   };
 
   try {
@@ -6795,7 +6819,7 @@ async function runDirectChatCompletion(params: {
         messages,
         stream: true,
       }),
-      signal: controller.signal,
+      signal: params.signal,
     });
 
     if (!response.ok) {
@@ -6871,7 +6895,6 @@ async function runDirectChatCompletion(params: {
     emitSnapshot('final');
     params.response.end();
   } catch (error) {
-    controller.abort();
     throw error;
   }
 }
@@ -7186,6 +7209,13 @@ function splitChatProcessOutput(
     processContent,
     processStreaming,
   };
+}
+
+function combineChatProcessContent(toolContent: string, modelContent: string): string {
+  return [toolContent, modelContent]
+    .map((value) => cleanupChatProcessText(value || ''))
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function rewriteOpenClawMediaPaths(text: string, workspacePath?: string): string {
@@ -9218,6 +9248,7 @@ app.delete('/api/sessions/:id', async (req, res) => {
   const interruptedEpoch = getSessionInterruptionEpoch(req.params.id);
   bumpSessionInterruptionEpoch(req.params.id);
   pendingChatPreparationManager.cancel(req.params.id, interruptedEpoch);
+  localChatOperationManager.abort(req.params.id, interruptedEpoch);
   try {
     await activeRunManager.abortRun(req.params.id);
   } catch {}
@@ -9261,6 +9292,7 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
     const interruptedEpoch = getSessionInterruptionEpoch(req.params.id);
     bumpSessionInterruptionEpoch(req.params.id);
     pendingChatPreparationManager.cancel(req.params.id, interruptedEpoch);
+    localChatOperationManager.abort(req.params.id, interruptedEpoch);
 
     try {
       await activeRunManager.abortRun(req.params.id);
@@ -9374,6 +9406,33 @@ app.get('/api/history/:sessionId/search', (req, res) => {
   }
 });
 
+app.get('/api/chat/:sessionId/active-run', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const pendingPreparation = pendingChatPreparationManager.get(sessionId);
+    const run = activeRunManager.getRun(sessionId);
+    const localOperation = localChatOperationManager.get(sessionId);
+    if (!run && !pendingPreparation && !localOperation) {
+      await reconcileInactiveChatLatestMessage(sessionId);
+    }
+    const active = !!(run || pendingPreparation || localOperation);
+    res.json({
+      success: true,
+      active,
+      runState: {
+        active,
+        messageId: run?.messageId ?? pendingPreparation?.messageId ?? localOperation?.messageId ?? null,
+        runId: run?.runId ?? null,
+        agentId: run?.agentId ?? pendingPreparation?.agentId ?? localOperation?.agentId ?? null,
+        startedAt: run?.startedAt ?? pendingPreparation?.startedAt ?? localOperation?.startedAt ?? null,
+        kind: localOperation?.kind ?? (run ? 'openclaw-run' : (pendingPreparation ? 'openclaw-preparation' : null)),
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json(buildStructuredChatHttpError(error?.message || 'Failed to read chat run state.'));
+  }
+});
+
 app.put('/api/messages/:id', (req, res) => {
   const { id } = req.params;
   const { content } = req.body;
@@ -9459,6 +9518,22 @@ interface PendingChatPreparation {
   modelUsed: string;
   startedAt: number;
   clients: express.Response[];
+}
+
+type LocalChatOperationKind = 'image-generation' | 'direct-runtime' | 'local';
+
+interface LocalChatOperation {
+  sessionId: string;
+  epoch: number;
+  messageId: number;
+  agentId: string;
+  agentName: string;
+  modelUsed: string;
+  startedAt: number;
+  kind: LocalChatOperationKind;
+  abortController?: AbortController;
+  clients: express.Response[];
+  cleanedUp?: boolean;
 }
 
 function resolveChatFinalTextSnapshot(text: string, message: any): string {
@@ -9578,6 +9653,112 @@ class PendingChatPreparationManager {
           res.end();
         } catch {}
       });
+  }
+}
+
+class LocalChatOperationManager {
+  private operations = new Map<string, LocalChatOperation>();
+
+  private matchesEpoch(operation: LocalChatOperation | undefined, expectedEpoch?: number): operation is LocalChatOperation {
+    if (!operation) return false;
+    return expectedEpoch === undefined || operation.epoch === expectedEpoch;
+  }
+
+  get(sessionId: string, expectedEpoch?: number): LocalChatOperation | undefined {
+    const operation = this.operations.get(sessionId);
+    return this.matchesEpoch(operation, expectedEpoch) ? operation : undefined;
+  }
+
+  start(operation: Omit<LocalChatOperation, 'clients'>): LocalChatOperation {
+    const previous = this.operations.get(operation.sessionId);
+    if (previous) {
+      previous.abortController?.abort();
+      this.cleanup(previous);
+    }
+
+    const nextOperation: LocalChatOperation = {
+      ...operation,
+      clients: [],
+    };
+    this.operations.set(operation.sessionId, nextOperation);
+    return nextOperation;
+  }
+
+  attachClient(sessionId: string, res: express.Response, options?: { announceAttach?: boolean; expectedEpoch?: number }): boolean {
+    const operation = this.get(sessionId, options?.expectedEpoch);
+    if (!operation || !isStreamingClientOpen(res)) return false;
+
+    operation.clients.push(res);
+    res.on('close', () => {
+      const current = this.get(sessionId, operation.epoch);
+      if (!current) return;
+      current.clients = current.clients.filter((client) => client !== res);
+    });
+
+    if (options?.announceAttach) {
+      res.write(`data: ${JSON.stringify({
+        type: 'attached',
+        messageId: operation.messageId,
+        agentId: operation.agentId,
+        agentName: operation.agentName,
+        modelUsed: operation.modelUsed,
+      })}\n\n`);
+    }
+
+    return true;
+  }
+
+  emit(sessionId: string, event: Record<string, unknown>, expectedEpoch?: number): void {
+    const operation = this.get(sessionId, expectedEpoch);
+    if (!operation) return;
+
+    const payload = `data: ${JSON.stringify(event)}\n\n`;
+    operation.clients = operation.clients.filter((res) => {
+      if (!isStreamingClientOpen(res)) return false;
+      try {
+        res.write(payload);
+        return isStreamingClientOpen(res);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  finish(sessionId: string, expectedEpoch?: number): void {
+    const operation = this.get(sessionId, expectedEpoch);
+    if (!operation) return;
+    this.cleanup(operation);
+  }
+
+  abort(sessionId: string, expectedEpoch?: number): { aborted: boolean } {
+    const operation = this.get(sessionId, expectedEpoch);
+    if (!operation) return { aborted: false };
+
+    operation.abortController?.abort();
+    this.cleanup(operation);
+    return { aborted: true };
+  }
+
+  private cleanup(operation: LocalChatOperation): void {
+    if (operation.cleanedUp) {
+      if (this.operations.get(operation.sessionId) === operation) {
+        this.operations.delete(operation.sessionId);
+      }
+      return;
+    }
+
+    operation.cleanedUp = true;
+    operation.clients
+      .filter((client) => isStreamingClientOpen(client))
+      .forEach((res) => {
+        try {
+          res.end();
+        } catch {}
+      });
+    operation.clients = [];
+    if (this.operations.get(operation.sessionId) === operation) {
+      this.operations.delete(operation.sessionId);
+    }
   }
 }
 
@@ -9752,7 +9933,7 @@ class ActiveRunManager {
     run.text = splitOutput.finalContent;
     run.modelProcessContent = splitOutput.processContent;
     run.modelProcessStreaming = splitOutput.processStreaming;
-    run.processContent = run.toolProcessContent;
+    run.processContent = combineChatProcessContent(run.toolProcessContent, run.modelProcessContent);
     run.processStreaming = run.modelProcessStreaming || run.activeToolCallIds.size > 0;
     return rawChanged;
   }
@@ -10370,7 +10551,7 @@ class ActiveRunManager {
       if (rewrittenFallbackText.trim()) {
         run.text = canonicalFallbackText;
         run.modelProcessContent = '';
-        run.processContent = run.toolProcessContent;
+        run.processContent = combineChatProcessContent(run.toolProcessContent, run.modelProcessContent);
         run.processStreaming = false;
         const rewrittenFallbackProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
 
@@ -10490,6 +10671,7 @@ class ActiveRunManager {
 
 const activeRunManager = new ActiveRunManager(db);
 const pendingChatPreparationManager = new PendingChatPreparationManager();
+const localChatOperationManager = new LocalChatOperationManager();
 
 // Force overlapping requests for the same session onto a fresh interruption epoch so
 // stale pending work or an older run cannot keep mutating state after a newer send begins.
@@ -10498,6 +10680,7 @@ async function interruptSessionStreamingStateForNewRun(sessionId: string): Promi
   const nextEpoch = bumpSessionInterruptionEpoch(sessionId);
   const pendingPreparation = pendingChatPreparationManager.get(sessionId, interruptedEpoch);
   const activeRun = activeRunManager.getRun(sessionId);
+  const localOperation = localChatOperationManager.get(sessionId);
 
   if (pendingPreparation) {
     pendingChatPreparationManager.cancel(sessionId, interruptedEpoch);
@@ -10519,7 +10702,19 @@ async function interruptSessionStreamingStateForNewRun(sessionId: string): Promi
     }
   }
 
-  if (pendingPreparation || activeRun) {
+  if (localOperation) {
+    localChatOperationManager.abort(sessionId);
+    try {
+      db.deleteMessage(localOperation.messageId);
+    } catch (error) {
+      console.warn(
+        `[chat] Failed to delete interrupted local assistant message ${localOperation.messageId} for session ${sessionId}:`,
+        error,
+      );
+    }
+  }
+
+  if (pendingPreparation || activeRun || localOperation) {
     disconnectConnection(sessionId);
   }
 
@@ -10588,7 +10783,11 @@ async function abortOpenClawSessionRuns(
 }
 
 async function reconcileInactiveChatLatestMessage(sessionId: string): Promise<void> {
-  if (activeRunManager.getRun(sessionId) || pendingChatPreparationManager.get(sessionId)) {
+  if (
+    activeRunManager.getRun(sessionId)
+    || pendingChatPreparationManager.get(sessionId)
+    || localChatOperationManager.get(sessionId)
+  ) {
     return;
   }
 
@@ -10935,48 +11134,78 @@ app.post('/api/chat', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId, assistantMsgId })}\n\n`);
 
     if (directImageModel) {
+      const localImageController = new AbortController();
       const startProcessContent = buildImageGenerationStartProcessContent(directImageModel);
       db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent, true);
+      localChatOperationManager.start({
+        sessionId: normalizedSessionId,
+        epoch: sessionInterruptionEpoch,
+        messageId: assistantMsgId,
+        agentId,
+        agentName,
+        modelUsed: directImageModel,
+        startedAt: Date.now(),
+        kind: 'image-generation',
+        abortController: localImageController,
+      });
+      const startEvent = {
+        type: 'delta',
+        text: '',
+        process_content: startProcessContent,
+        process_streaming: true,
+        modelUsed: directImageModel,
+        model_used: directImageModel,
+      };
       if (isStreamingClientOpen(res)) {
         try {
-          res.write(`data: ${JSON.stringify({
-            type: 'delta',
-            text: '',
-            process_content: startProcessContent,
-            process_streaming: true,
-            modelUsed: directImageModel,
-            model_used: directImageModel,
-          })}\n\n`);
+          res.write(`data: ${JSON.stringify(startEvent)}\n\n`);
         } catch {}
       }
-    }
 
-    const directImageResult = await tryGenerateImageForPrompt({
-      prompt: rawMessage,
-      intentText: rawMessage,
-      intentContext: imageIntentContext,
-      outputDir: path.join(getSessionWorkspacePath(normalizedSessionId), 'output', 'image-generations'),
-    });
-    if (directImageResult) {
-      assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
-      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
-      if (isStreamingClientOpen(res)) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            type: 'final',
-            text: directImageResult.content,
-            process_content: directImageResult.processContent,
-            process_streaming: false,
-            modelUsed: directImageResult.modelUsed,
-            model_used: directImageResult.modelUsed,
-          })}\n\n`);
-          res.end();
-        } catch {}
+      const directImageResult = await tryGenerateImageForPrompt({
+        prompt: rawMessage,
+        intentText: rawMessage,
+        intentContext: imageIntentContext,
+        outputDir: path.join(getSessionWorkspacePath(normalizedSessionId), 'output', 'image-generations'),
+        signal: localImageController.signal,
+      });
+      if (directImageResult) {
+        assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+        db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
+        const finalEvent = {
+          type: 'final',
+          text: directImageResult.content,
+          process_content: directImageResult.processContent,
+          process_streaming: false,
+          modelUsed: directImageResult.modelUsed,
+          model_used: directImageResult.modelUsed,
+        };
+        if (isStreamingClientOpen(res)) {
+          try {
+            res.write(`data: ${JSON.stringify(finalEvent)}\n\n`);
+            res.end();
+          } catch {}
+        }
+        localChatOperationManager.emit(normalizedSessionId, finalEvent, sessionInterruptionEpoch);
+        localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
+        return;
       }
-      return;
+      localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
     }
 
     if (runtimeSettings.runtimeMode === 'direct') {
+      const localDirectController = new AbortController();
+      localChatOperationManager.start({
+        sessionId: normalizedSessionId,
+        epoch: sessionInterruptionEpoch,
+        messageId: assistantMsgId,
+        agentId,
+        agentName,
+        modelUsed,
+        startedAt: Date.now(),
+        kind: 'direct-runtime',
+        abortController: localDirectController,
+      });
       await runDirectChatCompletion({
         sessionId: normalizedSessionId,
         agentId,
@@ -10985,10 +11214,13 @@ app.post('/api/chat', async (req, res) => {
         message: finalMessage,
         modelUsed,
         response: res,
+        signal: localDirectController.signal,
+        onEvent: (event) => localChatOperationManager.emit(normalizedSessionId, event, sessionInterruptionEpoch),
         processStartTag: sessionInfo?.process_start_tag || undefined,
         processEndTag: sessionInfo?.process_end_tag || undefined,
         sessionInterruptionEpoch,
       });
+      localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
       return;
     }
 
@@ -11137,17 +11369,13 @@ app.post('/api/chat', async (req, res) => {
       ));
     } else {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.fail(sessionId, structuredError, sessionInterruptionEpoch);
+        pendingChatPreparationManager.fail(normalizedSessionId, structuredError, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else {
-        res.write(`data: ${JSON.stringify({
-          type: 'error',
-          text: structuredError.content,
-          messageCode: structuredError.messageCode,
-          messageParams: structuredError.messageParams,
-          rawDetail: structuredError.rawDetail,
-          role: structuredError.role,
-        })}\n\n`);
+        const errorEvent = buildStructuredChatErrorStreamEvent(structuredError);
+        res.write(`data: ${JSON.stringify(errorEvent)}\n\n`);
+        localChatOperationManager.emit(normalizedSessionId, errorEvent, sessionInterruptionEpoch);
+        localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
         res.end();
       }
     }
@@ -11161,7 +11389,8 @@ app.post('/api/chat/regenerate', async (req, res) => {
     return res.status(400).json(buildStructuredChatHttpError('Missing sessionId, message, or parentId'));
   }
 
-  const sessionInterruptionEpoch = await interruptSessionStreamingStateForNewRun(String(sessionId));
+  const normalizedSessionId = String(sessionId);
+  const sessionInterruptionEpoch = await interruptSessionStreamingStateForNewRun(normalizedSessionId);
 
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
@@ -11171,7 +11400,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
   try {
     const requestedParentId = Number(parentId);
     const requestedTargetMessageId = Number(targetMessageId);
-    const { latestUserMessage, latestReplyMessage } = getLatestChatRegenerateTarget(sessionId);
+    const { latestUserMessage, latestReplyMessage } = getLatestChatRegenerateTarget(normalizedSessionId);
     const latestUserId = Number(latestUserMessage?.id);
     const latestReplyId = Number(latestReplyMessage?.id);
     const latestReplyParentId = Number(latestReplyMessage?.parent_id);
@@ -11208,7 +11437,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
       db.deleteMessage(Number(latestReplyMessage.id));
     }
 
-    const sessionInfo = sessionManager.getSession(sessionId);
+    const sessionInfo = sessionManager.getSession(normalizedSessionId);
     const rawMessage = String(message);
     let finalMessage = rawMessage;
     let injectedInstructions = '';
@@ -11240,7 +11469,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
       agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
 
     assistantMsgId = Number(db.saveMessage({
-      session_key: sessionId,
+      session_key: normalizedSessionId,
       parent_id: numericParentId,
       role: 'assistant',
       content: '', 
@@ -11260,65 +11489,98 @@ app.post('/api/chat/regenerate', async (req, res) => {
     res.write(`data: ${JSON.stringify({ type: 'ids', userMsgId: numericParentId, assistantMsgId })}\n\n`);
 
     if (directImageModel) {
+      const localImageController = new AbortController();
       const startProcessContent = buildImageGenerationStartProcessContent(directImageModel);
       db.updateMessage(assistantMsgId, '', directImageModel, startProcessContent, true);
+      localChatOperationManager.start({
+        sessionId: normalizedSessionId,
+        epoch: sessionInterruptionEpoch,
+        messageId: assistantMsgId,
+        agentId,
+        agentName,
+        modelUsed: directImageModel,
+        startedAt: Date.now(),
+        kind: 'image-generation',
+        abortController: localImageController,
+      });
+      const startEvent = {
+        type: 'delta',
+        text: '',
+        process_content: startProcessContent,
+        process_streaming: true,
+        modelUsed: directImageModel,
+        model_used: directImageModel,
+      };
       if (isStreamingClientOpen(res)) {
         try {
-          res.write(`data: ${JSON.stringify({
-            type: 'delta',
-            text: '',
-            process_content: startProcessContent,
-            process_streaming: true,
-            modelUsed: directImageModel,
-            model_used: directImageModel,
-          })}\n\n`);
+          res.write(`data: ${JSON.stringify(startEvent)}\n\n`);
         } catch {}
       }
-    }
 
-    const directImageResult = await tryGenerateImageForPrompt({
-      prompt: rawMessage,
-      intentText: rawMessage,
-      intentContext: imageIntentContext,
-      outputDir: path.join(getSessionWorkspacePath(String(sessionId)), 'output', 'image-generations'),
-    });
-    if (directImageResult) {
-      assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
-      db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
-      if (isStreamingClientOpen(res)) {
-        try {
-          res.write(`data: ${JSON.stringify({
-            type: 'final',
-            text: directImageResult.content,
-            process_content: directImageResult.processContent,
-            process_streaming: false,
-            modelUsed: directImageResult.modelUsed,
-            model_used: directImageResult.modelUsed,
-          })}\n\n`);
-          res.end();
-        } catch {}
+      const directImageResult = await tryGenerateImageForPrompt({
+        prompt: rawMessage,
+        intentText: rawMessage,
+        intentContext: imageIntentContext,
+        outputDir: path.join(getSessionWorkspacePath(normalizedSessionId), 'output', 'image-generations'),
+        signal: localImageController.signal,
+      });
+      if (directImageResult) {
+        assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+        db.updateMessage(assistantMsgId, directImageResult.content, directImageResult.modelUsed, directImageResult.processContent, false);
+        const finalEvent = {
+          type: 'final',
+          text: directImageResult.content,
+          process_content: directImageResult.processContent,
+          process_streaming: false,
+          modelUsed: directImageResult.modelUsed,
+          model_used: directImageResult.modelUsed,
+        };
+        if (isStreamingClientOpen(res)) {
+          try {
+            res.write(`data: ${JSON.stringify(finalEvent)}\n\n`);
+            res.end();
+          } catch {}
+        }
+        localChatOperationManager.emit(normalizedSessionId, finalEvent, sessionInterruptionEpoch);
+        localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
+        return;
       }
-      return;
+      localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
     }
 
     if (runtimeSettings.runtimeMode === 'direct') {
+      const localDirectController = new AbortController();
+      localChatOperationManager.start({
+        sessionId: normalizedSessionId,
+        epoch: sessionInterruptionEpoch,
+        messageId: assistantMsgId,
+        agentId,
+        agentName,
+        modelUsed,
+        startedAt: Date.now(),
+        kind: 'direct-runtime',
+        abortController: localDirectController,
+      });
       await runDirectChatCompletion({
-        sessionId: String(sessionId),
+        sessionId: normalizedSessionId,
         agentId,
         userMessageId: numericParentId,
         assistantMessageId: assistantMsgId,
         message: finalMessage,
         modelUsed,
         response: res,
+        signal: localDirectController.signal,
+        onEvent: (event) => localChatOperationManager.emit(normalizedSessionId, event, sessionInterruptionEpoch),
         processStartTag: sessionInfo?.process_start_tag || undefined,
         processEndTag: sessionInfo?.process_end_tag || undefined,
         sessionInterruptionEpoch,
       });
+      localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
       return;
     }
 
     pendingChatPreparationManager.start({
-      sessionId,
+      sessionId: normalizedSessionId,
       epoch: sessionInterruptionEpoch,
       messageId: assistantMsgId,
       agentId,
@@ -11327,40 +11589,40 @@ app.post('/api/chat/regenerate', async (req, res) => {
       startedAt: Date.now(),
     });
     pendingPreparationActive = true;
-    pendingChatPreparationManager.attachClient(sessionId, res, {
+    pendingChatPreparationManager.attachClient(normalizedSessionId, res, {
       announceAttach: true,
       expectedEpoch: sessionInterruptionEpoch,
     });
 
-    const client = await getConnection(sessionId);
+    const client = await getConnection(normalizedSessionId);
     sessionEventsClient = client;
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
-    const expectedSessionKey = buildOpenClawChatSessionKey(sessionId, agentId);
-    await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${sessionId} before regenerate`);
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+    const expectedSessionKey = buildOpenClawChatSessionKey(normalizedSessionId, agentId);
+    await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${normalizedSessionId} before regenerate`);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
     try {
       await client.subscribeSessionEvents();
       sessionEventsSubscribed = true;
     } catch (error) {
-      console.warn(`[chat] Failed to subscribe session events for session ${sessionId}:`, error);
+      console.warn(`[chat] Failed to subscribe session events for session ${normalizedSessionId}:`, error);
     }
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId, {
       includeDocumentToolingContext: runtimeSettings.toolMode === 'full' || runtimeSettings.toolMode === 'coding',
     });
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
       .then((history) => getHistorySnapshot(history))
       .catch(() => getUnknownHistorySnapshot());
-    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
-      sessionKey: sessionId,
+      sessionKey: normalizedSessionId,
       message: outgoingMessage.text,
       agentId: agentId,
       attachments: outgoingMessage.attachments,
     });
-    if (getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch) {
+    if (getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch) {
       try {
         const abortResult = await client.abortChat({
           sessionKey: finalSessionKey,
@@ -11368,22 +11630,22 @@ app.post('/api/chat/regenerate', async (req, res) => {
           timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
         });
         if (!abortResult.aborted) {
-          scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${sessionId}`);
+          scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${normalizedSessionId}`);
         }
       } catch {
-        scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${sessionId}`);
+        scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${normalizedSessionId}`);
       }
-      throw new SessionInterruptedError(sessionId);
+      throw new SessionInterruptedError(normalizedSessionId);
     }
 
     const run = activeRunManager.startRun(
-      sessionId,
+      normalizedSessionId,
       runId,
       agentId,
       agentName,
       modelUsed,
       assistantMsgId,
-      getSessionWorkspacePath(sessionId),
+      getSessionWorkspacePath(normalizedSessionId),
       client,
       finalSessionKey,
       preRunHistorySnapshot,
@@ -11393,20 +11655,20 @@ app.post('/api/chat/regenerate', async (req, res) => {
     );
     sessionEventsSubscribed = false;
 
-    const pendingClients = pendingChatPreparationManager.promoteClients(sessionId, sessionInterruptionEpoch);
+    const pendingClients = pendingChatPreparationManager.promoteClients(normalizedSessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
     pendingClients.forEach((clientRes) => {
-      activeRunManager.attachClient(sessionId, clientRes);
+      activeRunManager.attachClient(normalizedSessionId, clientRes);
     });
 
   } catch (error: any) {
     if (sessionEventsSubscribed && sessionEventsClient) {
       sessionEventsSubscribed = false;
       void sessionEventsClient.unsubscribeSessionEvents().catch((unsubscribeError) => {
-        console.warn(`[chat] Failed to unsubscribe session events for session ${sessionId}:`, unsubscribeError);
+        console.warn(`[chat] Failed to unsubscribe session events for session ${normalizedSessionId}:`, unsubscribeError);
       });
     }
-    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
+    const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
         if (typeof assistantMsgId === 'number') {
@@ -11415,7 +11677,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
             assistantMsgId = undefined;
           } catch {}
         }
-        pendingChatPreparationManager.cancel(sessionId, sessionInterruptionEpoch);
+        pendingChatPreparationManager.cancel(normalizedSessionId, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else if (res.headersSent) {
         try {
@@ -11432,7 +11694,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
       structuredErrorInput.rawDetail,
       structuredErrorInput.messageCode
     );
-    const sessionInfo = db.getSession(sessionId);
+    const sessionInfo = db.getSession(normalizedSessionId);
     const agentId = sessionInfo?.agentId || 'main';
     const modelUsed = agentProvisioner.readAgentModel(agentId) || agentProvisioner.readAvailableModels().find(m => m.primary)?.id || '';
 
@@ -11444,7 +11706,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
     } else {
       try {
         assistantMsgId = Number(db.saveMessage({
-          session_key: sessionId,
+          session_key: normalizedSessionId,
           parent_id: Number(parentId),
           role: structuredError.role,
           content: structuredError.content,
@@ -11462,17 +11724,13 @@ app.post('/api/chat/regenerate', async (req, res) => {
       ));
     } else {
       if (pendingPreparationActive) {
-        pendingChatPreparationManager.fail(sessionId, structuredError, sessionInterruptionEpoch);
+        pendingChatPreparationManager.fail(normalizedSessionId, structuredError, sessionInterruptionEpoch);
         pendingPreparationActive = false;
       } else {
-        res.write(`data: ${JSON.stringify({
-          type: 'error',
-          text: structuredError.content,
-          messageCode: structuredError.messageCode,
-          messageParams: structuredError.messageParams,
-          rawDetail: structuredError.rawDetail,
-          role: structuredError.role,
-        })}\n\n`);
+        const errorEvent = buildStructuredChatErrorStreamEvent(structuredError);
+        res.write(`data: ${JSON.stringify(errorEvent)}\n\n`);
+        localChatOperationManager.emit(normalizedSessionId, errorEvent, sessionInterruptionEpoch);
+        localChatOperationManager.finish(normalizedSessionId, sessionInterruptionEpoch);
         res.end();
       }
     }
@@ -11484,7 +11742,8 @@ app.get('/api/chat/attach/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
     const pendingPreparation = pendingChatPreparationManager.get(sessionId);
     const run = activeRunManager.getRun(sessionId);
-    if (!run && !pendingPreparation) {
+    const localOperation = localChatOperationManager.get(sessionId);
+    if (!run && !pendingPreparation && !localOperation) {
       await reconcileInactiveChatLatestMessage(sessionId);
       // Return empty payload to indicate no active run
       return res.status(200).json({ active: false });
@@ -11498,6 +11757,11 @@ app.get('/api/chat/attach/:sessionId', async (req, res) => {
 
     if (run) {
       activeRunManager.attachClient(sessionId, res, { announceAttach: true });
+      return;
+    }
+
+    if (localOperation) {
+      localChatOperationManager.attachClient(sessionId, res, { announceAttach: true });
       return;
     }
 
@@ -11525,6 +11789,7 @@ app.post('/api/chat/stop', async (req, res) => {
     const interruptedEpoch = getSessionInterruptionEpoch(normalizedSessionId);
     bumpSessionInterruptionEpoch(normalizedSessionId);
     pendingChatPreparationManager.cancel(normalizedSessionId, interruptedEpoch);
+    const localAbortResult = localChatOperationManager.abort(normalizedSessionId, interruptedEpoch);
     const result = await activeRunManager.abortRun(normalizedSessionId);
     let orphanAbortResult: { aborted: boolean; runIds: string[] } = { aborted: false, runIds: [] };
     try {
@@ -11543,7 +11808,7 @@ app.post('/api/chat/stop', async (req, res) => {
     await reconcileInactiveChatLatestMessage(normalizedSessionId);
     res.json({
       success: true,
-      aborted: result.aborted || orphanAbortResult.aborted,
+      aborted: localAbortResult.aborted || result.aborted || orphanAbortResult.aborted,
       runIds: orphanAbortResult.runIds,
     });
   } catch (error: any) {

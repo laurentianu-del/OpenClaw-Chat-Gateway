@@ -298,7 +298,9 @@
     "historyPageNoticeNewer": "已返回更新 {{count}} 轮"
   },
   "messageBubble": {
-    "processTitle": "处理过程",
+    "processTitle": "执行过程",
+    "toolStepsLabel": "工具步骤",
+    "modelProcessLabel": "模型过程",
     "executingPlaceholder": "执行中",
     "editMessagePlaceholder": "编辑消息内容..."
   },
